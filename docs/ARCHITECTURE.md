@@ -30,7 +30,10 @@ Each Pi session owns its own automation target:
 - If separate window cannot be created, pi-chrome falls back to dedicated tab.
 - Target survives `/reload` and Chrome service-worker restarts.
 - Ownership is tracked by id and mirrored to `chrome.storage.session`.
-- Cleanup closes only calling session's own target, never user tabs/windows or other sessions' targets.
+- Cleanup closes calling session's automation target and every tab it created through `tab.new`.
+- Existing user tabs adopted into a session group are preserved, and ungrouped only if still in that group.
+- Cleanup removes individual owned tabs, never whole windows. User/other-session tabs moved into a Pi window remain open; Chrome closes a window automatically when its final tab is removed.
+- Shutdown waits at most two seconds for cleanup before stopping the bridge. `/reload` preserves resources; revoke starts cleanup without blocking. Hard process termination or unavailable Chrome can still leave owned tabs open.
 
 To point pi-chrome at an existing tab, pass `targetId`, `urlIncludes`, or `titleIncludes`.
 

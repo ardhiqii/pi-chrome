@@ -29,7 +29,11 @@ let polling = false;
 const automationTargets = new Map(); // sessionKey -> { windowId?: number, tabId: number }
 const DEFAULT_SESSION_KEY = "__default__";
 const AUTOMATION_STORAGE_KEY = "piChromeAutomationTargets";
-let automationHydrated = false;
+let automationHydrated;
+const sessionTabs = new Map(); // sessionKey -> Map<tabId, { created: boolean, groupId?: number }>
+const SESSION_TABS_STORAGE_KEY = "piChromeSessionTabs";
+let sessionTabsReady;
+let sessionTabsWrite = Promise.resolve();
 
 function sessionKeyOf(params) {
   return params && typeof params.sessionKey === "string" && params.sessionKey
@@ -41,24 +45,99 @@ function sessionKeyOf(params) {
 // effort: storage may be unavailable on old Chrome, and a failure just means we may create a
 // fresh window (a harmless orphan) rather than reusing one.
 async function hydrateAutomationTargets() {
-  if (automationHydrated) return;
-  automationHydrated = true;
-  try {
-    const stored = await chrome.storage?.session?.get?.(AUTOMATION_STORAGE_KEY);
-    const saved = stored && stored[AUTOMATION_STORAGE_KEY];
-    if (saved && typeof saved === "object") {
-      for (const [key, value] of Object.entries(saved)) {
-        if (value && typeof value.tabId === "number") {
-          automationTargets.set(key, {
-            windowId: typeof value.windowId === "number" ? value.windowId : undefined,
-            tabId: value.tabId,
-          });
+  if (automationHydrated) return automationHydrated;
+  automationHydrated = (async () => {
+    try {
+      const stored = await chrome.storage?.session?.get?.(AUTOMATION_STORAGE_KEY);
+      const saved = stored && stored[AUTOMATION_STORAGE_KEY];
+      if (saved && typeof saved === "object") {
+        for (const [key, value] of Object.entries(saved)) {
+          if (value && typeof value.tabId === "number") {
+            automationTargets.set(key, {
+              windowId: typeof value.windowId === "number" ? value.windowId : undefined,
+              tabId: value.tabId,
+            });
+          }
         }
       }
+    } catch {
+      // Ignore: treat as "no persisted state".
     }
-  } catch {
-    // Ignore: treat as "no persisted state".
+  })();
+  return automationHydrated;
+}
+
+async function hydrateSessionTabs() {
+  if (!sessionTabsReady) sessionTabsReady = (async () => {
+    try {
+      const stored = await chrome.storage?.session?.get?.(SESSION_TABS_STORAGE_KEY);
+      for (const [key, entries] of Object.entries(stored?.[SESSION_TABS_STORAGE_KEY] || {})) {
+        if (!Array.isArray(entries)) continue;
+        const tabs = new Map();
+        for (const entry of entries) {
+          if (!entry || !Number.isInteger(entry.tabId) || entry.tabId < 0) continue;
+          if (entry.created === true) tabs.set(entry.tabId, { created: true });
+          else if (entry.created === false && Number.isInteger(entry.groupId) && entry.groupId >= 0) {
+            tabs.set(entry.tabId, { created: false, groupId: entry.groupId });
+          }
+        }
+        if (tabs.size) sessionTabs.set(key, tabs);
+      }
+    } catch {
+      // Missing ownership must leave tabs alone, not guess ownership from group names.
+    }
+  })();
+  return sessionTabsReady;
+}
+
+function persistSessionTabs() {
+  // Serialize writes and construct each snapshot when its turn starts.
+  sessionTabsWrite = sessionTabsWrite.then(async () => {
+    const saved = Object.fromEntries([...sessionTabs].map(([key, tabs]) => [
+      key, [...tabs].map(([tabId, record]) => ({ tabId, ...record })),
+    ]));
+    await chrome.storage?.session?.set?.({ [SESSION_TABS_STORAGE_KEY]: saved });
+  }).catch(() => {});
+  return sessionTabsWrite;
+}
+
+async function trackSessionTab(sessionKey, tabId, created, groupId) {
+  await Promise.all([hydrateSessionTabs(), hydrateAutomationTargets()]);
+  if (!Number.isInteger(tabId)) return;
+  if (!created) {
+    if (!Number.isInteger(groupId) || groupId < 0 || isPiChromeOwnedTarget(tabId)) return;
+    if ([...sessionTabs.values()].some((tabs) => tabs.get(tabId)?.created)) return;
   }
+  let tabs = sessionTabs.get(sessionKey);
+  if (!tabs) sessionTabs.set(sessionKey, tabs = new Map());
+  tabs.set(tabId, created ? { created: true } : { created: false, groupId });
+  await persistSessionTabs();
+}
+
+async function cleanupSessionTabs(sessionKey) {
+  await hydrateSessionTabs();
+  const automation = await cleanupAutomationTarget(sessionKey);
+  const tabs = sessionTabs.get(sessionKey);
+  let closedCreatedTabs = 0;
+  let ungroupedAdoptedTabs = 0;
+  for (const [tabId, record] of [...(tabs || [])]) {
+    try {
+      const tab = await chrome.tabs.get(tabId).catch(() => null);
+      if (tab && record.created) {
+        await chrome.tabs.remove(tabId);
+        closedCreatedTabs++;
+      } else if (tab && tab.groupId === record.groupId) {
+        await chrome.tabs.ungroup(tabId);
+        ungroupedAdoptedTabs++;
+      }
+      tabs.delete(tabId);
+    } catch {
+      // Retain failed operations for a later cleanup; never report them as completed.
+    }
+  }
+  if (tabs && !tabs.size) sessionTabs.delete(sessionKey);
+  await persistSessionTabs();
+  return { ...automation, closedCreatedTabs, ungroupedAdoptedTabs };
 }
 
 async function persistAutomationTargets() {
@@ -144,25 +223,26 @@ async function getOrCreateAutomationTarget(sessionKey, groupTitle) {
 async function cleanupAutomationTarget(sessionKey) {
   await hydrateAutomationTargets();
   const t = automationTargets.get(sessionKey);
+  const result = { closedWindowId: null, closedTabId: null };
+  if (!t) return result;
+  const tab = await chrome.tabs.get(t.tabId).catch(() => null);
+  if (tab) {
+    try {
+      // Never remove a whole window: users/other sessions can add tabs even between a
+      // contents check and removal. Chrome closes empty windows when their last tab closes.
+      await chrome.tabs.remove(t.tabId);
+      result.closedTabId = t.tabId;
+    } catch {
+      return result; // Keep ownership so cleanup can retry.
+    }
+    if (tab.windowId === t.windowId && typeof chrome.windows?.get === "function") {
+      const remaining = await chrome.windows.get(t.windowId).catch(() => null);
+      if (!remaining) result.closedWindowId = t.windowId;
+    }
+  }
   automationTargets.delete(sessionKey);
   await persistAutomationTargets();
-  if (!t) return { closedWindowId: null, closedTabId: null };
-  const { windowId, tabId } = t;
-  if (typeof windowId === "number" && chrome.windows && typeof chrome.windows.remove === "function") {
-    const win = await chrome.windows.get(windowId).catch(() => null);
-    if (win) {
-      await chrome.windows.remove(windowId).catch(() => {});
-      return { closedWindowId: windowId, closedTabId: typeof tabId === "number" ? tabId : null };
-    }
-  }
-  if (typeof tabId === "number") {
-    const tab = await chrome.tabs.get(tabId).catch(() => null);
-    if (tab) {
-      await chrome.tabs.remove(tabId).catch(() => {});
-      return { closedWindowId: null, closedTabId: tabId };
-    }
-  }
-  return { closedWindowId: null, closedTabId: null };
+  return result;
 }
 
 function withTimeout(promise, ms, label, onTimeout) {
@@ -1142,6 +1222,7 @@ async function dispatch(action, params) {
       const createParams = { url: params.url || "about:blank", active: true };
       if (existingGroup && typeof existingGroup.windowId === "number") createParams.windowId = existingGroup.windowId;
       const tab = await chrome.tabs.create(createParams);
+      await trackSessionTab(sessionKeyOf(params), tab.id, true);
       try {
         return await groupTab(tab, groupTitle, params.groupColor);
       } catch (error) {
@@ -1159,7 +1240,9 @@ async function dispatch(action, params) {
     }
     case "tab.group": {
       const tab = await getTabByParams(params, { createOwnedTarget: false });
-      return groupTab(tab, params.groupTitle || "Pi", params.groupColor);
+      const grouped = await groupTab(tab, params.groupTitle || "Pi", params.groupColor);
+      if (!(tab.groupId >= 0)) await trackSessionTab(sessionKeyOf(params), tab.id, false, grouped.group?.id);
+      return grouped;
     }
     case "tab.ungroup": {
       const tab = await getTabByParams(params, { createOwnedTarget: false });
@@ -1256,9 +1339,9 @@ async function dispatch(action, params) {
       return { windowId: t?.windowId ?? null, tabId: t?.tabId ?? null };
     }
     case "automation.cleanup":
-      // Close only THIS session's pi-chrome-owned window/tab. Never touches user tabs/windows or
-      // another Pi session's target.
-      return cleanupAutomationTarget(sessionKeyOf(params));
+      // Close recorded creations, and only ungroup user tabs still in their adopted group.
+      // Group titles are not ownership evidence.
+      return cleanupSessionTabs(sessionKeyOf(params));
     default:
       throw new Error(`Unknown action: ${action}`);
   }
@@ -1345,18 +1428,19 @@ async function getTabByParams(params, { createOwnedTarget = true } = {}) {
   // which tabs Pi is driving. We only adopt *ungrouped* tabs — never hijack a tab the user (or
   // another Pi session) already grouped, since groupTab would otherwise rename that group.
   if (params.joinSessionGroup && params.sessionGroupTitle) {
-    await joinSessionGroup(tab, params.sessionGroupTitle);
+    await joinSessionGroup(tab, params.sessionGroupTitle, sessionKeyOf(params));
   }
   return tab;
 }
 
 // Add an ungrouped tab to the session's tab group (reusing it by title, else creating it).
 // No-op when the tab is already grouped or tabGroups is unavailable.
-async function joinSessionGroup(tab, title) {
+async function joinSessionGroup(tab, title, sessionKey) {
   if (!chrome.tabGroups || typeof tab.id !== "number") return;
   if (typeof tab.groupId === "number" && tab.groupId >= 0) return;
   try {
-    await groupTab(tab, title);
+    const grouped = await groupTab(tab, title);
+    await trackSessionTab(sessionKey, tab.id, false, grouped.group?.id);
   } catch {
     // Grouping is best-effort; never block the actual page action on a grouping failure.
   }

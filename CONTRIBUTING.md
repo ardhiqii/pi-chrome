@@ -15,6 +15,10 @@ Thanks for considering a contribution. pi-chrome aims to be the **de-facto brows
 # Link from a checkout
 pi install ./pi-chrome
 
+# Run unit regressions (Node.js 22.13+; no live Chrome required)
+# Lifecycle tests use Node's built-in TypeScript stripping.
+npm test
+
 # Run the benchmark dashboard
 cd test-suite
 python3 -m http.server 8765
