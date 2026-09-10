@@ -1564,12 +1564,13 @@ Usage rules:
 		name: "chrome_type",
 		label: "Chrome Type",
 		description:
-			"Focus an optional snapshot uid or CSS selector, then type text using Chrome's real keyboard input. Pass includeSnapshot=true to return a fresh snapshot after typing.",
+			"Focus an optional snapshot uid or CSS selector, then type using Chrome's real input. Contenteditables use one native text insertion; other fields use key events. Set perCharacter=true for editors needing individual keydown events. Pass includeSnapshot=true to verify after typing.",
 		promptSnippet: "Type text into Chrome, optionally focusing a snapshot uid or selector first.",
 		parameters: Type.Object({
 			text: Type.String(),
 			uid: Type.Optional(Type.String({ description: "Stable element uid from chrome_snapshot." })),
 			selector: Type.Optional(Type.String({ description: "CSS selector to focus before typing." })),
+			perCharacter: Type.Optional(Type.Boolean({ default: false, description: "Send individual key events even in contenteditables. Default: one native text insertion for contenteditables; key events for other fields." })),
 			includeSnapshot: Type.Optional(Type.Boolean({ description: "If true, include a fresh chrome_snapshot result after typing." })),
 			maxElements: Type.Optional(Type.Number({ default: MAX_ELEMENTS, description: "Max elements in the included snapshot." })),
 			pressEnter: Type.Optional(Type.Boolean()),
@@ -1595,12 +1596,13 @@ Usage rules:
 		name: "chrome_fill",
 		label: "Chrome Fill",
 		description:
-			"Set the full value of a text input, textarea, or contenteditable element using Chrome click/select/delete/type input. Accepts a snapshot uid or CSS selector. Pass includeSnapshot=true to verify after filling.",
+			"Set the full value of a text input, textarea, or contenteditable using Chrome click/select/delete/type input. Contenteditables use one native text insertion; perCharacter=true retains individual keydown events. Accepts a snapshot uid or CSS selector. Pass includeSnapshot=true to verify after filling.",
 		promptSnippet: "Fill a Chrome form field by snapshot uid or selector, optionally returning a fresh snapshot.",
 		parameters: Type.Object({
 			text: Type.String(),
 			uid: Type.Optional(Type.String({ description: "Stable element uid from chrome_snapshot." })),
 			selector: Type.Optional(Type.String({ description: "CSS selector to fill if uid is omitted." })),
+			perCharacter: Type.Optional(Type.Boolean({ default: false, description: "Send individual key events even in contenteditables. Default: one native text insertion for contenteditables; key events for other fields." })),
 			submit: Type.Optional(Type.Boolean({ description: "If true, press Enter after filling." })),
 			domFallback: Type.Optional(Type.Boolean({ description: "If true (default), fall back to DOM value-setting if Chrome's CDP input path is blocked by another extension overlay or debugger failure." })),
 			includeSnapshot: Type.Optional(Type.Boolean({ description: "If true, include a fresh chrome_snapshot result after filling." })),
@@ -1636,7 +1638,7 @@ Usage rules:
 				ctrlKey: Type.Optional(Type.Boolean()),
 				altKey: Type.Optional(Type.Boolean()),
 				metaKey: Type.Optional(Type.Boolean()),
-			}, { description: "Modifier keys to hold while pressing the key (chord)." })),
+			}, { description: "Modifier keys to hold while pressing the key. Shift alone types the shifted US-layout character (a → A, 1 → !); Ctrl/Meta/Alt chords do not insert literal text." })),
 			includeSnapshot: Type.Optional(Type.Boolean({ description: "If true, include a fresh chrome_snapshot result after the keypress." })),
 			maxElements: Type.Optional(Type.Number({ default: MAX_ELEMENTS, description: "Max elements in the included snapshot." })),
 			targetId: Type.Optional(Type.String()),

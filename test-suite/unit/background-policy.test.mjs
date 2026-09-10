@@ -119,6 +119,26 @@ test("every registered page tool, tab.new, and chrome_launch(url) use the centra
   assert.equal(h.writes[0][1].toString(), "test", "screenshot tool still writes decoded bytes");
 });
 
+test("typing options and verification pass through real tool registrations without bypassing authorization", async () => {
+  const h = piHarness({ send: async () => ({ result: { input: "chrome", typing: "keys" }, snapshot: { url: "https://fixture.test" } }) });
+  for (const name of ["chrome_type", "chrome_fill"]) {
+    assert.equal(h.tools.get(name).parameters.perCharacter.default, false);
+    const result = await h.tool(name, { uid: "el-1", text: "hello", perCharacter: true, includeSnapshot: true, domFallback: false });
+    assert.equal(h.calls.at(-1).params.perCharacter, true);
+    assert.equal(h.calls.at(-1).params.includeSnapshot, true);
+    assert.equal(h.calls.at(-1).params.domFallback, false);
+    assert.equal(h.calls.at(-1).params.background, true);
+    assert.equal(result.details.result.result.typing, "keys");
+    assert.equal(result.details.result.snapshot.url, "https://fixture.test");
+  }
+  h.authorize(false);
+  const count = h.calls.length;
+  for (const [name, params] of [["chrome_type", { text: "x" }], ["chrome_fill", { text: "x" }], ["chrome_key", { key: "a" }], ["chrome_upload_file", { paths: ["/fixture.txt"] }]]) {
+    await assert.rejects(h.tool(name, params), /Chrome control locked/);
+  }
+  assert.equal(h.calls.length, count);
+});
+
 test("activation is rejected before dispatch; existing on/off/toggle/status commands suffice", async () => {
   const h = piHarness();
   await assert.rejects(h.tool("chrome_tab", { action: "activate", targetId: "2", background: false }), /background mode.*\/chrome background off/);

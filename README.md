@@ -74,6 +74,12 @@ Second doctor run should show all checks passing.
 
 Tool parameters and gotchas are documented inline in Pi.
 
+### Typing into rich editors
+
+`chrome_type` and `chrome_fill` use one native CDP `Input.insertText` operation for focused contenteditables. This avoids per-character delays for long text and preserves Unicode/newlines. Ordinary inputs and textareas retain individual key events.
+
+For an editor that needs a `keydown` for every character, pass `perCharacter:true`. Bulk insertion still uses Chrome's input system, but does not emit per-character key events or a clipboard `paste` event. Use `includeSnapshot:true` to verify the result; `chrome_fill` still honors `domFallback:false` when synthetic fallback is unwanted.
+
 ---
 
 ## Safety model

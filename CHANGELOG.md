@@ -2,6 +2,16 @@
 
 All notable user-facing changes to `pi-chrome`.
 
+## 0.15.49 — 2026-09-10
+
+- **Validation scope.** Node regression suites passed. Live browser validation remains incomplete: an input attempt encountered `Input.dispatchMouseEvent: Detached while handling command.`; a subsequent retest was blocked by a disconnected companion. No live-browser pass is claimed for these changes.
+
+- **Upload node fallback.** When Chrome cannot convert a file input's remote object to a DOM node ID, use that same `objectId` directly. Release the remote object after success or failure and reject stale snapshot UIDs. No native file picker or new permissions.
+- **Native rich-editor insertion.** `chrome_type` and `chrome_fill` use one CDP `Input.insertText` for focused contenteditables. Inputs/textareas keep individual key events; `perCharacter:true` preserves that path for rich editors needing `keydown` events. Results report `typing` as `insertText`, `keys`, or `none`. Existing DOM-fallback controls and background policy remain intact.
+- **Complete rich-editor fill and single Enter.** Select all requested contenteditable contents before deletion, not only one paragraph. `pressEnter` sends one Enter instead of two; Enter after type/fill stays pinned to the resolved tab.
+- **Shift-only typing.** Shift+a, Shift+1, and other US-layout printable chords now carry shifted text. Ctrl/Meta/Alt shortcuts still suppress literal insertion.
+- **Input regressions.** Added worker fault-injection tests and challenge 44. Challenge 16 explicitly tests per-character typing; challenge 21 waits for Shift release before grading.
+
 ## 0.15.48 — 2026-09-09
 
 - **Existing background mode is now hard background.** `/chrome background on` (still the default) overrides per-call foreground requests, keeps new tabs inactive, and blocks `chrome_tab activate`. Use the existing `/chrome background off` for foreground/watch mode; no new command or lock state.

@@ -491,7 +491,7 @@
     "id": "contenteditable-selection",
     "file": "challenges/16-contenteditable-selection.html",
     "category": "editing",
-    "goal": "Contenteditable typing advances selection/caret like user typing.",
+    "goal": "Contenteditable perCharacter typing advances selection/caret for each key (bulk insertion is covered by challenge 44).",
     "expected": {
       "synthetic": "CONDITIONAL",
       "trusted": "PASS",
@@ -502,7 +502,8 @@
         "tool": "chrome_type",
         "params": {
           "selector": "#ed",
-          "text": "hello"
+          "text": "hello",
+          "perCharacter": true
         }
       }
     ],
@@ -687,6 +688,10 @@
       "manual": "PASS"
     },
     "recipe": [
+      {
+        "tool": "chrome_click",
+        "params": { "selector": "#t", "domFallback": false }
+      },
       {
         "tool": "chrome_key",
         "params": {
@@ -1752,5 +1757,42 @@
     "flakeRisk": "medium",
     "manualBaseline": "unverified",
     "gradeSource": "both"
+  },
+  {
+    "id": "input-reliability",
+    "file": "challenges/44-input-reliability.html",
+    "category": "editing",
+    "difficulty": "L2",
+    "gate": "core",
+    "goal": "Upload a fixture, enter long Unicode rich-editor text, replace all old paragraphs, retain per-character typing, type Shift-only chords, and submit exactly once.",
+    "expected": { "synthetic": "FAIL", "trusted": "PASS", "manual": "PASS" },
+    "prerequisites": [
+      "Reload Pi and the updated Chrome companion. Snapshot before input; replace descriptive selectors with snapshot UIDs where available.",
+      "Substitute the chrome_evaluate caption result for $CAPTION and expand $PWD to the repository root."
+    ],
+    "recipe": [
+      { "tool": "chrome_evaluate", "params": { "expression": "window.__inputFixture.caption" } },
+      { "tool": "chrome_type", "params": { "selector": "#typed", "text": "$CAPTION", "includeSnapshot": true } },
+      { "tool": "chrome_fill", "params": { "selector": "#filled", "text": "$CAPTION", "domFallback": false, "includeSnapshot": true } },
+      { "tool": "chrome_type", "params": { "selector": "#keys", "text": "Ab!", "perCharacter": true, "includeSnapshot": true } },
+      { "tool": "chrome_click", "params": { "selector": "#shift", "domFallback": false } },
+      { "tool": "chrome_key", "params": { "key": "a", "modifiers": { "shiftKey": true } } },
+      { "tool": "chrome_key", "params": { "key": "1", "modifiers": { "shiftKey": true } } },
+      { "tool": "chrome_key", "params": { "key": "/", "modifiers": { "shiftKey": true }, "includeSnapshot": true } },
+      { "tool": "chrome_type", "params": { "selector": "#once", "text": "done", "pressEnter": true, "includeSnapshot": true } },
+      { "tool": "chrome_upload_file", "params": { "selector": "#file", "paths": ["$PWD/test-suite/fixtures/pi-chrome-upload.txt"] } },
+      { "tool": "chrome_click", "params": { "selector": "#verify", "domFallback": false, "includeSnapshot": true } },
+      { "tool": "chrome_evaluate", "params": { "expression": "JSON.stringify({v:window.__verdict,r:window.__reason,e:window.__events.slice(-20)})" } }
+    ],
+    "requires": { "cdp": true },
+    "tags": ["upload", "contenteditable", "insertText", "keyboard", "unicode", "modifiers"],
+    "notes": [
+      "Bulk insertion emits native editing events, not a keydown per character or a clipboard paste event. Per-character behavior remains covered by challenge 16 and the explicit keys editor here.",
+      "Manual baseline: paste the exact caption into both editors (select all old paragraphs first), type Ab!, release Shift between each Shift chord, type done then Enter once, and choose the fixture file.",
+      "The page checks actual file contents/native change. Node-ID conversion failure and cleanup are covered by fault-injected worker unit tests, not forced by the page."
+    ],
+    "flakeRisk": "low",
+    "manualBaseline": "unverified",
+    "gradeSource": "page"
   }
 ]
