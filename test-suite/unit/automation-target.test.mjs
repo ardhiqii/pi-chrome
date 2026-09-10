@@ -81,7 +81,12 @@ function makeChrome(state, { withWindows = true, withStorage = true, withTabGrou
         return { ...tab };
       },
       update: async (id, props = {}) => { const t = tabs.get(id); if (!t) throw new Error(`No tab with id ${id}`); Object.assign(t, props); return { ...t }; },
-      remove: async (id) => { tabs.delete(id); },
+      remove: async (id) => {
+        const tab = tabs.get(id);
+        tabs.delete(id);
+        // Chrome closes a window automatically when its final tab is removed.
+        if (tab && ![...tabs.values()].some((other) => other.windowId === tab.windowId)) windows.delete(tab.windowId);
+      },
       group: async ({ groupId, tabIds = [] } = {}) => {
         let gid = groupId;
         if (typeof gid !== "number") {
@@ -386,6 +391,108 @@ async function run() {
     for (const [tid, tab] of [...state.tabs]) if (tab.windowId === t.windowId) state.tabs.delete(tid);
     const stale = await w.cleanupAutomationTarget(SK);
     ok(stale.closedWindowId === null && stale.closedTabId === null, "cleanup: robust when owned window was already closed");
+  }
+
+  // Cleanup must never remove a window wholesale, even if tabs move during removal.
+  for (const moveOwnedTab of [false, true]) {
+    const state = makeChromeState();
+    const chrome = makeChrome(state);
+    chrome.windows.remove = async () => { throw new Error("whole-window removal is forbidden"); };
+    const w = loadWorker(chrome);
+    const owned = await w.getOrCreateAutomationTarget(SK);
+    const remove = chrome.tabs.remove;
+    chrome.tabs.remove = async (id) => {
+      // User adds a tab just as cleanup starts; a pre-removal window check is not enough.
+      state.userArticle.windowId = owned.windowId;
+      if (moveOwnedTab) state.tabs.get(owned.id).windowId = state.userWindowId;
+      await remove(id);
+    };
+    const result = await w.dispatch("automation.cleanup", { sessionKey: SK });
+    ok(result.closedTabId === owned.id && result.closedWindowId === null, "mixed window: only owned tab reported closed");
+    ok(state.tabs.has(state.userArticle.id) && state.windows.has(owned.windowId), "mixed window: user tab and its window survive");
+    ok(!state.tabs.has(owned.id), "mixed window: owned tab removed even after moving to another window");
+  }
+
+  // A populated automation window is not disposable merely because Pi created it.
+  {
+    const state = makeChromeState();
+    const w = loadWorker(makeChrome(state));
+    const owned = await w.getOrCreateAutomationTarget(SK);
+    state.userArticle.windowId = owned.windowId;
+    await w.dispatch("automation.cleanup", { sessionKey: SK });
+    ok(state.tabs.has(state.userArticle.id) && state.windows.has(owned.windowId), "populated window: user's moved-in tab survives cleanup");
+  }
+
+  // Created vs adopted ownership survives restart; matching titles do not grant ownership.
+  for (const restart of [false, true]) {
+    const state = makeChromeState();
+    const chrome = makeChrome(state, { withTabGroups: true });
+    let w = loadWorker(chrome);
+    const groupTitle = "Pi Session: shared-name";
+    await w.dispatch("page.navigate", {
+      sessionKey: SK, targetId: String(state.userGmail.id), url: "https://mail.google.com/",
+      waitUntilLoad: false, joinSessionGroup: true, sessionGroupTitle: groupTitle,
+    });
+    await w.dispatch("tab.group", { sessionKey: SK, targetId: String(state.userArticle.id), groupTitle });
+    const created = await w.dispatch("tab.new", { sessionKey: SK, groupTitle });
+    const other = await w.dispatch("tab.new", { sessionKey: "session:other", groupTitle });
+    // User changes the article's group after Pi adopted it. Cleanup must respect that change.
+    const replacementGroup = state.alloc.group();
+    state.userArticle.groupId = replacementGroup;
+    if (restart) w = loadWorker(makeChrome(state, { withTabGroups: true }));
+    const result = await w.dispatch("automation.cleanup", { sessionKey: SK });
+    ok(!state.tabs.has(created.tab.id) && state.tabs.has(other.tab.id), "resources: close only this session's created tabs");
+    ok(state.tabs.has(state.userGmail.id) && state.userGmail.groupId === -1, "resources: adopted user tab ungrouped, not closed");
+    ok(state.userArticle.groupId === replacementGroup, "resources: user's replacement group untouched");
+    ok(result.closedCreatedTabs === 1 && result.ungroupedAdoptedTabs === 1, "resources: counts reflect successful operations");
+    ok(!(SK in state.storage.piChromeSessionTabs), "resources: completed ownership removed from persistence");
+    const again = await w.dispatch("automation.cleanup", { sessionKey: SK });
+    ok(again.closedCreatedTabs === 0 && again.ungroupedAdoptedTabs === 0, "resources: repeated cleanup is idempotent");
+  }
+
+  // A failed close keeps ownership for retry, without claiming success.
+  {
+    const state = makeChromeState();
+    const chrome = makeChrome(state, { withTabGroups: true });
+    const w = loadWorker(chrome);
+    const owned = await w.getOrCreateAutomationTarget(SK);
+    const opened = await w.dispatch("tab.new", { sessionKey: SK });
+    const remove = chrome.tabs.remove;
+    chrome.tabs.remove = async () => { throw new Error("temporary close failure"); };
+    const failed = await w.dispatch("automation.cleanup", { sessionKey: SK });
+    ok(failed.closedCreatedTabs === 0 && failed.closedTabId === null, "retry: failed closes not reported as success");
+    chrome.tabs.remove = remove;
+    const restarted = loadWorker(chrome);
+    await restarted.dispatch("automation.cleanup", { sessionKey: SK });
+    ok(!state.tabs.has(owned.id) && !state.tabs.has(opened.tab.id), "retry: persisted ownership allows retry after restart");
+  }
+
+  // Failed ungrouping also remains retryable; a full browser restart abandons ownership.
+  {
+    const state = makeChromeState();
+    const chrome = makeChrome(state, { withTabGroups: true });
+    const w = loadWorker(chrome);
+    await w.dispatch("tab.group", { sessionKey: SK, targetId: String(state.userGmail.id) });
+    const ungroup = chrome.tabs.ungroup;
+    chrome.tabs.ungroup = async () => { throw new Error("temporary group failure"); };
+    const failed = await w.dispatch("automation.cleanup", { sessionKey: SK });
+    ok(failed.ungroupedAdoptedTabs === 0 && state.userGmail.groupId >= 0, "ungroup retry: failure leaves user tab and ownership intact");
+    chrome.tabs.ungroup = ungroup;
+    await loadWorker(chrome).dispatch("automation.cleanup", { sessionKey: SK });
+    ok(state.userGmail.groupId === -1, "ungroup retry: successful after worker restart");
+    const created = await w.dispatch("tab.new", { sessionKey: SK });
+    for (const key of Object.keys(state.storage)) delete state.storage[key];
+    await loadWorker(chrome).dispatch("automation.cleanup", { sessionKey: SK });
+    ok(state.tabs.has(created.tab.id), "browser restart: cleared storage never reclaims restored tabs by group name");
+  }
+
+  // Runtime tracking still works when storage.session is unavailable.
+  {
+    const state = makeChromeState();
+    const w = loadWorker(makeChrome(state, { withTabGroups: true, withStorage: false }));
+    const opened = await w.dispatch("tab.new", { sessionKey: SK });
+    await w.dispatch("automation.cleanup", { sessionKey: SK });
+    ok(!state.tabs.has(opened.tab.id) && state.tabs.has(state.userGmail.id), "no storage: created tab cleaned up safely");
   }
 
   console.log(`\n${passes} passed, ${failures} failed`);
