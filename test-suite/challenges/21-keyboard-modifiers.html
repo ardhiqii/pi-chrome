@@ -30,9 +30,12 @@ for (const name of ["keydown","keypress","keyup","input"]) {
   });
 }
 
-t.addEventListener("input", () => {
-  if (t.value !== "A") return;
+// input fires before keyup. Grade only when Shift is released so a valid chord
+// cannot fail merely because its release events have not happened yet.
+t.addEventListener("keyup", (event) => {
+  if (event.key !== "Shift") return;
   const bad = [];
+  if (t.value !== "A") bad.push(`value=${JSON.stringify(t.value)} (need 'A')`);
   const downShift = log.find(e => e.name === "keydown" && e.key === "Shift");
   const downA     = log.find(e => e.name === "keydown" && e.code === "KeyA");
   const upShift   = log.find(e => e.name === "keyup"   && e.key === "Shift");

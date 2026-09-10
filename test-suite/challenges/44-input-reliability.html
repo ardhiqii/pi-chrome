@@ -1,0 +1,105 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>44 input reliability</title>
+<link rel="stylesheet" href="../_style.css">
+<script src="../_lib.js"></script>
+<style>
+  [contenteditable] { min-height: 48px; max-height: 180px; overflow: auto; padding: 10px; border: 1px solid #777; white-space: pre-wrap; }
+  label { display: block; margin-top: 20px; }
+  pre { white-space: pre-wrap; }
+</style>
+<body>
+<main>
+  <h1>Upload and text-input reliability</h1>
+  <p>Read <code>window.__inputFixture.caption</code>. Type it into the empty editor,
+    then fill the old multi-paragraph editor with the same text. Leave
+    <code>perCharacter</code> off for both. Native text insertion must preserve
+    Unicode, newlines, and literal markup without hundreds of key events.</p>
+  <details><summary>Exact caption (manual baseline: copy and paste into both editors)</summary><pre id="expected"></pre></details>
+  <label for="typed">Empty editor — chrome_type</label>
+  <div id="typed" role="textbox" aria-label="Empty editor" contenteditable="true"></div>
+  <label for="filled">Old paragraphs — chrome_fill must replace all of them</label>
+  <div id="filled" role="textbox" aria-label="Old paragraphs" contenteditable="true"><div>OLD first paragraph</div><div>OLD second paragraph</div><div>OLD third paragraph</div></div>
+  <label for="keys">Key-event editor — type Ab! with perCharacter:true</label>
+  <div id="keys" role="textbox" aria-label="Key-event editor" contenteditable="true"></div>
+  <label for="shift">Shift-only chords — Shift+a, Shift+1, Shift+/ must produce A!?</label>
+  <input id="shift" aria-label="Shift-only chords" autocomplete="off">
+  <form id="onceForm">
+    <label for="once">Type done with pressEnter:true — submit exactly once</label>
+    <input id="once" aria-label="Single Enter" autocomplete="off">
+    <button type="submit">Submit once</button>
+  </form>
+  <label for="file">Attach test-suite/fixtures/pi-chrome-upload.txt</label>
+  <input id="file" type="file">
+  <p>Node-ID conversion failure is fault-injected by the Node unit tests; this page
+    checks the real file contents and native upload event.</p>
+  <button id="verify" type="button">Verify all input</button>
+</main>
+<script>
+Challenge.init({ id: "input-reliability", instructions: "Complete six fields, then Verify all input" });
+window.__inputFixture = {
+  caption: Array.from({ length: 8 }, (_, i) => `${i + 1}. Caption: café 中文 👩🏽‍💻 — <b>plain text</b>.  Keep spaces.\nSecond paragraph.`).join("\n\n"),
+};
+document.getElementById("expected").textContent = window.__inputFixture.caption;
+const metrics = {};
+const chords = [];
+for (const id of ["typed", "filled", "keys", "shift", "once", "file"]) {
+  const el = document.getElementById(id);
+  metrics[id] = { beforeinput: 0, input: 0, printableKeys: 0, nativeChange: 0 };
+  for (const name of ["keydown", "keyup", "beforeinput", "input", "change"]) {
+    el.addEventListener(name, (event) => {
+      Challenge.log(name, { id, key: event.key, code: event.code, trusted: event.isTrusted, inputType: event.inputType, dataLength: event.data?.length });
+      if (event.isTrusted && name === "beforeinput") metrics[id].beforeinput++;
+      if (event.isTrusted && name === "input") metrics[id].input++;
+      if (event.isTrusted && name === "change") metrics[id].nativeChange++;
+      if (name === "keydown" && event.key.length === 1 && !(event.metaKey || event.ctrlKey || event.altKey)) metrics[id].printableKeys++;
+      if (id === "shift" && (name === "keydown" || name === "keyup")) {
+        chords.push({ name, key: event.key, code: event.code, shiftKey: event.shiftKey, trusted: event.isTrusted });
+      }
+    });
+  }
+}
+let submits = 0;
+document.getElementById("onceForm").addEventListener("submit", (event) => {
+  event.preventDefault();
+  submits++;
+  Challenge.log("submit", { submits, trusted: event.isTrusted });
+});
+
+// innerText reflects contenteditable line breaks; Chrome may preserve repeated
+// spaces using NBSP nodes, which are equivalent here to their rendered spaces.
+function textOf(id) {
+  return document.getElementById(id).innerText.replace(/\r\n/g, "\n").replace(/\u00a0/g, " ");
+}
+document.getElementById("verify").addEventListener("click", async (event) => {
+  const bad = [];
+  if (!event.isTrusted) bad.push("verification click was synthetic");
+  for (const id of ["typed", "filled"]) {
+    if (textOf(id) !== window.__inputFixture.caption) bad.push(`${id}: text/paragraphs do not match`);
+    if (!metrics[id].beforeinput || !metrics[id].input) bad.push(`${id}: missing native beforeinput/input`);
+    if (metrics[id].printableKeys) bad.push(`${id}: ${metrics[id].printableKeys} per-character keydowns (expected native bulk insertion)`);
+    if (document.getElementById(id).querySelector("b")) bad.push(`${id}: literal markup became HTML`);
+  }
+  if (textOf("keys") !== "Ab!" || metrics.keys.printableKeys !== 3 || metrics.keys.input < 3) bad.push("perCharacter editor needs Ab! via three native keystrokes");
+  if (document.getElementById("shift").value !== "A!?") bad.push("Shift-only chords did not type A!?");
+  const expected = [["A", "KeyA"], ["!", "Digit1"], ["?", "Slash"]];
+  for (let i = 0; i < expected.length; i++) {
+    const [key, code] = expected[i];
+    const group = chords.slice(i * 4, i * 4 + 4);
+    if (group.length !== 4 || group.some((e) => !e.trusted) ||
+        group[0].name !== "keydown" || group[0].key !== "Shift" ||
+        group[1].name !== "keydown" || group[1].key !== key || group[1].code !== code || !group[1].shiftKey ||
+        group[2].name !== "keyup" || group[2].key !== key ||
+        group[3].name !== "keyup" || group[3].key !== "Shift") bad.push(`bad Shift chord for ${key}`);
+  }
+  if (chords.length !== 12) bad.push(`Shift chord event count=${chords.length}, expected 12`);
+  if (document.getElementById("once").value !== "done" || submits !== 1) bad.push(`single Enter: value or submission count wrong (${submits})`);
+  const file = document.getElementById("file").files[0];
+  if (!file || file.name !== "pi-chrome-upload.txt" || await file.text() !== "pi-chrome upload fixture\n") bad.push("uploaded file contents do not match fixture");
+  if (!metrics.file.nativeChange) bad.push("upload lacks native change event");
+  Challenge.log("metrics", { metrics, submits, chords });
+  if (bad.length) Challenge.fail(...bad);
+  else Challenge.pass("native bulk text, full replacement, key-event override, Shift chords, single Enter, and file upload");
+});
+</script>
+</body>

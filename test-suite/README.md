@@ -177,6 +177,15 @@ The dashboard renders this from `manifest.json`. In brief:
 41. explicit tab lifecycle
 42. strict CSP eval/snapshot via CDP (regression guard for the CSP bypass)
 43. hard background: inactive-tab visibility and trusted input
+44. input reliability: native rich-editor insertion, full replacement, per-character override, Shift chords, single Enter, and file upload
+
+### Input regressions (16, 21, 31, 44)
+
+Challenge 44 exercises `chrome_type`/`chrome_fill` bulk insertion into contenteditables, including long Unicode text and multiple paragraphs. It also checks `perCharacter:true`, Shift-only printable keys, one Enter per `pressEnter`, and real file contents. Read `window.__inputFixture.caption` and follow its manifest recipe. Use `domFallback:false` to ensure failures are not hidden by synthetic events.
+
+Challenge 16 intentionally requests `perCharacter:true`: its grader requires a caret update for each keystroke. Challenge 21 focuses its field before sending Shift+a and grades after Shift release, not during the earlier input event. Challenge 31 retains standalone upload coverage.
+
+`npm test` also fault-injects zero/missing/rejected upload node IDs, attachment/cleanup failures, stale UIDs, insertion failures, shortcut suppression, and authorization/option forwarding. These mocked tests cannot prove `isTrusted` or real browser selection behavior; run the browser challenges too.
 
 ### Hard-background regression (43)
 

@@ -681,7 +681,13 @@ function cdpKeyInfo(key, shifted) {
   };
   if (SPECIAL[key]) return { key, ...SPECIAL[key] };
   if (key.length === 1) {
-    const ch = key;
+    // Explicit Shift chords need shifted text as well as a modifier bit. CDP does
+    // not derive printable text from code/windowsVirtualKeyCode for us.
+    const SHIFTED = {
+      "`": "~", "1": "!", "2": "@", "3": "#", "4": "$", "5": "%", "6": "^", "7": "&", "8": "*", "9": "(", "0": ")",
+      "-": "_", "=": "+", "[": "{", "]": "}", "\\": "|", ";": ":", "'": "\"", ",": "<", ".": ">", "/": "?",
+    };
+    const ch = shifted ? (/^[a-z]$/.test(key) ? key.toUpperCase() : SHIFTED[key] || key) : key;
     const layout = usKeyLayoutForChar(ch);
     return { key: ch, code: layout.code, windowsVirtualKeyCode: layout.keyCode, text: ch };
   }
@@ -809,13 +815,14 @@ async function chromeInputKey(params) {
     await cdp(tab.id, "Input.dispatchKeyEvent", { type: "keyDown", key: m.key, code: m.code, windowsVirtualKeyCode: m.vk, modifiers: modBits });
     await sleep(rng(6, 18));
   }
-  const info = cdpKeyInfo(key);
-  // When modifiers are active, browsers usually emit "rawKeyDown" (no text) so chords like Cmd+V don't insert the literal char.
-  const downType = modBits ? "rawKeyDown" : "keyDown";
+  const info = cdpKeyInfo(key, mods.shiftKey);
+  // Ctrl/Meta/Alt chords must not insert literal text (e.g. Cmd+V). Shift alone
+  // still types: Shift+a -> A, Shift+1 -> !, and Shift+Enter carries a newline.
+  const shortcut = !!(mods.ctrlKey || mods.metaKey || mods.altKey);
   await cdp(tab.id, "Input.dispatchKeyEvent", {
-    type: downType, key: info.key, code: info.code,
+    type: shortcut ? "rawKeyDown" : "keyDown", key: info.key, code: info.code,
     windowsVirtualKeyCode: info.windowsVirtualKeyCode, nativeVirtualKeyCode: info.windowsVirtualKeyCode,
-    text: modBits ? "" : info.text, unmodifiedText: modBits ? "" : info.text, modifiers: modBits,
+    text: shortcut ? "" : info.text, unmodifiedText: shortcut ? "" : info.text, modifiers: modBits,
   });
   await sleep(rng(25, 90));
   await cdp(tab.id, "Input.dispatchKeyEvent", {
@@ -827,6 +834,49 @@ async function chromeInputKey(params) {
     await cdp(tab.id, "Input.dispatchKeyEvent", { type: "keyUp", key: m.key, code: m.code, windowsVirtualKeyCode: m.vk, modifiers: 0 });
   }
   return { input: "chrome", key: info.key, modifiers: mods };
+}
+
+// Read the actual focused editor, not a role=textbox lookalike. For fill, select
+// the requested editor's entire contents: triple-click only selects a paragraph.
+// Selection uses the DOM; deletion and insertion still use Chrome's input layer.
+async function contentEditableInTab(tabId, selectAllParams = null) {
+  const results = await executeScriptTimed({
+    target: { tabId, frameIds: [0] },
+    world: "MAIN",
+    func: (selector, uid, selectAll) => {
+      const active = document.activeElement;
+      if (selectAll) {
+        const state = window.__PI_CHROME_STATE__;
+        const el = uid ? state?.elements?.[uid] : document.querySelector(selector);
+        if (uid && (!el || !el.isConnected)) throw new Error(`snapshot uid ${uid} is stale; refresh chrome_snapshot`);
+        if (!el?.isContentEditable) return false;
+        if (!active?.isContentEditable || !(el === active || el.contains(active) || active.contains(el))) {
+          throw new Error("chrome.fill: requested contenteditable is not focused");
+        }
+        const selection = window.getSelection();
+        if (!selection) throw new Error("Could not select contenteditable contents");
+        const range = document.createRange();
+        range.selectNodeContents(el);
+        selection.removeAllRanges();
+        selection.addRange(range);
+      }
+      return active?.isContentEditable === true;
+    },
+    args: [selectAllParams?.selector ?? null, selectAllParams?.uid ?? null, selectAllParams !== null],
+  }, `inspect contenteditable in tab ${tabId}`);
+  return results?.[0]?.result === true;
+}
+
+async function typeTextInTab(tabId, text, perCharacter) {
+  if (!text) return "none";
+  if (!perCharacter && await contentEditableInTab(tabId)) {
+    // One native edit avoids per-character delays and rich-editor render races.
+    // Do not retry as keystrokes if insertion fails: it may already have applied.
+    await cdp(tabId, "Input.insertText", { text });
+    return "insertText";
+  }
+  for (const ch of Array.from(text)) await cdpTypeChar(tabId, ch);
+  return "keys";
 }
 
 async function chromeInputType(params) {
@@ -844,12 +894,9 @@ async function chromeInputType(params) {
     await sleep(rng(50, 120));
   }
   const text = String(params.text || "");
-  for (const ch of Array.from(text)) await cdpTypeChar(tab.id, ch);
-  if (params.pressEnter) {
-    await cdpTypeChar(tab.id, "\r").catch(() => undefined);
-    await chromeInputKey({ ...params, key: "Enter" });
-  }
-  return { input: "chrome", length: text.length };
+  const typing = await typeTextInTab(tab.id, text, params.perCharacter);
+  if (params.pressEnter) await chromeInputKey({ ...params, targetId: tab.id, key: "Enter" });
+  return { input: "chrome", length: text.length, typing };
 }
 
 async function domFillFallback(tabId, params, cause) {
@@ -908,14 +955,15 @@ async function chromeInputFill(params) {
       await cdp(tab.id, "Input.dispatchMouseEvent", { type: "mouseReleased", x: point.x, y: point.y, button: "left", buttons: 0, clickCount: i, pointerType: "mouse" });
       await sleep(rng(20, 60));
     }
+    await contentEditableInTab(tab.id, params);
     // Delete selection.
     await cdp(tab.id, "Input.dispatchKeyEvent", { type: "keyDown", key: "Delete", code: "Delete", windowsVirtualKeyCode: 46 });
     await cdp(tab.id, "Input.dispatchKeyEvent", { type: "keyUp", key: "Delete", code: "Delete", windowsVirtualKeyCode: 46 });
     await sleep(rng(20, 60));
     const text = String(params.text || "");
-    for (const ch of Array.from(text)) await cdpTypeChar(tab.id, ch);
-    if (params.submit) await chromeInputKey({ ...params, key: "Enter" });
-    return { input: "chrome", length: text.length };
+    const typing = await typeTextInTab(tab.id, text, params.perCharacter);
+    if (params.submit) await chromeInputKey({ ...params, targetId: tab.id, key: "Enter" });
+    return { input: "chrome", length: text.length, typing };
   } catch (error) {
     if (params.domFallback === false) throw error;
     return domFillFallback(tab.id, params, error);
@@ -1024,25 +1072,31 @@ async function chromeInputUpload(params) {
     const selector = ${JSON.stringify(params.selector ?? null)};
     const uid = ${JSON.stringify(params.uid ?? null)};
     const state = window.__PI_CHROME_STATE__;
-    const el = uid && state && state.elements ? state.elements[uid] : (selector ? document.querySelector(selector) : null);
+    const el = uid ? state?.elements?.[uid] : (selector ? document.querySelector(selector) : null);
+    if (uid && (!el || !el.isConnected)) throw new Error("snapshot uid " + uid + " is stale; refresh chrome_snapshot");
     if (!el || el.tagName !== "INPUT" || el.type !== "file") throw new Error("Target must be <input type=file>");
     el.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
     return el;
   })()`;
   const evaluated = await cdp(tab.id, "Runtime.evaluate", { expression, objectGroup: "pi-chrome-upload", includeCommandLineAPI: false, returnByValue: false });
-  if (evaluated.exceptionDetails) throw new Error(evaluated.exceptionDetails.text || "Could not resolve file input");
+  if (evaluated.exceptionDetails) throw new Error(cdpExceptionText(evaluated.exceptionDetails) || "Could not resolve file input");
   const objectId = evaluated.result?.objectId;
   if (!objectId) throw new Error("Could not resolve file input object");
-  await cdp(tab.id, "DOM.enable", {}).catch(() => undefined);
-  const requested = await cdp(tab.id, "DOM.requestNode", { objectId });
-  if (!requested.nodeId) throw new Error("Could not resolve file input node");
-  await cdp(tab.id, "DOM.setFileInputFiles", { nodeId: requested.nodeId, files: paths });
-  await cdp(tab.id, "Runtime.callFunctionOn", {
-    objectId,
-    functionDeclaration: `function() { this.dispatchEvent(new Event("input", { bubbles: true })); this.dispatchEvent(new Event("change", { bubbles: true })); return this.files ? this.files.length : 0; }`,
-    returnByValue: true,
-  }).catch(() => undefined);
-  await cdp(tab.id, "Runtime.releaseObject", { objectId }).catch(() => undefined);
+  try {
+    await cdp(tab.id, "DOM.enable", {}).catch(() => undefined);
+    // Some DOM agents return nodeId:0 (or reject conversion) for a valid remote
+    // element. CDP accepts that same objectId directly, before any file mutation.
+    const requested = await cdp(tab.id, "DOM.requestNode", { objectId }).catch(() => null);
+    const target = requested?.nodeId ? { nodeId: requested.nodeId } : { objectId };
+    await cdp(tab.id, "DOM.setFileInputFiles", { ...target, files: paths });
+    await cdp(tab.id, "Runtime.callFunctionOn", {
+      objectId,
+      functionDeclaration: `function() { this.dispatchEvent(new Event("input", { bubbles: true })); this.dispatchEvent(new Event("change", { bubbles: true })); return this.files ? this.files.length : 0; }`,
+      returnByValue: true,
+    }).catch(() => undefined);
+  } finally {
+    await cdp(tab.id, "Runtime.releaseObject", { objectId }).catch(() => undefined);
+  }
   return { input: "chrome", uploaded: paths.map((path) => ({ path })) };
 }
 // ===============================================================
