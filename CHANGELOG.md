@@ -2,6 +2,12 @@
 
 All notable user-facing changes to `pi-chrome`.
 
+## 0.15.51 — 2026-09-10
+
+- **Fewer Chrome commands.** Removed `/chrome status`; use bare `/chrome` for the quick connection, authorization, and background dashboard plus controls. The dashboard remains lightweight and does not run page probes.
+- **Complete Doctor report.** `/chrome doctor` now includes authorization and background state alongside connection, version, page checks, and troubleshooting hints, even when Chrome is offline or outdated.
+- **Command regressions.** Added tests for command dispatch/completion, lightweight dashboard behavior, Doctor state reporting, and failure paths. `/chrome background status` remains available.
+
 ## 0.15.50 — 2026-09-10
 
 - **README clarity.** Lead with workflow examples, correct setup ordering and platform-specific onboarding instructions, and clarify privacy guidance. Describe background behavior and the on/off/status controls directly.

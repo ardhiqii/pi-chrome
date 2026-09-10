@@ -90,17 +90,19 @@ If page inspection or evaluation is blocked, use screenshots and coordinate inpu
 ## Commands
 
 ```text
+/chrome                      # quick connection/auth/background dashboard and controls
 /chrome onboard              # one-time companion setup
 /chrome authorize            # authorize this Pi session for 15 minutes
 /chrome authorize 30m        # choose a duration
 /chrome authorize indefinite # no time limit; revoke when finished
 /chrome revoke               # lock tools and request session cleanup
-/chrome doctor               # connection, version, and page checks
-/chrome status               # connection, authorization, and background state
+/chrome doctor               # full diagnostics, including authorization/background state
 /chrome background on        # default: block explicit focus/tab activation
 /chrome background off       # allow foreground/watch mode
 /chrome background status
 ```
+
+Bare `/chrome` checks the connection without running page probes. Use `/chrome doctor` for version and page checks, troubleshooting hints, and authorization/background state.
 
 Tool parameters are documented inline in Pi. See [architecture](./docs/ARCHITECTURE.md) for target ownership, screenshot behavior, and background-policy details.
 
