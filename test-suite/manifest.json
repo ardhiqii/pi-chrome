@@ -1565,6 +1565,9 @@
     "difficulty": "L2",
     "gate": "core",
     "goal": "Create a new tab, inspect it, close it, return to the parent tab, and verify tab lifecycle state.",
+    "prerequisites": [
+      "Ask the user to run /chrome background off for this explicit activation test. Background on intentionally blocks chrome_tab activate."
+    ],
     "expected": {
       "synthetic": "CONDITIONAL",
       "trusted": "PASS",
@@ -1677,5 +1680,77 @@
     ],
     "manualBaseline": "unverified",
     "gradeSource": "page"
+  },
+  {
+    "id": "hard-background",
+    "file": "challenges/43-hard-background.html",
+    "category": "focus-keyboard",
+    "difficulty": "L2",
+    "gate": "conditional",
+    "goal": "Snapshot and screenshot an inactive target with background:false, then send a trusted click without activating it. Inspect the screenshot for the colored target.",
+    "expected": {
+      "synthetic": "FAIL",
+      "trusted": "PASS",
+      "manual": "FAIL"
+    },
+    "prerequisites": [
+      "Keep /chrome background on. Reload both Pi and the updated Chrome companion.",
+      "Open the target, manually select a different tab in the same window, then return to Pi before arming. Do not select the target until grading finishes."
+    ],
+    "recipe": [
+      {
+        "tool": "chrome_evaluate",
+        "params": {
+          "urlIncludes": "/43-hard-background.html",
+          "expression": "armBackgroundProbe()",
+          "background": true
+        }
+      },
+      {
+        "tool": "chrome_snapshot",
+        "params": {
+          "urlIncludes": "/43-hard-background.html",
+          "background": false
+        }
+      },
+      {
+        "tool": "chrome_screenshot",
+        "params": {
+          "urlIncludes": "/43-hard-background.html",
+          "path": ".pi/chrome-screenshots/hard-background.png",
+          "background": false
+        }
+      },
+      {
+        "tool": "chrome_click",
+        "params": {
+          "urlIncludes": "/43-hard-background.html",
+          "selector": "#verify",
+          "background": false,
+          "domFallback": false,
+          "includeSnapshot": true
+        }
+      },
+      {
+        "tool": "chrome_evaluate",
+        "params": {
+          "urlIncludes": "/43-hard-background.html",
+          "expression": "JSON.stringify({v:window.__verdict,r:window.__reason,e:window.__events})",
+          "background": true
+        }
+      }
+    ],
+    "requires": {
+      "cdp": true
+    },
+    "tags": ["background", "visibility", "screenshot", "trusted-input"],
+    "notes": [
+      "The page grades visibility and isTrusted, not OS focus or macOS Spaces. The runner must also inspect the screenshot for target fidelity.",
+      "Manual FAIL is intentional: a normal human click requires selecting the hidden tab. Synthetic FAIL detects replacing Chrome input with DOM events.",
+      "Selecting the target while armed causes sticky FAIL, including after PASS. Read results through background tools before returning to this tab."
+    ],
+    "flakeRisk": "medium",
+    "manualBaseline": "unverified",
+    "gradeSource": "both"
   }
 ]

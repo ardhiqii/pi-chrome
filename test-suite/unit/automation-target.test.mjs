@@ -345,7 +345,7 @@ async function run() {
     ok(state.tabs.has(state.userArticle.id), "tab.close: user's active tab was NOT closed");
     ok(state.windows.size === windowsBefore && state.tabs.size === tabsBefore, "tab.close: did not spawn a throwaway tab/window");
 
-    await throwsWith(() => w.dispatch("tab.activate", { sessionKey: SK }), /no automation tab yet|Pass targetId/, "tab.activate: errors with no target/owned target");
+    await throwsWith(() => w.dispatch("tab.activate", { sessionKey: SK, foreground: true }), /no automation tab yet|Pass targetId/, "tab.activate: errors with no target/owned target");
 
     // Once an automation target exists, management actions operate on it (not on the user tab).
     const nav = await w.dispatch("page.navigate", { url: "https://pi.test/manage", waitUntilLoad: false, sessionKey: SK });

@@ -2,6 +2,14 @@
 
 All notable user-facing changes to `pi-chrome`.
 
+## 0.15.48 — 2026-09-09
+
+- **Existing background mode is now hard background.** `/chrome background on` (still the default) overrides per-call foreground requests, keeps new tabs inactive, and blocks `chrome_tab activate`. Use the existing `/chrome background off` for foreground/watch mode; no new command or lock state.
+- **Screenshots without tab activation.** PNG/JPEG and full-page tiles use CDP instead of `captureVisibleTab`. Debugger/capture failures never fall back to switching tabs. Old companions reject background creation/capture with a reload instruction. Screenshot tools now require debugger access.
+- **Trusted input preserved.** Background policy does not replace Chrome input with synthetic events. It blocks explicit focus/activation, not page/native/Chrome/OS side effects; inactive-page rendering and focus-gated workflows can still vary by environment.
+- **Regression coverage.** Added policy/worker/screenshot unit tests and challenge 43 for inactive-tab visibility plus trusted input. Full-page capture restores both scroll axes best-effort after success or failure.
+- **Live validation and unresolved limitation.** Chrome 152/macOS checks passed for inactive tab creation, blocked activation, background PNG/JPEG/full-page capture, and scroll restoration. The trusted-click check encountered debugger detachment, then a visibility failure on retry; the cause remains unresolved and human interference was not ruled out. This release does not promise zero focus changes during trusted input. Chrome-behind-another-app and macOS Spaces behavior remain unverified.
+
 ## 0.15.47 — 2026-09-09
 
 - **Bounded session cleanup.** On exit, Pi waits up to two seconds for cleanup before stopping the bridge. Reload preserves browser resources; revoke remains non-blocking.

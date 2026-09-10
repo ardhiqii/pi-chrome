@@ -134,7 +134,7 @@ If your threat model excludes extensions with broad permissions, neither approac
 
 ## Public benchmarks worth knowing (for axis 2 / axis 3 comparison)
 
-Pi-chrome itself ships a benchmark suite ([`../test-suite/`](../test-suite)) of **42 primitive challenges** plus **4 hermetic BrowserGym-style long-horizon tasks** covering trusted input, pointer humanization, keyboard fidelity, drag/drop, Shadow DOM, iframes, file uploads, strict-CSP screenshot fallback and CDP eval/snapshot bypass, dynamic waits, tab lifecycle, network observability, fingerprint leaks, and agent-safety honeypots. Scoring tracks expected outcomes per challenge instead of raw PASS count, with `core`, `conditional`, and `quality` gate buckets. That's **driver-level** grading.
+Pi-chrome itself ships a benchmark suite ([`../test-suite/`](../test-suite)) of **43 primitive challenges** plus **4 hermetic BrowserGym-style long-horizon tasks** covering trusted input, pointer humanization, keyboard fidelity, drag/drop, Shadow DOM, iframes, file uploads, strict-CSP screenshot fallback and CDP eval/snapshot bypass, dynamic waits, tab lifecycle, network observability, fingerprint leaks, and agent-safety honeypots. Scoring tracks expected outcomes per challenge instead of raw PASS count, with `core`, `conditional`, and `quality` gate buckets. That's **driver-level** grading.
 
 For **agent-level** comparison (axis 2), the public benchmarks worth citing:
 

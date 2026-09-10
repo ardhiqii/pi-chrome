@@ -46,14 +46,26 @@ To point pi-chrome at an existing tab, pass `targetId`, `urlIncludes`, or `title
 
 ## Background mode
 
-By default, chrome calls run in background so Chrome does not steal focus.
+The existing background setting is a hard session policy, enabled by default. No separate lock/unlock command is needed.
 
 ```text
-/chrome background on       # background mode
-/chrome background off      # foreground/watch mode
+/chrome background on       # enforce no explicit window focus/tab activation
+/chrome background off      # allow foreground/watch mode
 ```
 
-Per-call `background: false` brings Chrome forward for that action. Per-call `background: true` forces background.
+- With background on, per-call `background:false` and legacy `foreground:true` cannot override the policy. `chrome_tab activate` errors with instructions to ask the user to turn background off.
+- With background off, calls may focus Chrome; per-call `background:true` still avoids explicit focus/tab activation.
+- Policy is applied in `authorizedBridgeSend` for every tool, including `chrome_launch(url)`, tab creation, and tools without a background parameter. Each session sends its own effective `background`/`foreground` flags through the shared bridge.
+- All worker window-focus/tab-activation writes go through a guarded helper. Background tab creation uses `active:false`; implicit automation windows remain `focused:false`.
+- Screenshots use CDP `Page.captureScreenshot` with `fromSurface:true` and `captureBeyondViewport:false`. They target a tab, not whichever tab happens to be visible. There is no `captureVisibleTab`/activation fallback on debugger or capture failure. PNG/JPEG output is unchanged; full-page capture retains tiles plus a JSON manifest and restores scroll position best-effort, including on failure.
+- Background tab creation and screenshots use internal `tab.new.background` / `page.screenshot.background` wire actions. Old companions reject them before changing tabs; Pi reports a reload instruction instead of retrying an unsafe legacy action. No capability-probe race or extra round trip is needed.
+- Real CDP input and existing explicit DOM-fallback controls are unchanged. Background mode never silently substitutes synthetic input to avoid focus.
+
+### Scope and risks
+
+This is a policy against **explicit pi-chrome focus/activation**, not an OS focus sandbox. Page scripts (`window.open`, `window.focus`), trusted input, native dialogs, debugger banners, Chrome window/Spaces behavior, and closing an active tab can still change focus or selection. Other sessions and human actions remain independent. Requests already dispatched before a mode change keep their earlier policy.
+
+Inactive/minimized tabs can throttle timers or rendering, and clipboard/fullscreen/other focus-gated workflows may fail. Screenshots now require debugger attachment, which can conflict with DevTools or other extensions; hidden-tab rendering can differ or be unavailable. No automatic foreground retry is allowed. Full-page capture temporarily scrolls the target page. Reload both Pi and the Chrome companion after upgrading, and live-test tab selection, OS focus, and screenshot fidelity on supported Chrome/OS versions.
 
 ## Authorization
 

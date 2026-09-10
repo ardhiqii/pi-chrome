@@ -745,7 +745,7 @@ async function domClickFallback(tabId, params, cause) {
 
 async function chromeInputClick(params) {
   const tab = await getTabByParams(params);
-  if (params.foreground) await bringToFront(tab);
+  await bringToFront(tab, params);
   try {
     await attachDebugger(tab.id);
     const resolved = await resolveTargetInTab(tab.id, params);
@@ -782,7 +782,7 @@ async function chromeInputClick(params) {
 
 async function chromeInputHover(params) {
   const tab = await getTabByParams(params);
-  if (params.foreground) await bringToFront(tab);
+  await bringToFront(tab, params);
   await attachDebugger(tab.id);
   const resolved = await resolveTargetInTab(tab.id, params);
   const point = resolved.rect ? pickInsideRect(resolved.rect) : { x: resolved.x, y: resolved.y };
@@ -793,7 +793,7 @@ async function chromeInputHover(params) {
 
 async function chromeInputKey(params) {
   const tab = await getTabByParams(params);
-  if (params.foreground) await bringToFront(tab);
+  await bringToFront(tab, params);
   await attachDebugger(tab.id);
   const key = String(params.key || "");
   if (!key) throw new Error("chrome.key: missing key");
@@ -831,7 +831,7 @@ async function chromeInputKey(params) {
 
 async function chromeInputType(params) {
   const tab = await getTabByParams(params);
-  if (params.foreground) await bringToFront(tab);
+  await bringToFront(tab, params);
   await attachDebugger(tab.id);
   if (params.selector || params.uid) {
     // Focus target by clicking it first.
@@ -894,7 +894,7 @@ async function domFillFallback(tabId, params, cause) {
 
 async function chromeInputFill(params) {
   const tab = await getTabByParams(params);
-  if (params.foreground) await bringToFront(tab);
+  await bringToFront(tab, params);
   try {
     await attachDebugger(tab.id);
     if (!(params.selector || params.uid)) throw new Error("chrome.fill: selector or uid required");
@@ -924,7 +924,7 @@ async function chromeInputFill(params) {
 
 async function chromeInputScroll(params) {
   const tab = await getTabByParams(params);
-  if (params.foreground) await bringToFront(tab);
+  await bringToFront(tab, params);
   await attachDebugger(tab.id);
   const resolved = (params.selector || params.uid) ? await resolveTargetInTab(tab.id, params) : { x: 100, y: 100, rect: null };
   const x = resolved.rect ? resolved.rect.left + Math.min(resolved.rect.width, 800) / 2 : resolved.x;
@@ -974,7 +974,7 @@ async function chromeInputScroll(params) {
 
 async function chromeInputTap(params) {
   const tab = await getTabByParams(params);
-  if (params.foreground) await bringToFront(tab);
+  await bringToFront(tab, params);
   await attachDebugger(tab.id);
   const resolved = (params.selector || params.uid || (typeof params.x === "number" && typeof params.y === "number"))
     ? await resolveTargetInTab(tab.id, params)
@@ -990,7 +990,7 @@ async function chromeInputTap(params) {
 
 async function chromeInputDrag(params) {
   const tab = await getTabByParams(params);
-  if (params.foreground) await bringToFront(tab);
+  await bringToFront(tab, params);
   await attachDebugger(tab.id);
   const from = await resolveTargetInTab(tab.id, { selector: params.fromSelector ?? null, uid: params.fromUid ?? null, x: params.fromX ?? null, y: params.fromY ?? null });
   const to = await resolveTargetInTab(tab.id, { selector: params.toSelector ?? null, uid: params.toUid ?? null, x: params.toX ?? null, y: params.toY ?? null });
@@ -1015,7 +1015,7 @@ async function chromeInputDrag(params) {
 
 async function chromeInputUpload(params) {
   const tab = await getTabByParams(params);
-  if (params.foreground) await bringToFront(tab);
+  await bringToFront(tab, params);
   await attachDebugger(tab.id);
   if (!(params.selector || params.uid)) throw new Error("chrome.upload: selector or uid required");
   const paths = Array.isArray(params.paths) ? params.paths.map(String) : [];
@@ -1208,22 +1208,29 @@ async function dispatch(action, params) {
         extensionVersion: chrome.runtime.getManifest().version,
         bridgeUrl: BRIDGE_URL,
         userAgent: navigator.userAgent,
+        capabilities: { hardBackground: true },
       };
     case "tab.list": {
       const tabs = await chrome.tabs.query({});
       return Promise.all(tabs.map(formatTab));
     }
+    case "tab.new.background":
+    case "page.screenshot.background":
+      // Older workers reject these action names before touching tabs. Do not replace this with
+      // a capability probe followed by an old action: a reload/profile change can race the probe.
+      return dispatch(action.slice(0, -".background".length), { ...params, background: true, foreground: false });
     case "tab.new": {
       // Every Pi-opened tab must join a tab group. There is intentionally no opt-out: an ungrouped
       // Pi-created tab is easy to lose among user tabs. If grouping fails after creation, close the
       // tab best-effort before surfacing the error so tab.new never leaves an ungrouped Pi tab.
       const groupTitle = params.groupTitle || "Pi";
       const existingGroup = await findGroupRecordByTitle(groupTitle);
-      const createParams = { url: params.url || "about:blank", active: true };
+      const createParams = { url: params.url || "about:blank", active: foregroundRequested(params) };
       if (existingGroup && typeof existingGroup.windowId === "number") createParams.windowId = existingGroup.windowId;
       const tab = await chrome.tabs.create(createParams);
       await trackSessionTab(sessionKeyOf(params), tab.id, true);
       try {
+        await bringToFront(tab, params);
         return await groupTab(tab, groupTitle, params.groupColor);
       } catch (error) {
         if (typeof tab.id === "number") await chrome.tabs.remove(tab.id).catch(() => {});
@@ -1231,12 +1238,14 @@ async function dispatch(action, params) {
       }
     }
     case "tab.activate": {
+      if (!foregroundRequested(params)) {
+        throw new Error("Tab activation is blocked by background mode. Ask the user to run /chrome background off to allow foreground work.");
+      }
       // Management actions never auto-create an automation target (createOwnedTarget:false): with
       // no explicit target they act on an owned target if one exists, else error — they must never
       // fall back to (or spawn a tab just to touch) the user's active tab.
       const tab = await getTabByParams(params, { createOwnedTarget: false });
-      await chrome.windows.update(tab.windowId, { focused: true });
-      return formatTab(await chrome.tabs.update(tab.id, { active: true }));
+      return formatTab(await bringToFront(tab, params));
     }
     case "tab.group": {
       const tab = await getTabByParams(params, { createOwnedTarget: false });
@@ -1292,7 +1301,7 @@ async function dispatch(action, params) {
       // Poll from the service worker via CDP (bypasses CSP). The old approach ran the polling
       // loop in-page with new Function() for expression checks, which fails under strict CSP.
       const tab = await getTabByParams(params);
-      if (params.foreground) await bringToFront(tab);
+      await bringToFront(tab, params);
       const timeoutMs = params.timeoutMs || 10000;
       const intervalMs = params.intervalMs || 250;
       const started = Date.now();
@@ -1316,7 +1325,7 @@ async function dispatch(action, params) {
       return executeInTab(params, probePage, []);
     case "page.navigate": {
       const tab = await getTabByParams(params);
-      if (params.foreground) await bringToFront(tab);
+      await bringToFront(tab, params);
       if (params.initScript) {
         // Register a one-shot document_start content script. We register, navigate, wait, then unregister.
         await registerInitScript(tab.id, params.initScript);
@@ -1477,7 +1486,7 @@ const HELPER_FUNCS = [
 
 async function executeInTab(params, func, args) {
   const tab = await getTabByParams(params);
-  if (params.foreground) await bringToFront(tab);
+  await bringToFront(tab, params);
 
   // Phase 1: define the helpers and the action function as page globals via CDP
   // Runtime.evaluate. This bypasses page CSP (no `eval`/`new Function`), which is the
@@ -1544,7 +1553,7 @@ function piEvalStringify(v) {
 // pages that ship `script-src 'self'` without `'unsafe-eval'` (which blocks `eval`/`new Function`).
 async function evaluateInTab(params) {
   const tab = await getTabByParams(params);
-  if (params.foreground) await bringToFront(tab);
+  await bringToFront(tab, params);
   const expression = String(params.expression ?? "");
   const stringifySrc = `(${piEvalStringify.toString()})`;
   // Wrap the user expression so the result is run through piEvalStringify in-page before it
@@ -1591,7 +1600,7 @@ async function withOptionalSnapshot(params, actionFn) {
 // It shares window.__PI_CHROME_STATE__ (same el- uid scheme) with the CDP-injected input helpers.
 async function snapshotInTab(params) {
   const tab = await getTabByParams(params);
-  if (params.foreground) await bringToFront(tab);
+  await bringToFront(tab, params);
   const args = [
     params.maxElements || 80,
     params.containingText ?? null,
@@ -1635,7 +1644,7 @@ async function snapshotInTab(params) {
 async function inspectInTab(params) {
   if (!params.uid && !params.selector) throw new Error("chrome_inspect requires uid or selector");
   const tab = await getTabByParams(params);
-  if (params.foreground) await bringToFront(tab);
+  await bringToFront(tab, params);
   const args = [params.uid ?? null, params.selector ?? null, params.scrollIntoView === true];
   await executeScriptTimed({
     target: { tabId: tab.id, frameIds: [0] },
@@ -1705,9 +1714,15 @@ if (chrome.webNavigation && chrome.webNavigation.onCommitted) {
   });
 }
 
-async function bringToFront(tab) {
+function foregroundRequested(params) {
+  // Fail quiet when unspecified, and let background veto even a contradictory foreground flag.
+  return params?.foreground === true && params.background !== true;
+}
+
+async function bringToFront(tab, params) {
+  if (!foregroundRequested(params)) return tab;
   await chrome.windows.update(tab.windowId, { focused: true });
-  await chrome.tabs.update(tab.id, { active: true });
+  return chrome.tabs.update(tab.id, { active: true });
 }
 
 function waitForTabComplete(tabId, timeoutMs) {
@@ -1727,50 +1742,51 @@ function waitForTabComplete(tabId, timeoutMs) {
   });
 }
 
-async function takeScreenshot(params) {
-  const tab = await getTabByParams(params);
-  if (params.foreground) await bringToFront(tab);
-  let previousActiveId;
-  if (!tab.active) {
-    const activeBefore = await chrome.tabs.query({ active: true, windowId: tab.windowId });
-    previousActiveId = activeBefore[0]?.id;
-    await chrome.tabs.update(tab.id, { active: true });
-  }
+async function captureTabScreenshot(tabId, params) {
+  const format = params.format || "png";
   try {
-    if (params.fullPage) {
-      // Tile-stitched full page capture: scroll, capture, paste, repeat.
-      const tiles = await executeInTab({ ...params, foreground: false }, captureFullPageTiles, []);
-      // captureFullPageTiles only computes scroll positions / metrics; we capture per scroll here
-      // (chrome.tabs.captureVisibleTab can't be called from MAIN world).
-      const captured = [];
-      for (const tile of tiles.tiles) {
-        await executeInTab({ ...params, foreground: false }, scrollToY, [tile.scrollY]);
-        // Small settle delay; many sites have on-scroll animations / lazy-load.
-        await sleep(120);
-        const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, {
-          format: params.format || "png",
-          quality: params.format === "jpeg" ? params.quality : undefined,
-        });
-        captured.push({ y: tile.y, dataUrl });
-      }
-      await executeInTab({ ...params, foreground: false }, scrollToY, [tiles.originalScrollY]);
-      return {
-        fullPage: true,
-        tab: await formatTab(tab),
-        dimensions: { width: tiles.width, height: tiles.height, viewportHeight: tiles.viewportHeight, dpr: tiles.dpr },
-        tiles: captured,
-      };
-    }
-    const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, {
-      format: params.format || "png",
-      quality: params.format === "jpeg" ? params.quality : undefined,
-    });
-    return { dataUrl, tab: await formatTab(tab) };
-  } finally {
-    if (previousActiveId !== undefined && previousActiveId !== tab.id) {
-      await chrome.tabs.update(previousActiveId, { active: true }).catch(() => undefined);
-    }
+    await attachDebugger(tabId);
+    const captureParams = { format, fromSurface: true, captureBeyondViewport: false };
+    if (format === "jpeg" && params.quality !== undefined) captureParams.quality = params.quality;
+    const result = await cdp(tabId, "Page.captureScreenshot", captureParams);
+    if (typeof result?.data !== "string" || !result.data) throw new Error("CDP returned no screenshot data");
+    return `data:image/${format};base64,${result.data}`;
+  } catch (error) {
+    // captureVisibleTab requires activation and can race with the user switching tabs. Never
+    // use it as a fallback, even when debugger attachment or background rendering fails.
+    throw new Error(`Chrome screenshot via CDP failed; no tab-activation fallback was attempted. ${error?.message || error}`);
   }
+}
+
+async function takeScreenshot(params) {
+  const tab = await bringToFront(await getTabByParams(params), params);
+  if (params.fullPage) {
+    // Preserve the existing tile + manifest contract. Every tile captures the same resolved tab,
+    // without activation; selector/title changes during capture must not retarget later tiles.
+    const targetParams = { ...params, targetId: tab.id, foreground: false };
+    const tiles = await executeInTab(targetParams, captureFullPageTiles, []);
+    const captured = [];
+    try {
+      for (const tile of tiles.tiles) {
+        await executeInTab(targetParams, scrollToY, [tile.scrollY]);
+        await sleep(120); // Let scroll/lazy-load handlers settle.
+        captured.push({ y: tile.y, dataUrl: await captureTabScreenshot(tab.id, params) });
+      }
+    } finally {
+      // A failed tile must not strand the page at a new scroll position. Restore both axes
+      // best-effort, without masking the capture error if the tab/debugger is gone.
+      await executeInTab(targetParams, scrollToY, [tiles.originalScrollY, tiles.originalScrollX]).catch(() => undefined);
+    }
+    return {
+      fullPage: true,
+      method: "cdp",
+      tab: await formatTab(tab),
+      dimensions: { width: tiles.width, height: tiles.height, viewportHeight: tiles.viewportHeight, dpr: tiles.dpr },
+      tiles: captured,
+    };
+  }
+  const dataUrl = await captureTabScreenshot(tab.id, params);
+  return { dataUrl, method: "cdp", tab: await formatTab(tab) };
 }
 
 // ---------------------------------------------------------------------------
@@ -2197,8 +2213,7 @@ function probePage() {
 }
 
 function captureFullPageTiles() {
-  // Returns the *plan* for tile capture; the actual chrome.tabs.captureVisibleTab calls happen
-  // in the SW. We just report the scroll positions and metrics.
+  // Returns the plan for CDP tile capture in the worker: scroll positions and page metrics.
   const html = document.documentElement;
   const body = document.body;
   const width = Math.max(html.scrollWidth, body ? body.scrollWidth : 0, innerWidth);
@@ -2206,17 +2221,18 @@ function captureFullPageTiles() {
   const viewportHeight = innerHeight;
   const dpr = window.devicePixelRatio || 1;
   const originalScrollY = scrollY;
+  const originalScrollX = scrollX;
   const tiles = [];
   let y = 0;
   while (y < height) {
     tiles.push({ y, scrollY: y });
     y += viewportHeight;
   }
-  return { width, height, viewportHeight, dpr, originalScrollY, tiles };
+  return { width, height, viewportHeight, dpr, originalScrollY, originalScrollX, tiles };
 }
 
-function scrollToY(y) {
-  window.scrollTo({ top: y, left: 0, behavior: "instant" });
+function scrollToY(y, x = 0) {
+  window.scrollTo({ top: y, left: x, behavior: "instant" });
   return { scrollY };
 }
 

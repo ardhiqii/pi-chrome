@@ -176,6 +176,15 @@ The dashboard renders this from `manifest.json`. In brief:
 40. dynamic wait/readiness
 41. explicit tab lifecycle
 42. strict CSP eval/snapshot via CDP (regression guard for the CSP bypass)
+43. hard background: inactive-tab visibility and trusted input
+
+### Hard-background regression (43)
+
+Keep `/chrome background on`. Open challenge 43, then manually select a different tab in the **same window** and return to Pi. Target the challenge URL explicitly, arm its probe, and run its manifest recipe without selecting the target again. Inspect the saved screenshot for the colored target. The page detects visibility changes and synthetic input; it cannot establish OS focus or macOS Spaces behavior.
+
+Separately live-test with Chrome behind another app, a minimized window, multiple windows, and macOS Spaces. Confirm the foreground app/window and each active tab stay unchanged during background new-tab creation, viewport/full-page screenshots, and trusted input. Confirm `/chrome background off` permits explicit activation. Native prompts/page popups are outside this focus policy, not a zero-focus guarantee.
+
+`npm test` runs mocked regressions for every registered tool's policy, old-companion rejection, worker focus writes, CDP capture success/failure, trusted input, and full-page scroll restoration. No live Chrome is required; Node.js 22.13+ is required for TypeScript stripping.
 
 ## Design notes
 
