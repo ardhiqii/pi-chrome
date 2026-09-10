@@ -992,7 +992,11 @@ Usage rules:
 	// Shared handlers, dispatched by the unified /chrome command below.
 	const doctorHandler = async (ctx: ExtensionContext) => {
 			ctx.ui.notify("Checking pi-chrome…", "info");
-			const lines: string[] = [`pi-chrome v${PI_CHROME_VERSION}`];
+			const lines: string[] = [
+				`pi-chrome v${PI_CHROME_VERSION}`,
+				`• Authorization: ${authSummary()}.`,
+				`• Background: ${backgroundEnabled ? "on (hard)" : "off (foreground/watch mode)"}.`,
+			];
 			const status = bridge.status();
 			const roleLabel = status.mode === "client" ? "sharing another pi session's connection" : "running the Chrome connection for this machine";
 			lines.push(`• This pi session is ${roleLabel}.`);
@@ -1144,8 +1148,7 @@ Usage rules:
 		);
 	};
 
-	// One-line snapshot of pi-chrome's current state. Used as a header in the bare-/chrome
-	// picker and as the body of /chrome status.
+	// Lightweight connection/auth/background header for the bare-/chrome picker. No page probes.
 	const statusSummary = async (): Promise<string> => {
 		const parts: string[] = [];
 		try {
@@ -1161,11 +1164,6 @@ Usage rules:
 		parts.push(`auth: ${authSummary()}`);
 		parts.push(`background: ${backgroundEnabled ? "on (hard)" : "off"}`);
 		return parts.join(" · ");
-	};
-
-	const statusHandler = async (ctx: ExtensionContext) => {
-		ctx.ui.notify("Checking Chrome connection…", "info");
-		ctx.ui.notify(await statusSummary(), "info");
 	};
 
 	const openAuthorizeMenu = async (ctx: ExtensionContext): Promise<void> => {
@@ -1225,7 +1223,7 @@ Usage rules:
 
 	pi.registerCommand("chrome", {
 		description:
-			"All pi-chrome controls in one place.\n  /chrome authorize [15m|30m|<minutes>|indefinite] — allow this Pi session to use chrome_* tools.\n  /chrome revoke   — lock Chrome control.\n  /chrome status   — one-line snapshot of connection, auth, and background setting.\n  /chrome doctor   — full health check.\n  /chrome onboard  — install the Chrome companion extension.\n  /chrome background [on|off|status|toggle] — enforce no explicit focus/tab activation, or allow foreground/watch mode.\nRun with no arguments for an interactive picker that shows current state.",
+			"All pi-chrome controls in one place.\n  /chrome authorize [15m|30m|<minutes>|indefinite] — allow this Pi session to use chrome_* tools.\n  /chrome revoke   — lock Chrome control.\n  /chrome doctor   — full health check plus authorization and background state.\n  /chrome onboard  — install the Chrome companion extension.\n  /chrome background [on|off|status|toggle] — enforce no explicit focus/tab activation, or allow foreground/watch mode.\nRun with no arguments for an interactive picker that shows current state.",
 		getArgumentCompletions: (prefix) => {
 			const raw = prefix;
 			const trimmedRight = raw.replace(/\s+$/, "");
@@ -1244,8 +1242,7 @@ Usage rules:
 				candidates = [
 					{ fullValue: "authorize", label: "authorize", description: "Allow this Pi session to use chrome_* tools." },
 					{ fullValue: "revoke", label: "revoke", description: "Lock Chrome control for this Pi session." },
-					{ fullValue: "status", label: "status", description: "One-line summary: connection, auth, and background setting." },
-					{ fullValue: "doctor", label: "doctor", description: "Full health check. Tells you if Chrome is connected and what's wrong if it isn't." },
+					{ fullValue: "doctor", label: "doctor", description: "Full diagnostics: connection, version, page checks, authorization, and background state." },
 					{ fullValue: "onboard", label: "onboard", description: "Install the Chrome companion extension (first-time setup)." },
 					{ fullValue: "background", label: "background", description: "Enforce hard background or allow foreground/watch mode." },
 				];
@@ -1279,7 +1276,6 @@ Usage rules:
 			switch (head) {
 				case "authorize": return authorizeHandler(ctx, subArgs);
 				case "revoke": return revokeHandler(ctx);
-				case "status": return statusHandler(ctx);
 				case "doctor": return doctorHandler(ctx);
 				case "onboard": return onboardHandler(ctx);
 				case "background":
@@ -1292,7 +1288,7 @@ Usage rules:
 					return;
 				}
 				default:
-					ctx.ui.notify(`Unknown subcommand '${head}'. Try: /chrome authorize | revoke | status | doctor | onboard | background.`, "warning");
+					ctx.ui.notify(`Unknown subcommand '${head}'. Run /chrome for current state and controls, or try: /chrome authorize | revoke | doctor | onboard | background.`, "warning");
 			}
 		},
 	});
