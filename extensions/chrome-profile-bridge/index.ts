@@ -64,6 +64,7 @@ const DEFAULT_PORT = Number(process.env.PI_CHROME_BRIDGE_PORT ?? "17318");
 const DEFAULT_TIMEOUT_MS = 30_000;
 const MAX_TEXT_CHARS = 30_000;
 const MAX_ELEMENTS = 80;
+const BACKGROUND_PARAM_DESCRIPTION = "If true, avoid explicit Chrome focus/tab activation for this call. /chrome background on (default) enforces this for every call and ignores false. Ask the user to run /chrome background off to allow foreground work.";
 
 function truncateText(text: string, maxChars = MAX_TEXT_CHARS): string {
 	if (text.length <= maxChars) return text;
@@ -685,7 +686,7 @@ export default function (pi: ExtensionAPI): void {
 	globalState[PI_CHROME_GLOBAL_KEY] = { version: PI_CHROME_VERSION, root: currentRoot, token: instanceToken };
 
 	const bridge = new ChromeProfileBridge(DEFAULT_HOST, DEFAULT_PORT);
-	let backgroundDefault = true;
+	let backgroundEnabled = true;
 	let chromeAuthorizedUntil: number | "indefinite" | undefined;
 	// Restore an authorization that survived a /reload. Drop it if it already expired.
 	const persistedAuth = globalState[PI_CHROME_AUTH_KEY];
@@ -881,14 +882,21 @@ export default function (pi: ExtensionAPI): void {
 		}, Math.max(0, until - Date.now()));
 	};
 
-	const authorizedBridgeSend = (action: string, params: Record<string, unknown>, timeoutMs = DEFAULT_TIMEOUT_MS, signal?: AbortSignal): Promise<unknown> => {
+	const authorizedBridgeSend = async (action: string, params: Record<string, unknown>, timeoutMs = DEFAULT_TIMEOUT_MS, signal?: AbortSignal): Promise<unknown> => {
 		requireChromeControlAuthorized();
-		// Scope the service worker's dedicated automation tab/window to this session. Forwarded on
-		// every action so tab resolution, navigation, and cleanup all agree on which target is ours.
+		// Background on is a session policy, not a default that tool arguments can override.
+		// Apply it here so tab.new, chrome_launch(url), and tools without a background parameter
+		// cannot bypass it. Background off still permits per-call background:true.
+		const typed = params as { background?: boolean; foreground?: boolean };
+		const requestedBackground = typed.background ?? (typed.foreground !== undefined ? !typed.foreground : false);
+		const background = backgroundEnabled || requestedBackground;
+		if (action === "tab.activate" && background) {
+			throw new Error("Tab activation is blocked by background mode. Ask the user to run /chrome background off to allow foreground work.");
+		}
+		// Scope every action to this session's dedicated automation target and tab group.
 		const sessionKey = sessionKeyFor(sessionCtx);
-		let wireParams: Record<string, unknown> = sessionKey !== undefined && params.sessionKey === undefined
-			? { ...params, sessionKey }
-			: params;
+		let wireParams: Record<string, unknown> = { ...params, background, foreground: !background };
+		if (sessionKey !== undefined && params.sessionKey === undefined) wireParams.sessionKey = sessionKey;
 		const sessionTitle = sessionCtx !== undefined ? sessionGroupTitle(sessionCtx) : undefined;
 		// Any tab Pi opens through tab.new/tab.group must use THIS session's group, even if a caller
 		// passes group:false or a custom groupTitle. This central guard covers chrome_tab plus internal
@@ -904,21 +912,21 @@ export default function (pi: ExtensionAPI): void {
 		if (shouldJoinGroup) {
 			wireParams = { ...wireParams, sessionGroupTitle: sessionTitle, joinSessionGroup: true };
 		}
-		return bridge.send(action, wireParams, timeoutMs, signal);
-	};
-
-	// Translate the public `background` parameter (default on = silent/background) into the
-	// service worker's wire-level `foreground` flag, accepting legacy `foreground` as a fallback.
-	const withBackground = <T extends Record<string, unknown>>(params: T): T => {
-		const typed = params as { background?: boolean; foreground?: boolean };
-		const explicit =
-			typed.background !== undefined
-				? typed.background
-				: typed.foreground !== undefined
-					? !typed.foreground
-					: undefined;
-		const background = explicit ?? backgroundDefault;
-		return { ...params, foreground: !background } as T;
+		// Older companions ignore background for tab creation and activate tabs for screenshots.
+		// Dedicated wire actions make them fail closed, with no probe/action race or extra round trip.
+		// These are internal protocol aliases, not new tools or /chrome commands.
+		const wireAction = background && (action === "tab.new" || action === "page.screenshot")
+			? `${action}.background`
+			: action;
+		try {
+			return await bridge.send(wireAction, wireParams, timeoutMs, signal);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			if (wireAction !== action && message.includes(`Unknown action: ${wireAction}`)) {
+				throw new Error("Hard background requires an updated Chrome companion extension. Reload Pi Chrome Connector at chrome://extensions, then retry.");
+			}
+			throw error;
+		}
 	};
 
 	pi.on("session_start", async (_event, ctx) => {
@@ -974,7 +982,7 @@ Usage rules:
 3. \`includeSnapshot=true\` on click/type/fill/key to verify in one round trip.
 4. If \`chrome_evaluate\` returns null when you expected a value, the expression evaluated to null/undefined in the page; surface the value via \`JSON.stringify\` to confirm.
 5. \`chrome_navigate\` supports an optional \`initScript\` that runs at document_start in MAIN world for the next navigation (good for seeding localStorage or stubbing Date.now).
-6. By default chrome_* tools run in the background without focusing Chrome; pass \`background=false\` or run /chrome background off when the user wants to watch Chrome work.
+6. /chrome background on (default) is a hard policy: per-call \`background=false\` cannot override it, new tabs stay inactive, and \`chrome_tab activate\` is blocked. Ask the user to run /chrome background off when they want foreground/watch mode. With background off, per-call \`background=true\` still avoids explicit focus/tab activation. Screenshots use CDP without activating background tabs; debugger failures never fall back to tab activation. Page scripts, trusted input, native prompts, and Chrome/OS behavior can still affect focus.
 7. If you hit a native file-picker or privileged browser prompt gate, tell the user; generic clicks/typing/CSP gates are handled by Chrome input.
 8. Run /chrome doctor when in doubt about connectivity or capabilities.
 </chrome-profile-bridge>`;
@@ -1045,30 +1053,30 @@ Usage rules:
 		ctx.ui.notify(lines.join("\n"), "info");
 	};
 
-	// Run-in-background (Chrome focus) handler. No args = toggle. Explicit on/off/status.
+	// Existing background setting is the hard policy. No args = toggle; no separate lock mode.
 	const BACKGROUND_DESC: Record<string, string> = {
-		on: "pi-chrome runs in the background; Chrome won't pop up or steal focus.",
-		off: "Chrome pops to the front and switches tabs so you can watch what pi-chrome is doing.",
+		on: "Hard background: pi-chrome will not explicitly focus windows or activate tabs; per-call foreground overrides and tab activation are blocked. Page/Chrome behavior can still affect focus.",
+		off: "Foreground/watch mode: Chrome may come forward and switch tabs. Per-call background:true still avoids explicit focus/tab activation.",
 	};
 
 	const backgroundHandler = async (ctx: ExtensionContext, args: string) => {
 		const arg = (args || "").trim().toLowerCase();
-		const currentLabel = backgroundDefault ? "on" : "off";
+		const currentLabel = backgroundEnabled ? "on" : "off";
 
 		if (arg === "status") {
 			ctx.ui.notify(`Run in background is ${currentLabel}. ${BACKGROUND_DESC[currentLabel]}`, "info");
 			return;
 		}
 
-		if (arg === "on" || arg === "true" || arg === "1") backgroundDefault = true;
-		else if (arg === "off" || arg === "false" || arg === "0") backgroundDefault = false;
-		else if (arg === "toggle" || arg === "") backgroundDefault = !backgroundDefault;
+		if (arg === "on" || arg === "true" || arg === "1") backgroundEnabled = true;
+		else if (arg === "off" || arg === "false" || arg === "0") backgroundEnabled = false;
+		else if (arg === "toggle" || arg === "") backgroundEnabled = !backgroundEnabled;
 		else {
 			ctx.ui.notify(`Unknown background setting '${arg}'. Pick one of: on | off | toggle | status.`, "warning");
 			return;
 		}
 
-		const nextLabel = backgroundDefault ? "on" : "off";
+		const nextLabel = backgroundEnabled ? "on" : "off";
 		ctx.ui.notify(`Run in background → ${nextLabel}. ${BACKGROUND_DESC[nextLabel]}`, "info");
 	};
 
@@ -1151,7 +1159,7 @@ Usage rules:
 			parts.push(`✗ Chrome not responding`);
 		}
 		parts.push(`auth: ${authSummary()}`);
-		parts.push(`background: ${backgroundDefault ? "on" : "off"}`);
+		parts.push(`background: ${backgroundEnabled ? "on (hard)" : "off"}`);
 		return parts.join(" · ");
 	};
 
@@ -1217,7 +1225,7 @@ Usage rules:
 
 	pi.registerCommand("chrome", {
 		description:
-			"All pi-chrome controls in one place.\n  /chrome authorize [15m|30m|<minutes>|indefinite] — allow this Pi session to use chrome_* tools.\n  /chrome revoke   — lock Chrome control.\n  /chrome status   — one-line snapshot of connection, auth, and background setting.\n  /chrome doctor   — full health check.\n  /chrome onboard  — install the Chrome companion extension.\n  /chrome background [on|off|status|toggle] — whether pi-chrome runs without focusing Chrome.\nRun with no arguments for an interactive picker that shows current state.",
+			"All pi-chrome controls in one place.\n  /chrome authorize [15m|30m|<minutes>|indefinite] — allow this Pi session to use chrome_* tools.\n  /chrome revoke   — lock Chrome control.\n  /chrome status   — one-line snapshot of connection, auth, and background setting.\n  /chrome doctor   — full health check.\n  /chrome onboard  — install the Chrome companion extension.\n  /chrome background [on|off|status|toggle] — enforce no explicit focus/tab activation, or allow foreground/watch mode.\nRun with no arguments for an interactive picker that shows current state.",
 		getArgumentCompletions: (prefix) => {
 			const raw = prefix;
 			const trimmedRight = raw.replace(/\s+$/, "");
@@ -1239,7 +1247,7 @@ Usage rules:
 					{ fullValue: "status", label: "status", description: "One-line summary: connection, auth, and background setting." },
 					{ fullValue: "doctor", label: "doctor", description: "Full health check. Tells you if Chrome is connected and what's wrong if it isn't." },
 					{ fullValue: "onboard", label: "onboard", description: "Install the Chrome companion extension (first-time setup)." },
-					{ fullValue: "background", label: "background", description: "Run pi-chrome in the background without focusing Chrome?" },
+					{ fullValue: "background", label: "background", description: "Enforce hard background or allow foreground/watch mode." },
 				];
 			} else if (path[0] === "authorize" && path.length === 1) {
 				candidates = [
@@ -1249,7 +1257,7 @@ Usage rules:
 				];
 			} else if (path[0] === "background" && path.length === 1) {
 				candidates = [
-					{ fullValue: "background on", label: "on", description: "Run in background. Chrome stays in the background. Your editor keeps focus. (default)" },
+					{ fullValue: "background on", label: "on", description: "Hard background: block explicit focus/tab activation and per-call foreground overrides. (default)" },
 					{ fullValue: "background off", label: "off", description: "Bring Chrome to the front so you can watch." },
 					{ fullValue: "background toggle", label: "toggle", description: "Flip whichever way it's currently set." },
 					{ fullValue: "background status", label: "status", description: "Show the current setting." },
@@ -1333,7 +1341,7 @@ Usage rules:
 	pi.registerTool({
 		name: "chrome_tab",
 		label: "Chrome Tab",
-		description: "List, create, activate, close, group, ungroup, or inspect tabs in the user's existing Chrome profile via the companion extension. New/grouped tabs always use this session's Pi tab group. activate/close/group/ungroup require a target (targetId/urlIncludes/titleIncludes); with no target they act on this session's pi-chrome automation tab if one exists, and otherwise error rather than touching the user's active tab.",
+		description: "List, create, activate, close, group, ungroup, or inspect tabs in the user's existing Chrome profile via the companion extension. New/grouped tabs always use this session's Pi tab group. Background mode keeps new tabs inactive and blocks activate; ask the user to run /chrome background off for foreground/watch mode. activate/close/group/ungroup require a target (targetId/urlIncludes/titleIncludes); with no target they act on this session's pi-chrome automation tab if one exists, and otherwise error rather than touching the user's active tab.",
 		promptSnippet: "List/open/activate/close/group existing Chrome tabs through the companion extension.",
 		parameters: Type.Object({
 			action: StringEnum(tabActionValues),
@@ -1369,7 +1377,7 @@ Usage rules:
 		name: "chrome_snapshot",
 		label: "Chrome Snapshot",
 		description:
-			"Inspect a page in the user's existing Chrome profile. Default output is a concise, agent-friendly observation with structural layout/context, stable uids, visible actions, form fields, page hints, and changes since the previous snapshot. Use mode/query/nearUid to zoom instead of dumping the whole page. Runs in the background by default; pass background=false to bring Chrome to the foreground so the user can watch.",
+			"Inspect a page in the user's existing Chrome profile. Default output is a concise, agent-friendly observation with structural layout/context, stable uids, visible actions, form fields, page hints, and changes since the previous snapshot. Use mode/query/nearUid to zoom instead of dumping the whole page. Background mode (default) blocks explicit focus/tab activation even with background=false. Ask the user to run /chrome background off for foreground/watch mode.",
 		promptSnippet: "Observe the current Chrome page: concise summary, structural layout, visible actions, forms, page map, query matches, and stable uids.",
 		parameters: Type.Object({
 			targetId: Type.Optional(Type.String()),
@@ -1382,16 +1390,14 @@ Usage rules:
 			containingText: Type.Optional(Type.String({ description: "Only return elements whose label/text contains this string (case-insensitive). Useful when the page has many controls." })),
 			roleFilter: Type.Optional(Type.String({ description: "Only return elements matching this ARIA role or tag name (case-insensitive). e.g. 'button', 'link', 'textbox'." })),
 			nearUid: Type.Optional(Type.String({ description: "Sort elements by proximity to this snapshot uid. Useful for finding controls near a known anchor." })),
-			background: Type.Optional(
-				Type.Boolean({ description: "If true (the default), run silently in the background without focusing Chrome; pass false so Chrome focuses + the tab activates and the user can watch." }),
-			),
+			background: Type.Optional(Type.Boolean({ description: BACKGROUND_PARAM_DESCRIPTION })),
 			host: Type.Optional(Type.String()),
 			port: Type.Optional(Type.Number()),
 		}),
 		async execute(_id, params, signal): Promise<ToolTextResult> {
 			const snapshot = await authorizedBridgeSend(
 				"page.snapshot",
-				withBackground({ ...params, maxElements: params.maxElements ?? MAX_ELEMENTS }),
+				{ ...params, maxElements: params.maxElements ?? MAX_ELEMENTS },
 				DEFAULT_TIMEOUT_MS,
 				signal,
 			);
@@ -1412,16 +1418,14 @@ Usage rules:
 			targetId: Type.Optional(Type.String()),
 			urlIncludes: Type.Optional(Type.String()),
 			titleIncludes: Type.Optional(Type.String()),
-			background: Type.Optional(
-				Type.Boolean({ description: "If true (the default), run silently in the background without focusing Chrome; pass false so Chrome focuses + the tab activates and the user can watch." }),
-			),
+			background: Type.Optional(Type.Boolean({ description: BACKGROUND_PARAM_DESCRIPTION })),
 			host: Type.Optional(Type.String()),
 			port: Type.Optional(Type.Number()),
 		}),
 		async execute(_id, params, signal): Promise<ToolTextResult> {
 			const snapshot = await authorizedBridgeSend(
 				"page.snapshot",
-				withBackground({ ...params, mode: params.mode || "auto", maxElements: params.maxElements ?? MAX_ELEMENTS }),
+				{ ...params, mode: params.mode || "auto", maxElements: params.maxElements ?? MAX_ELEMENTS },
 				DEFAULT_TIMEOUT_MS,
 				signal,
 			);
@@ -1442,15 +1446,13 @@ Usage rules:
 			targetId: Type.Optional(Type.String()),
 			urlIncludes: Type.Optional(Type.String()),
 			titleIncludes: Type.Optional(Type.String()),
-			background: Type.Optional(
-				Type.Boolean({ description: "If true (the default), run silently in the background without focusing Chrome; pass false so Chrome focuses + the tab activates and the user can watch." }),
-			),
+			background: Type.Optional(Type.Boolean({ description: BACKGROUND_PARAM_DESCRIPTION })),
 			host: Type.Optional(Type.String()),
 			port: Type.Optional(Type.Number()),
 		}),
 		async execute(_id, params, signal): Promise<ToolTextResult> {
 			try {
-				const inspect = await authorizedBridgeSend("page.inspect", withBackground(params), DEFAULT_TIMEOUT_MS, signal);
+				const inspect = await authorizedBridgeSend("page.inspect", params, DEFAULT_TIMEOUT_MS, signal);
 				return { content: [{ type: "text", text: formatChromeInspect(inspect) }], details: { inspect } };
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
@@ -1460,13 +1462,13 @@ Usage rules:
 				// but still gives useful nearby candidates instead of failing the workflow.
 				const snapshot = await authorizedBridgeSend(
 					"page.snapshot",
-					withBackground({
+					{
 						...params,
 						mode: "interactive",
 						maxElements: MAX_ELEMENTS,
 						nearUid: params.uid,
 						query: params.selector,
-					}),
+					},
 					DEFAULT_TIMEOUT_MS,
 					signal,
 				);
@@ -1480,7 +1482,7 @@ Usage rules:
 		name: "chrome_navigate",
 		label: "Chrome Navigate",
 		description:
-			"Navigate a Chrome tab to a URL via the companion extension. With no target, navigation goes to pi-chrome's own dedicated automation window/tab — it never replaces the user's active tab. Pass targetId/urlIncludes/titleIncludes only to act on a specific existing tab. Runs in the background by default; pass background=false to focus Chrome and activate the tab so the user can watch. Optionally waits for load completion.",
+			"Navigate a Chrome tab to a URL via the companion extension. With no target, navigation goes to pi-chrome's own dedicated automation window/tab — it never replaces the user's active tab. Pass targetId/urlIncludes/titleIncludes only to act on a specific existing tab. Background mode (default) blocks explicit focus/tab activation even with background=false; /chrome background off allows foreground/watch mode. Optionally waits for load completion.",
 		promptSnippet: "Navigate a Chrome tab in the user's existing profile.",
 		parameters: Type.Object({
 			url: Type.String(),
@@ -1490,14 +1492,12 @@ Usage rules:
 			waitUntilLoad: Type.Optional(Type.Boolean({ default: true })),
 			timeoutMs: Type.Optional(Type.Number({ default: 15_000 })),
 			initScript: Type.Optional(Type.String({ description: "Optional JavaScript source to run in MAIN world at document_start of the next navigation. Useful for seeding localStorage, stubbing Date.now(), or defining navigator.webdriver=undefined. Requires the companion extension's webNavigation permission." })),
-			background: Type.Optional(
-				Type.Boolean({ description: "If true, navigate silently without focusing Chrome. Defaults to on (the session background setting); pass false to focus Chrome so the user can watch." }),
-			),
+			background: Type.Optional(Type.Boolean({ description: BACKGROUND_PARAM_DESCRIPTION })),
 			host: Type.Optional(Type.String()),
 			port: Type.Optional(Type.Number()),
 		}),
 		async execute(_id, params, signal): Promise<ToolTextResult> {
-			const result = await authorizedBridgeSend("page.navigate", withBackground(params), (params.timeoutMs ?? 15_000) + 2_000, signal);
+			const result = await authorizedBridgeSend("page.navigate", params, (params.timeoutMs ?? 15_000) + 2_000, signal);
 			return { content: [{ type: "text", text: `Navigated to ${params.url}${params.initScript ? " (with initScript)" : ""}` }], details: { result: result as Json } };
 		},
 	});
@@ -1506,7 +1506,7 @@ Usage rules:
 		name: "chrome_evaluate",
 		label: "Chrome Evaluate",
 		description:
-			"Evaluate JavaScript in an existing Chrome tab through the companion extension. Runs in the page context and returns JSON-serializable values when possible. Runs in the background by default; pass background=false to focus Chrome and activate the tab.",
+			"Evaluate JavaScript in an existing Chrome tab through the companion extension. Runs in the page context and returns JSON-serializable values when possible. Background mode (default) blocks explicit focus/tab activation even with background=false; /chrome background off allows foreground/watch mode.",
 		promptSnippet: "Evaluate JavaScript in the active Chrome tab through the companion extension.",
 		parameters: Type.Object({
 			expression: Type.String(),
@@ -1514,14 +1514,12 @@ Usage rules:
 			targetId: Type.Optional(Type.String()),
 			urlIncludes: Type.Optional(Type.String()),
 			titleIncludes: Type.Optional(Type.String()),
-			background: Type.Optional(
-				Type.Boolean({ description: "If true, evaluate silently without focusing Chrome. Defaults to on (the session background setting); pass false to focus Chrome so the user can watch." }),
-			),
+			background: Type.Optional(Type.Boolean({ description: BACKGROUND_PARAM_DESCRIPTION })),
 			host: Type.Optional(Type.String()),
 			port: Type.Optional(Type.Number()),
 		}),
 		async execute(_id, params, signal): Promise<ToolTextResult> {
-			const value = await authorizedBridgeSend("page.evaluate", withBackground(params), DEFAULT_TIMEOUT_MS, signal);
+			const value = await authorizedBridgeSend("page.evaluate", params, DEFAULT_TIMEOUT_MS, signal);
 			const text = value === undefined
 				? "undefined"
 				: typeof value === "string"
@@ -1548,14 +1546,12 @@ Usage rules:
 			targetId: Type.Optional(Type.String()),
 			urlIncludes: Type.Optional(Type.String()),
 			titleIncludes: Type.Optional(Type.String()),
-			background: Type.Optional(
-				Type.Boolean({ description: "If true, click silently without focusing Chrome. Defaults to on (the session background setting); pass false to focus Chrome so the user can watch." }),
-			),
+			background: Type.Optional(Type.Boolean({ description: BACKGROUND_PARAM_DESCRIPTION })),
 			host: Type.Optional(Type.String()),
 			port: Type.Optional(Type.Number()),
 		}),
 		async execute(_id, params, signal): Promise<ToolTextResult> {
-			const raw = await authorizedBridgeSend("page.click", withBackground(params), DEFAULT_TIMEOUT_MS, signal);
+			const raw = await authorizedBridgeSend("page.click", params, DEFAULT_TIMEOUT_MS, signal);
 			const result = (params.includeSnapshot ? (raw as { result: unknown }).result : raw) as Json;
 			const summary = summarizeActionResult(result);
 			const target = params.uid ?? params.selector ?? `${params.x},${params.y}`;
@@ -1580,14 +1576,12 @@ Usage rules:
 			targetId: Type.Optional(Type.String()),
 			urlIncludes: Type.Optional(Type.String()),
 			titleIncludes: Type.Optional(Type.String()),
-			background: Type.Optional(
-				Type.Boolean({ description: "If true, type silently without focusing Chrome. Defaults to on (the session background setting); pass false to focus Chrome so the user can watch." }),
-			),
+			background: Type.Optional(Type.Boolean({ description: BACKGROUND_PARAM_DESCRIPTION })),
 			host: Type.Optional(Type.String()),
 			port: Type.Optional(Type.Number()),
 		}),
 		async execute(_id, params, signal): Promise<ToolTextResult> {
-			const raw = await authorizedBridgeSend("page.type", withBackground(params), DEFAULT_TIMEOUT_MS, signal);
+			const raw = await authorizedBridgeSend("page.type", params, DEFAULT_TIMEOUT_MS, signal);
 			const result = (params.includeSnapshot ? (raw as { result: unknown }).result : raw) as Json;
 			const summary = summarizeActionResult(result);
 			const into = params.uid || params.selector ? ` into ${params.uid ?? params.selector}` : "";
@@ -1614,14 +1608,12 @@ Usage rules:
 			targetId: Type.Optional(Type.String()),
 			urlIncludes: Type.Optional(Type.String()),
 			titleIncludes: Type.Optional(Type.String()),
-			background: Type.Optional(
-				Type.Boolean({ description: "If true, fill silently without focusing Chrome. Defaults to on (the session background setting); pass false to focus Chrome so the user can watch." }),
-			),
+			background: Type.Optional(Type.Boolean({ description: BACKGROUND_PARAM_DESCRIPTION })),
 			host: Type.Optional(Type.String()),
 			port: Type.Optional(Type.Number()),
 		}),
 		async execute(_id, params, signal): Promise<ToolTextResult> {
-			const raw = await authorizedBridgeSend("page.fill", withBackground(params), DEFAULT_TIMEOUT_MS, signal);
+			const raw = await authorizedBridgeSend("page.fill", params, DEFAULT_TIMEOUT_MS, signal);
 			const result = (params.includeSnapshot ? (raw as { result: unknown }).result : raw) as Json;
 			const summary = summarizeActionResult(result);
 			const into = params.uid || params.selector ? ` into ${params.uid ?? params.selector}` : "";
@@ -1635,7 +1627,7 @@ Usage rules:
 		name: "chrome_key",
 		label: "Chrome Key",
 		description:
-			"Send a keyboard key to an existing Chrome tab (Enter, Escape, Tab, Backspace, Delete, ArrowUp/Down/Left/Right, or one character). Runs in the background by default; pass background=false to focus Chrome and activate the tab so the user can watch. Pass includeSnapshot=true to verify after the keypress.",
+			"Send a keyboard key to an existing Chrome tab (Enter, Escape, Tab, Backspace, Delete, ArrowUp/Down/Left/Right, or one character). Background mode (default) blocks explicit focus/tab activation even with background=false; /chrome background off allows foreground/watch mode. Pass includeSnapshot=true to verify after the keypress.",
 		promptSnippet: "Press keys in Chrome through the companion extension.",
 		parameters: Type.Object({
 			key: Type.String(),
@@ -1650,14 +1642,12 @@ Usage rules:
 			targetId: Type.Optional(Type.String()),
 			urlIncludes: Type.Optional(Type.String()),
 			titleIncludes: Type.Optional(Type.String()),
-			background: Type.Optional(
-				Type.Boolean({ description: "If true, send the key silently without focusing Chrome. Defaults to on (the session background setting); pass false to focus Chrome so the user can watch." }),
-			),
+			background: Type.Optional(Type.Boolean({ description: BACKGROUND_PARAM_DESCRIPTION })),
 			host: Type.Optional(Type.String()),
 			port: Type.Optional(Type.Number()),
 		}),
 		async execute(_id, params, signal): Promise<ToolTextResult> {
-			const raw = await authorizedBridgeSend("page.key", withBackground(params), DEFAULT_TIMEOUT_MS, signal);
+			const raw = await authorizedBridgeSend("page.key", params, DEFAULT_TIMEOUT_MS, signal);
 			const result = (params.includeSnapshot ? (raw as { result: unknown }).result : raw) as Json;
 			const summary = summarizeActionResult(result);
 			const base = `Pressed ${params.key}.`;
@@ -1699,12 +1689,12 @@ Usage rules:
 			targetId: Type.Optional(Type.String()),
 			urlIncludes: Type.Optional(Type.String()),
 			titleIncludes: Type.Optional(Type.String()),
-			background: Type.Optional(Type.Boolean({ description: "If true, run silently without focusing Chrome. Defaults to on (the session background setting); pass false to focus Chrome so the user can watch." })),
+			background: Type.Optional(Type.Boolean({ description: BACKGROUND_PARAM_DESCRIPTION })),
 			host: Type.Optional(Type.String()),
 			port: Type.Optional(Type.Number()),
 		}),
 		async execute(_id, params, signal): Promise<ToolTextResult> {
-			const result = await authorizedBridgeSend("page.console.list", withBackground(params), DEFAULT_TIMEOUT_MS, signal);
+			const result = await authorizedBridgeSend("page.console.list", params, DEFAULT_TIMEOUT_MS, signal);
 			return { content: [{ type: "text", text: truncateText(safeJson(result)) }], details: { result: result as Json } };
 		},
 	});
@@ -1721,12 +1711,12 @@ Usage rules:
 			targetId: Type.Optional(Type.String()),
 			urlIncludes: Type.Optional(Type.String()),
 			titleIncludes: Type.Optional(Type.String()),
-			background: Type.Optional(Type.Boolean({ description: "If true, run silently without focusing Chrome. Defaults to on (the session background setting); pass false to focus Chrome so the user can watch." })),
+			background: Type.Optional(Type.Boolean({ description: BACKGROUND_PARAM_DESCRIPTION })),
 			host: Type.Optional(Type.String()),
 			port: Type.Optional(Type.Number()),
 		}),
 		async execute(_id, params, signal): Promise<ToolTextResult> {
-			const result = await authorizedBridgeSend("page.network.list", withBackground(params), DEFAULT_TIMEOUT_MS, signal);
+			const result = await authorizedBridgeSend("page.network.list", params, DEFAULT_TIMEOUT_MS, signal);
 			return { content: [{ type: "text", text: truncateText(safeJson(result)) }], details: { result: result as Json } };
 		},
 	});
@@ -1741,12 +1731,12 @@ Usage rules:
 			targetId: Type.Optional(Type.String()),
 			urlIncludes: Type.Optional(Type.String()),
 			titleIncludes: Type.Optional(Type.String()),
-			background: Type.Optional(Type.Boolean({ description: "If true, run silently without focusing Chrome. Defaults to on (the session background setting); pass false to focus Chrome so the user can watch." })),
+			background: Type.Optional(Type.Boolean({ description: BACKGROUND_PARAM_DESCRIPTION })),
 			host: Type.Optional(Type.String()),
 			port: Type.Optional(Type.Number()),
 		}),
 		async execute(_id, params, signal): Promise<ToolTextResult> {
-			const result = await authorizedBridgeSend("page.network.get", withBackground(params), DEFAULT_TIMEOUT_MS, signal);
+			const result = await authorizedBridgeSend("page.network.get", params, DEFAULT_TIMEOUT_MS, signal);
 			return { content: [{ type: "text", text: truncateText(safeJson(result)) }], details: { result: result as Json } };
 		},
 	});
@@ -1755,19 +1745,17 @@ Usage rules:
 		name: "chrome_screenshot",
 		label: "Chrome Screenshot",
 		description:
-			"Capture a screenshot of an existing Chrome tab via the companion extension and save it to disk. Chrome's extension screenshot API requires the target tab to be the active tab in its window. Runs in the background by default (the tab is briefly activated within its window for the capture, then the previous active tab is restored); pass background=false to focus Chrome so the user can watch.",
+			"Capture a screenshot of a Chrome tab via CDP and save it to disk without activating background tabs. Requires debugger access; failures never fall back to activating a tab. Background mode (default) ignores background=false; /chrome background off allows foreground/watch mode.",
 		promptSnippet: "Capture Chrome screenshots and save them under .pi/chrome-screenshots by default.",
 		parameters: Type.Object({
 			path: Type.Optional(Type.String({ description: "Output path. Defaults to .pi/chrome-screenshots/<timestamp>.<format>." })),
 			format: Type.Optional(StringEnum(imageFormatValues)),
-			quality: Type.Optional(Type.Number({ description: "JPEG quality 0-100." })),
-			fullPage: Type.Optional(Type.Boolean({ description: "Not supported by the extension bridge yet; viewport screenshots are captured." })),
+			quality: Type.Optional(Type.Number({ minimum: 0, maximum: 100, description: "JPEG quality 0-100." })),
+			fullPage: Type.Optional(Type.Boolean({ description: "Capture full-page tiles plus a JSON manifest. Temporarily scrolls the target page; does not activate background tabs." })),
 			targetId: Type.Optional(Type.String()),
 			urlIncludes: Type.Optional(Type.String()),
 			titleIncludes: Type.Optional(Type.String()),
-			background: Type.Optional(
-				Type.Boolean({ description: "If true (the default), capture silently without focusing the Chrome window (the target tab is briefly activated within its window for the capture, then restored); pass false to focus Chrome." }),
-			),
+			background: Type.Optional(Type.Boolean({ description: BACKGROUND_PARAM_DESCRIPTION })),
 			host: Type.Optional(Type.String()),
 			port: Type.Optional(Type.Number()),
 		}),
@@ -1776,8 +1764,9 @@ Usage rules:
 			const cwd = workspaceCwd(ctx);
 			const defaultPath = join(cwd, ".pi", "chrome-screenshots", `${new Date().toISOString().replace(/[:.]/g, "-")}.${format}`);
 			const outputPath = params.path ? resolve(cwd, params.path) : defaultPath;
-			const result = (await authorizedBridgeSend("page.screenshot", withBackground(params), params.fullPage ? 120_000 : DEFAULT_TIMEOUT_MS, signal)) as {
+			const result = (await authorizedBridgeSend("page.screenshot", params, params.fullPage ? 120_000 : DEFAULT_TIMEOUT_MS, signal)) as {
 				dataUrl?: string;
+				method?: string;
 				tab?: unknown;
 				fullPage?: boolean;
 				dimensions?: { width: number; height: number; viewportHeight: number; dpr: number };
@@ -1800,13 +1789,13 @@ Usage rules:
 				await writeFile(outputPath + ".json", JSON.stringify({ width, height, viewportHeight, dpr, tiles: manifest }, null, 2));
 				return {
 					content: [{ type: "text", text: `Saved ${result.tiles.length} full-page tile(s) for ${width}×${height}px page. Manifest: ${outputPath}.json` }],
-					details: { manifest: outputPath + ".json", tiles: manifest, dimensions: result.dimensions, tab: result.tab } as unknown as Record<string, unknown>,
+					details: { manifest: outputPath + ".json", tiles: manifest, dimensions: result.dimensions, tab: result.tab, method: result.method } as unknown as Record<string, unknown>,
 				};
 			}
 			if (!result.dataUrl) throw new Error("Screenshot returned no dataUrl");
 			const base64 = result.dataUrl.replace(/^data:image\/(?:png|jpeg);base64,/, "");
 			await writeFile(outputPath, Buffer.from(base64, "base64"));
-			return { content: [{ type: "text", text: `Saved Chrome screenshot to ${outputPath}` }], details: { path: outputPath, format, tab: result.tab } };
+			return { content: [{ type: "text", text: `Saved Chrome screenshot to ${outputPath}` }], details: { path: outputPath, format, tab: result.tab, method: result.method } };
 		},
 	});
 
@@ -1823,10 +1812,10 @@ Usage rules:
 			targetId: Type.Optional(Type.String()),
 			urlIncludes: Type.Optional(Type.String()),
 			titleIncludes: Type.Optional(Type.String()),
-			background: Type.Optional(Type.Boolean()),
+			background: Type.Optional(Type.Boolean({ description: BACKGROUND_PARAM_DESCRIPTION })),
 		}),
 		async execute(_id, params, signal): Promise<ToolTextResult> {
-			const result = await authorizedBridgeSend("page.hover", withBackground(params), DEFAULT_TIMEOUT_MS, signal);
+			const result = await authorizedBridgeSend("page.hover", params, DEFAULT_TIMEOUT_MS, signal);
 			return { content: [{ type: "text", text: `Hovered ${params.uid ?? params.selector ?? `${params.x},${params.y}`}` }], details: { result: result as Json } };
 		},
 	});
@@ -1849,10 +1838,10 @@ Usage rules:
 			targetId: Type.Optional(Type.String()),
 			urlIncludes: Type.Optional(Type.String()),
 			titleIncludes: Type.Optional(Type.String()),
-			background: Type.Optional(Type.Boolean()),
+			background: Type.Optional(Type.Boolean({ description: BACKGROUND_PARAM_DESCRIPTION })),
 		}),
 		async execute(_id, params, signal): Promise<ToolTextResult> {
-			const result = await authorizedBridgeSend("page.drag", withBackground(params), DEFAULT_TIMEOUT_MS, signal);
+			const result = await authorizedBridgeSend("page.drag", params, DEFAULT_TIMEOUT_MS, signal);
 			return { content: [{ type: "text", text: `Dragged from ${params.fromUid ?? params.fromSelector} to ${params.toUid ?? params.toSelector}` }], details: { result: result as Json } };
 		},
 	});
@@ -1871,10 +1860,10 @@ Usage rules:
 			targetId: Type.Optional(Type.String()),
 			urlIncludes: Type.Optional(Type.String()),
 			titleIncludes: Type.Optional(Type.String()),
-			background: Type.Optional(Type.Boolean()),
+			background: Type.Optional(Type.Boolean({ description: BACKGROUND_PARAM_DESCRIPTION })),
 		}),
 		async execute(_id, params, signal): Promise<ToolTextResult> {
-			const result = await authorizedBridgeSend("page.tap", withBackground(params), DEFAULT_TIMEOUT_MS, signal);
+			const result = await authorizedBridgeSend("page.tap", params, DEFAULT_TIMEOUT_MS, signal);
 			const target = params.uid ?? params.selector ?? `${params.x},${params.y}`;
 			return { content: [{ type: "text", text: `Tapped ${target} (touch)` }], details: { result: result as Json } };
 		},
@@ -1894,10 +1883,10 @@ Usage rules:
 			targetId: Type.Optional(Type.String()),
 			urlIncludes: Type.Optional(Type.String()),
 			titleIncludes: Type.Optional(Type.String()),
-			background: Type.Optional(Type.Boolean()),
+			background: Type.Optional(Type.Boolean({ description: BACKGROUND_PARAM_DESCRIPTION })),
 		}),
 		async execute(_id, params, signal): Promise<ToolTextResult> {
-			const result = await authorizedBridgeSend("page.scroll", withBackground(params), DEFAULT_TIMEOUT_MS, signal);
+			const result = await authorizedBridgeSend("page.scroll", params, DEFAULT_TIMEOUT_MS, signal);
 			return { content: [{ type: "text", text: `Scrolled dy=${params.deltaY ?? 0} dx=${params.deltaX ?? 0}` }], details: { result: result as Json } };
 		},
 	});
@@ -1914,12 +1903,12 @@ Usage rules:
 			targetId: Type.Optional(Type.String()),
 			urlIncludes: Type.Optional(Type.String()),
 			titleIncludes: Type.Optional(Type.String()),
-			background: Type.Optional(Type.Boolean()),
+			background: Type.Optional(Type.Boolean({ description: BACKGROUND_PARAM_DESCRIPTION })),
 		}),
 		async execute(_id, params, signal, _onUpdate, ctx): Promise<ToolTextResult> {
 			const cwd = workspaceCwd(ctx);
 			const paths = params.paths.map((p) => resolve(cwd, p));
-			const result = await authorizedBridgeSend("page.upload", withBackground({ ...params, paths }), DEFAULT_TIMEOUT_MS, signal);
+			const result = await authorizedBridgeSend("page.upload", { ...params, paths }, DEFAULT_TIMEOUT_MS, signal);
 			return { content: [{ type: "text", text: `Uploaded ${paths.length} file(s) to ${params.uid ?? params.selector}` }], details: { result: result as Json } };
 		},
 	});

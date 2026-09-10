@@ -108,12 +108,20 @@ Security details: [`SECURITY.md`](./SECURITY.md). Architecture details: [`docs/A
 /chrome status              # connection + auth + background state
 /chrome authorize [duration]
 /chrome revoke
-/chrome background on       # default: don't steal focus
+/chrome background on       # default: hard background policy
 /chrome background off      # foreground/watch mode
 /chrome background status
 ```
 
 If loaded extension is older than installed `pi-chrome`, `/chrome doctor` tells you to reload it from `chrome://extensions`.
+
+### Background policy
+
+`/chrome background on` is enforced, not an overridable default. Per-call `background:false` cannot bring Chrome forward, new tabs stay inactive, and `chrome_tab activate` is blocked. Use the existing `/chrome background off` for foreground/watch mode; per-call `background:true` still works when that mode is off.
+
+Screenshots use CDP without activating background tabs. Debugger/capture failures return errors, never an activation fallback. Reload both Pi and the Chrome companion after upgrading; old companions reject background tab creation/screenshots rather than silently switching tabs.
+
+This prevents explicit pi-chrome focus/activation, not every Chrome/OS side effect. Trusted input, page popups, native prompts, debugger banners, and macOS Spaces can still affect focus. Inactive pages may throttle rendering or reject focus-gated actions. See [scope and risks](./docs/ARCHITECTURE.md#scope-and-risks).
 
 ---
 

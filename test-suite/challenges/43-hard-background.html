@@ -1,0 +1,42 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>43 hard background</title>
+<link rel="stylesheet" href="../_style.css">
+<script src="../_lib.js"></script>
+<body>
+<main>
+  <h1>Hard-background target</h1>
+  <p>Setup: keep <code>/chrome background on</code>. Select another tab in this same Chrome window so this target is inactive, then return to Pi. Do not select this tab again until verification finishes.</p>
+  <p>Runner: target this URL explicitly. Evaluate <code>armBackgroundProbe()</code>, snapshot and screenshot with <code>background:false</code>, then click Verify with <code>domFallback:false</code> and <code>background:false</code>. These foreground requests must not activate this tab. Read <code>window.__verdict</code> without activating it.</p>
+  <p>This page grades tab visibility and trusted input, not OS focus or macOS Spaces. Inspect the screenshot for the colored target below; test OS focus separately. Reload to reset.</p>
+  <div style="background:#2463aa;color:white;padding:32px;border:16px solid #e5a323">SCREENSHOT TARGET: hard background</div>
+  <button id="verify">Verify hidden trusted click</button>
+</main>
+<script>
+Challenge.init({ id: "hard-background", instructions: "inactive tab → arm → snapshot/screenshot → trusted click; no activation" });
+let armed = false;
+window.armBackgroundProbe = () => {
+  if (armed) throw new Error("Already armed; reload to reset");
+  if (!document.hidden) throw new Error("Select another tab in this window before arming");
+  armed = true;
+  Challenge.log("armed", { visibility: document.visibilityState, focused: document.hasFocus() });
+  return { armed, visibility: document.visibilityState };
+};
+document.addEventListener("visibilitychange", () => {
+  Challenge.log("visibilitychange", { visibility: document.visibilityState, armed });
+  if (armed && !document.hidden) Challenge.fail("Target became visible after arming: background activation leaked");
+});
+for (const name of ["focus", "blur"]) {
+  window.addEventListener(name, () => Challenge.log(name, { visibility: document.visibilityState, focused: document.hasFocus() }));
+}
+document.getElementById("verify").addEventListener("click", (event) => {
+  Challenge.log("verify", { trusted: event.isTrusted, visibility: document.visibilityState, armed });
+  const failures = [];
+  if (!armed) failures.push("Probe was not armed while inactive");
+  if (!event.isTrusted) failures.push("Verify click isTrusted=false: synthetic input substituted");
+  if (!document.hidden) failures.push("Verify target is not hidden");
+  if (failures.length) Challenge.fail(...failures);
+  else Challenge.pass("Trusted click received while target remained hidden");
+});
+</script>
+</body>
