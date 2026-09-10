@@ -4,12 +4,7 @@
 
 Debug your app, inspect signed-in dashboards, and capture screenshots using your existing Chrome profile—without setting up a separate automation browser.
 
-Built for the [Pi coding agent](https://pi.dev). Pi's Chrome tools stay locked until you authorize the current session.
-
-[Quick start](#quick-start) · [Examples](./docs/EXAMPLES.md) · [Safety](#safety) · [Contributing](./CONTRIBUTING.md)
-
-[![npm version](https://img.shields.io/npm/v/pi-chrome.svg)](https://www.npmjs.com/package/pi-chrome)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
+Built for the [Pi coding agent](https://pi.dev).
 
 ## What you can do
 
@@ -84,9 +79,7 @@ Run `/chrome revoke` when finished. Use `/chrome authorize` again whenever you w
 - **Per-session approval.** Pi's Chrome tools require `/chrome authorize`. `/chrome revoke` locks them and requests cleanup of that session's owned automation tabs. Cleanup preserves existing user tabs.
 - **Separate targets by default.** Page actions without an explicit target use a session-owned automation window or tab. The agent can deliberately target an existing tab when your task calls for it.
 - **Local transport, not a sandbox.** The bridge binds to `127.0.0.1:17318` and rejects browser-origin command requests. It does not authenticate arbitrary non-browser local callers; it is not protection against hostile processes on your machine.
-- **Background mode by default.** Tools cannot override it to explicitly focus Chrome or activate tabs. This is not a zero-focus guarantee: page scripts, trusted input, native prompts, and Chrome/OS behavior can still affect focus. Chrome may also show its debugger banner while attached.
-
-Read the [security policy](./SECURITY.md) and [background-mode scope and risks](./docs/ARCHITECTURE.md#scope-and-risks) before using it with sensitive accounts.
+- **Background mode:** `/chrome background on` (default) blocks pi-chrome tools from directly bringing Chrome to the front or switching your selected tab. Use `/chrome background off` to allow those actions, and `/chrome background status` to check the setting.
 
 ### Limits
 
@@ -114,33 +107,3 @@ Tool parameters are documented inline in Pi. See [architecture](./docs/ARCHITECT
 ### Updating and troubleshooting
 
 After `pi update npm:pi-chrome`, run `/reload` in Pi and reload **Pi Chrome Connector** in `chrome://extensions`. Run `/chrome doctor` to check the connection and companion version.
-
-If Chrome is not responding, confirm the companion is enabled and keep Chrome open. If page checks fail on a Chrome internal page, try a regular web page and run Doctor again. Follow its version-mismatch or session-restart instructions when shown.
-
-### Typing into rich editors
-
-`chrome_type` and `chrome_fill` use one native CDP `Input.insertText` operation for focused contenteditables. This avoids per-character delays for long text and preserves Unicode/newlines. Ordinary inputs and textareas retain individual key events.
-
-For an editor that needs a `keydown` for every character, pass `perCharacter:true`. Bulk insertion still uses Chrome's input system, but does not emit per-character key events or a clipboard `paste` event. Use `includeSnapshot:true` to verify the result; `chrome_fill` still honors `domFallback:false` when synthetic fallback is unwanted.
-
-## Tests and documentation
-
-The [benchmark suite](./test-suite/README.md) includes **44 browser challenges**, hermetic multi-step tasks, and mocked regression tests for input, screenshots, session cleanup, and background policy. These are reproducible test cases—not a guarantee that every website or OS interaction works.
-
-Run mocked regressions with `npm test` (Node.js 22.13+; no live Chrome required). Follow the benchmark guide for live browser checks.
-
-- [Examples](./docs/EXAMPLES.md) — prompts and workflows to try.
-- [FAQ](./docs/FAQ.md) — compatibility, setup questions, and limitations.
-- [Architecture](./docs/ARCHITECTURE.md) — bridge, session lifecycle, and background policy.
-- [Comparison](./docs/COMPARISON.md) — where pi-chrome fits among browser tools.
-- [Changelog](./CHANGELOG.md) — release history.
-
-## Contributing
-
-Bug reports, reproducible browser challenges, and real workflow demos are welcome. Include `/chrome doctor` output and reproduction steps; redact private URLs and page content. See [CONTRIBUTING.md](./CONTRIBUTING.md).
-
-If pi-chrome is useful, consider starring the repo or sharing a workflow that worked for you.
-
-## License
-
-MIT. See [LICENSE](./LICENSE).

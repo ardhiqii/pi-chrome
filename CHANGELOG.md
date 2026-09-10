@@ -2,6 +2,11 @@
 
 All notable user-facing changes to `pi-chrome`.
 
+## 0.15.50 — 2026-09-10
+
+- **README clarity.** Lead with workflow examples, correct setup ordering and platform-specific onboarding instructions, and clarify privacy guidance. Describe background behavior and the on/off/status controls directly.
+- **Documentation-only release.** Browser behavior and permissions are unchanged. The companion version matches the npm package version.
+
 ## 0.15.49 — 2026-09-10
 
 - **Validation scope.** Node regression suites passed. Live browser validation remains incomplete: an input attempt encountered `Input.dispatchMouseEvent: Detached while handling command.`; a subsequent retest was blocked by a disconnected companion. No live-browser pass is claimed for these changes.
