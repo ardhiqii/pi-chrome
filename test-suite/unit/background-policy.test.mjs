@@ -19,8 +19,13 @@ function section(start, end) {
 
 // Load the shipped policy, existing command handler, and actual tool registrations. Only the
 // bridge/Pi UI/typebox/formatting/filesystem boundaries are replaced; no live server is opened.
-function piHarness({ session = "alpha", send } = {}) {
-  const calls = [], tools = new Map(), notices = [], writes = [];
+function piHarness({ session = "alpha", send, files, unlinkFails = false } = {}) {
+  const calls = [], tools = new Map(), notices = [], writes = [], removed = [];
+  // In-memory stand-in for the screenshot folder: name -> mtimeMs. Lets the retention tests drive
+  // readdir/stat/unlink without touching the real filesystem.
+  const folder = new Map(Object.entries(files ?? {}));
+  const nameOf = (p) => String(p).split(/[\\/]/).pop();
+  const unlinkAttempts = { count: 0 };
   let authorized = true;
   const ctx = { key: `session:${session}`, title: `Pi Session: ${session}`, cwd: "/fixture", ui: { notify: (...args) => notices.push(args) } };
   const bridge = {
@@ -50,6 +55,19 @@ function piHarness({ session = "alpha", send } = {}) {
     formatChromeInspect: JSON.stringify, summarizeActionResult: () => "", formatIncludedSnapshotText: (_r, text) => text,
     workspaceCwd: () => ctx.cwd, ...path,
     mkdir: async () => {}, writeFile: async (...args) => writes.push(args),
+    readdir: async () => [...folder.keys()],
+    stat: async (p) => {
+      const name = nameOf(p);
+      if (!folder.has(name)) { const e = new Error(`ENOENT: ${name}`); e.code = "ENOENT"; throw e; }
+      return { isFile: () => !name.endsWith("/"), mtimeMs: folder.get(name) };
+    },
+    unlink: async (p) => {
+      unlinkAttempts.count += 1;
+      const name = nameOf(p);
+      if (unlinkFails) { const e = new Error(`EPERM: ${name}`); e.code = "EPERM"; throw e; }
+      if (!folder.delete(name)) { const e = new Error(`ENOENT: ${name}`); e.code = "ENOENT"; throw e; }
+      removed.push(name);
+    },
   };
   const registrations = indexSource.slice(indexSource.indexOf("function registerChromeTools(pi:"), indexSource.lastIndexOf("\n}"));
   vm.runInNewContext(stripTypeScriptTypes([
@@ -61,7 +79,7 @@ function piHarness({ session = "alpha", send } = {}) {
   ].join("\n")), sandbox);
   sandbox.registerChromeTools({ registerTool: (tool) => tools.set(tool.name, tool) });
   return {
-    calls, tools, notices, writes, ctx,
+    calls, tools, notices, writes, ctx, removed, folder, unlinkAttempts,
     send: async (...args) => sandbox.send(...args),
     background: (arg) => sandbox.background(ctx, arg),
     tool: (name, params = {}, signal) => tools.get(name).execute("test", params, signal, undefined, ctx),
@@ -608,4 +626,80 @@ test("postResult aborts a stalled /result POST instead of wedging handleCommand"
   fetches[1].settle.resolve({ ok: true, status: 200 });
   await healthy;
   assert.equal(timers.size, 0, "the result abort timer is cleared on success");
+});
+
+// Regression: every chrome_screenshot capture writes a new timestamped file, so its folder grew
+// without bound. Captures now prune their own older files at capture time. These tests pin the
+// properties that matter: only fork-generated names are eligible, the newest SCREENSHOT_KEEP_MIN
+// survive regardless of age, retention is opt-out, and a failing prune can never fail a capture.
+const DAY_MS = 24 * 60 * 60 * 1000;
+const shotStamp = (i) => `2026-09-${String(i).padStart(2, "0")}T00-00-00-000Z.png`;
+const staleShots = (count, ageDays) => {
+  const files = {};
+  for (let i = 1; i <= count; i++) files[shotStamp(i)] = Date.now() - ageDays * DAY_MS - i;
+  return files;
+};
+
+test("screenshot retention keeps the newest 20, prunes older captures, and spares hand-named files", async () => {
+  const h = piHarness({
+    files: {
+      ...staleShots(22, 30),
+      "regression-check.png": Date.now() - 60 * DAY_MS,
+      "notes.html": Date.now() - 60 * DAY_MS,
+    },
+  });
+  const result = await h.tool("chrome_screenshot", {});
+  // 22 eligible captures, newest 20 kept -> the 2 oldest go.
+  assert.equal(h.removed.length, 2, `expected 2 pruned, got ${h.removed.length}`);
+  assert.deepEqual(h.removed.slice().sort(), [shotStamp(21), shotStamp(22)].sort());
+  assert.ok(h.folder.has("regression-check.png"), "hand-named png is never eligible");
+  assert.ok(h.folder.has("notes.html"), "unrelated file is never eligible");
+  assert.match(result.content[0].text, /pruned 2 older captures/);
+  assert.equal(result.details.pruned, 2);
+});
+
+test("full-page tiles and their manifest are eligible for retention", async () => {
+  const h = piHarness({
+    files: {
+      ...staleShots(20, 10),
+      "2026-09-17T00-00-00-000Z-tile0.png": Date.now() - 400 * DAY_MS,
+      "2026-09-17T00-00-00-000Z.png.json": Date.now() - 401 * DAY_MS,
+    },
+  });
+  await h.tool("chrome_screenshot", {});
+  assert.deepEqual(
+    h.removed.slice().sort(),
+    ["2026-09-17T00-00-00-000Z-tile0.png", "2026-09-17T00-00-00-000Z.png.json"].sort(),
+  );
+});
+
+test("captures inside the retention window are never pruned, even past the keep floor", async () => {
+  const h = piHarness({ files: staleShots(30, 1) });
+  const result = await h.tool("chrome_screenshot", {});
+  assert.equal(h.removed.length, 0, "nothing inside the window is deleted");
+  assert.equal(result.details.pruned, 0);
+  assert.doesNotMatch(result.content[0].text, /pruned/);
+});
+
+test("retentionDays:0 opts out of pruning entirely", async () => {
+  const files = staleShots(30, 100);
+  // Same fixture, default retention: proves the opt-out is what suppressed the deletes.
+  const withDefaults = piHarness({ files });
+  await withDefaults.tool("chrome_screenshot", {});
+  assert.equal(withDefaults.removed.length, 10, "defaults do prune this fixture");
+
+  const h = piHarness({ files });
+  await h.tool("chrome_screenshot", { retentionDays: 0 });
+  assert.equal(h.unlinkAttempts.count, 0, "no delete was even attempted");
+  assert.equal(h.removed.length, 0);
+  assert.equal(h.folder.size, 30);
+});
+
+test("a failing prune never fails the capture", async () => {
+  const h = piHarness({ files: staleShots(30, 100), unlinkFails: true });
+  const result = await h.tool("chrome_screenshot", {});
+  assert.ok(h.unlinkAttempts.count > 0, "pruning was attempted");
+  assert.equal(h.removed.length, 0, "nothing was deleted");
+  assert.match(result.content[0].text, /Saved Chrome screenshot to/);
+  assert.equal(h.writes.length, 1, "the capture still wrote its file");
 });

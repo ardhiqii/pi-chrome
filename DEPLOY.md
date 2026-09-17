@@ -27,7 +27,7 @@ reinstalls it.** Deployment only overwrites the files listed below in that exist
 | File | Change |
 | --- | --- |
 | `browser-extension/service_worker.js` | Raw CDP passthrough (`cdp.call`), CDP target diagnostics (`cdp.targets`), best-effort focus emulation on attach, stalled long-poll recovery, unified `Pi Agent` tab group |
-| `index.ts` | Pi-side tools `chrome_cdp` and `chrome_cdp_targets` |
+| `index.ts` | Pi-side tools `chrome_cdp` and `chrome_cdp_targets`; capture-time screenshot retention |
 | `package.json`, `browser-extension/manifest.json` | The fork's version (`0.15.51.1`), so the build is distinguishable from stock |
 
 What you get, in plain terms:
@@ -47,6 +47,10 @@ What you get, in plain terms:
 - **Stalled long-poll recovery** — `/next` is a server-side long poll; a half-open socket left by
   a dead Pi process used to park the service worker permanently. It now aborts on a deadline and
   retries by itself.
+- **Screenshot retention** — `chrome_screenshot` wrote a new timestamped file per capture and never
+  removed any, so `<cwd>/.pi/chrome-screenshots/` grew without bound. Captures now prune their own
+  files older than 7 days once more than 20 are present, always keeping the newest 20. Hand-named
+  files are never eligible. `retentionDays: 0` disables it.
 
 Permissions, install path, authorization rules, and background mode are untouched.
 

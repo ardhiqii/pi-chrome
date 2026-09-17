@@ -1,7 +1,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { existsSync, readFileSync, statSync } from "node:fs";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readdir, stat, unlink, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { dirname, join, resolve } from "node:path";
 
@@ -837,7 +837,6 @@ export default function (pi: ExtensionAPI): void {
 		}
 		return "";
 	};
-
 	// Stable per-session key the service worker uses to scope its dedicated automation tab/window
 	// to *this* session (one extension brokers all sessions). The session id is stable across
 	// /reload, so the automation target is reused rather than orphaned. Returns undefined only
@@ -1299,6 +1298,56 @@ Usage rules:
 		if (chromeToolsRegistered) return;
 		chromeToolsRegistered = true;
 
+	// --- screenshot retention -------------------------------------------------------------------
+	// Every capture writes a new timestamped file, so without pruning the screenshot folder grows
+	// without bound. Pruning at capture time keeps it bounded with no external scheduler.
+	// Only files this tool generated are eligible: an ISO timestamp (colons and dots replaced with
+	// dashes), the optional -tileN suffix written by a full-page capture, and the matching .json
+	// manifest. Anything named by hand in that folder is never touched, and the newest
+	// SCREENSHOT_KEEP_MIN captures are always kept so a burst of captures cannot wipe the folder.
+	const SCREENSHOT_RETENTION_DAYS = 7;
+	const SCREENSHOT_KEEP_MIN = 20;
+	const SCREENSHOT_OWNED_RE = /^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z(?:-tile\d+)?\.(?:png|jpe?g|webp)(?:\.json)?$/i;
+
+	// Best effort by design: a capture must never fail or be delayed into an error because pruning
+	// did. `retentionDays <= 0` disables pruning outright.
+	const pruneScreenshots = async (dir: string, retentionDays: number): Promise<{ removed: number; kept: number }> => {
+		if (!Number.isFinite(retentionDays) || retentionDays <= 0) return { removed: 0, kept: 0 };
+		let names: string[];
+		try {
+			names = await readdir(dir);
+		} catch {
+			// No folder yet, or it is unreadable: nothing to prune.
+			return { removed: 0, kept: 0 };
+		}
+		const owned: Array<{ path: string; mtimeMs: number }> = [];
+		for (const name of names) {
+			if (!SCREENSHOT_OWNED_RE.test(name)) continue;
+			const filePath = join(dir, name);
+			try {
+				const info = await stat(filePath);
+				if (info.isFile()) owned.push({ path: filePath, mtimeMs: info.mtimeMs });
+			} catch {
+				// Raced with a delete between readdir and stat; nothing to prune.
+			}
+		}
+		if (owned.length <= SCREENSHOT_KEEP_MIN) return { removed: 0, kept: owned.length };
+		owned.sort((a, b) => b.mtimeMs - a.mtimeMs);
+		const cutoff = Date.now() - retentionDays * 24 * 60 * 60 * 1000;
+		let removed = 0;
+		for (const entry of owned.slice(SCREENSHOT_KEEP_MIN)) {
+			if (entry.mtimeMs >= cutoff) continue;
+			try {
+				await unlink(entry.path);
+				removed += 1;
+			} catch {
+				// A locked or unreadable file is kept rather than failing the capture.
+			}
+		}
+		return { removed, kept: owned.length - removed };
+	};
+
+
 	pi.registerTool({
 		name: "chrome_launch",
 		label: "Chrome Bridge Setup",
@@ -1749,6 +1798,7 @@ Usage rules:
 		promptSnippet: "Capture Chrome screenshots and save them under .pi/chrome-screenshots by default.",
 		parameters: Type.Object({
 			path: Type.Optional(Type.String({ description: "Output path. Defaults to .pi/chrome-screenshots/<timestamp>.<format>." })),
+			retentionDays: Type.Optional(Type.Number({ minimum: 0, description: "Prune older captures in the default screenshot folder after this many days; 0 disables pruning. Defaults to 7. The newest 20 captures are always kept, and hand-named files are never touched." })),
 			format: Type.Optional(StringEnum(imageFormatValues)),
 			quality: Type.Optional(Type.Number({ minimum: 0, maximum: 100, description: "JPEG quality 0-100." })),
 			fullPage: Type.Optional(Type.Boolean({ description: "Capture full-page tiles plus a JSON manifest. Temporarily scrolls the target page; does not activate background tabs." })),
@@ -1762,7 +1812,8 @@ Usage rules:
 		async execute(_id, params, signal, _onUpdate, ctx: ExtensionContext): Promise<ToolTextResult> {
 			const format = params.format ?? "png";
 			const cwd = workspaceCwd(ctx);
-			const defaultPath = join(cwd, ".pi", "chrome-screenshots", `${new Date().toISOString().replace(/[:.]/g, "-")}.${format}`);
+			const screenshotDir = join(cwd, ".pi", "chrome-screenshots");
+			const defaultPath = join(screenshotDir, `${new Date().toISOString().replace(/[:.]/g, "-")}.${format}`);
 			const outputPath = params.path ? resolve(cwd, params.path) : defaultPath;
 			const result = (await authorizedBridgeSend("page.screenshot", params, params.fullPage ? 120_000 : DEFAULT_TIMEOUT_MS, signal)) as {
 				dataUrl?: string;
@@ -1773,6 +1824,9 @@ Usage rules:
 				tiles?: Array<{ y: number; dataUrl: string }>;
 			};
 			await mkdir(dirname(outputPath), { recursive: true });
+			// Prune before writing so the folder stays bounded even if this capture fails midway.
+			const pruned = await pruneScreenshots(screenshotDir, params.retentionDays ?? SCREENSHOT_RETENTION_DAYS);
+			const prunedNote = pruned.removed > 0 ? ` (pruned ${pruned.removed} older capture${pruned.removed === 1 ? "" : "s"})` : "";
 			if (result.fullPage && result.tiles && result.dimensions) {
 				// Stitch via PNG if format is png; otherwise we fall back to writing tile files and a
 				// manifest. We avoid pulling in an image library by writing each tile next to the main
@@ -1788,14 +1842,14 @@ Usage rules:
 				}
 				await writeFile(outputPath + ".json", JSON.stringify({ width, height, viewportHeight, dpr, tiles: manifest }, null, 2));
 				return {
-					content: [{ type: "text", text: `Saved ${result.tiles.length} full-page tile(s) for ${width}×${height}px page. Manifest: ${outputPath}.json` }],
+					content: [{ type: "text", text: `Saved ${result.tiles.length} full-page tile(s) for ${width}×${height}px page. Manifest: ${outputPath}.json${prunedNote}` }],
 					details: { manifest: outputPath + ".json", tiles: manifest, dimensions: result.dimensions, tab: result.tab, method: result.method } as unknown as Record<string, unknown>,
 				};
 			}
 			if (!result.dataUrl) throw new Error("Screenshot returned no dataUrl");
 			const base64 = result.dataUrl.replace(/^data:image\/(?:png|jpeg);base64,/, "");
 			await writeFile(outputPath, Buffer.from(base64, "base64"));
-			return { content: [{ type: "text", text: `Saved Chrome screenshot to ${outputPath}` }], details: { path: outputPath, format, tab: result.tab, method: result.method } };
+			return { content: [{ type: "text", text: `Saved Chrome screenshot to ${outputPath}${prunedNote}` }], details: { path: outputPath, format, tab: result.tab, method: result.method, pruned: pruned.removed } };
 		},
 	});
 

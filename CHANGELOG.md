@@ -79,6 +79,17 @@ All notable user-facing changes to `pi-chrome`.
   This fork instead uses one stable name for every Pi-created group, so all of Pi's tabs live
   together in a single group per window and are instantly recognisable as Pi's rather than the
   user's.
+- **Screenshot retention.** `chrome_screenshot` wrote a new timestamped file on every capture and
+  nothing ever removed them, so `<cwd>/.pi/chrome-screenshots/` grew without bound — and a
+  `fullPage` capture adds one file per tile plus a `.json` manifest on top of that. Captures now
+  prune that folder at capture time: files older than 7 days are deleted once more than 20 of this
+  tool's own captures are present. Only files this tool generated are eligible — an ISO timestamp
+  (colons and dots replaced with dashes), the optional `-tileN` suffix, and the matching `.json`
+  manifest — so a hand-named file sitting in the same folder is never touched, and an explicit
+  `path:` is never pruned. The newest 20 are always kept, so a burst of captures cannot empty the
+  folder. The whole prune is best-effort: a locked or unreadable file is kept, and a prune failure
+  can never fail or delay the capture into an error. `retentionDays` overrides the window per call;
+  `retentionDays: 0` disables pruning entirely.
 
 ### Fork tooling
 
@@ -129,6 +140,12 @@ All notable user-facing changes to `pi-chrome`.
   the bridge's real `waitForCommand(25_000, ...)` hold out of `index.ts` rather than comparing
   against the worker's unrelated (and coincidentally equal) `COMMAND_TIMEOUT_MS`, and they **fail
   against the pre-fix worker** — so they are genuinely load-bearing rather than vacuous.
+- `background-policy.test.mjs` also gained five `chrome_screenshot` retention tests (keeps the
+  newest 20 while pruning older captures; spares hand-named files; treats full-page tiles and their
+  manifest as eligible; never prunes inside the retention window; `retentionDays: 0` opts out; a
+  failing `unlink` never fails the capture). All five fail against the pre-retention `index.ts`, so
+  none of them is vacuous — including the two that assert *absence* of deletion, which now also
+  assert that pruning was attempted at all.
 
 ## 0.15.51 — 2026-09-10
 

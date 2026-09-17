@@ -198,8 +198,8 @@ if [ "$sw_changed" -eq 1 ]; then
   echo "     running and none of the new code executes."
 else
   echo "  1) No Reload needed: service_worker.js is unchanged."
-  echo "     A version-only change is picked up by the extension's own version-skew reload,"
-  echo "     which fires within a few seconds of the next /next poll."
+  echo "     (A version bump on its own is picked up by the extension's own version-skew"
+  echo "     reload; with no version change there is nothing for the browser to reload.)"
 fi
 echo
 if [ "$index_changed" -eq 1 ]; then
