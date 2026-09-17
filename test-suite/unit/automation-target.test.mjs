@@ -236,7 +236,7 @@ async function run() {
 
     const blankTitle = await w.dispatch("tab.new", { url: "https://pi.test/blank-title", groupTitle: "", group: false, sessionKey: SK });
     ok(typeof blankTitle.tab.groupId === "number" && blankTitle.tab.groupId >= 0, "tab.new-group: groupTitle:'' still creates a grouped tab");
-    ok(blankTitle.group.title === "Pi", "tab.new-group: blank groupTitle falls back to a group instead of opting out");
+    ok(blankTitle.group.title === "Pi Agent", "tab.new-group: blank groupTitle falls back to a group instead of opting out");
 
     const nav2 = await w.dispatch("page.navigate", {
       url: "https://pi.test/new-automation-target", waitUntilLoad: false,

@@ -1,14 +1,35 @@
 const BRIDGE_URL = "http://127.0.0.1:17318";
 const CLIENT_NAME = `Pi Chrome Connector ${chrome.runtime.id}`;
 const POLL_ERROR_BACKOFF_MS = 2000;
+// Abort deadline for one /next long poll. The bridge holds /next open for up to 25s
+// (`waitForCommand(25_000, ...)` in extensions/chrome-profile-bridge/index.ts), so this must stay
+// comfortably above that hold. 45s leaves a 20s margin: a healthy long poll must never be aborted
+// by a scheduler/GC/network hiccup, because a false abort discards the command that was in flight.
+// A zombie socket still recovers on its own in ~47s (45s deadline + 2s backoff) instead of parking
+// forever. The guarantee is time-to-first-byte, not whole response: the timer is cleared as soon as
+// the fetch settles, before response.json() reads the body.
+const POLL_ABORT_MS = 45_000;
+// Abort deadline for the /result POST. /result is a short request, but a half-open bridge socket
+// parks it forever too, and handleCommand awaits it from inside pollLoop's while loop.
+const RESULT_ABORT_MS = 10_000;
+// Throttle for the aborted-request warning in pollLoop so a dead bridge cannot spam the console.
+const ABORT_WARN_THROTTLE_MS = 60_000;
 const DEFAULT_GROUP_COLOR = "blue";
 const PI_GROUP_RE = /^Pi(\b|\s*-)/i;
+// The tab-group title for every Pi-created group, in both the extension and the Pi side
+// (index.ts `sessionGroupTitle`). "Pi" alone was ambiguous — it reads as the number pi — and it
+// split Pi's own tabs across two differently-named groups in the same window.
+const PI_GROUP_NAME = "Pi Agent";
 const VALID_GROUP_COLORS = new Set(["grey", "blue", "red", "yellow", "green", "pink", "purple", "cyan", "orange"]);
 const COMMAND_TIMEOUT_MS = 25_000;
 const CDP_COMMAND_TIMEOUT_MS = 5_000;
 const SCRIPTING_TIMEOUT_MS = 8_000;
 const ATTACH_TIMEOUT_MS = 3_000;
+// Gate for the best-effort focus-emulation command sent on every fresh debugger attach. Set to
+// false to restore the pre-feature attach path (one less CDP round trip per fresh attach).
+const FOCUS_EMULATION_ON_ATTACH = true;
 let polling = false;
+let lastAbortWarnAt = 0;
 
 // =================== pi-chrome automation target ownership ===================
 // pi-chrome must never hijack the user's active tab. When a page/navigation action runs without
@@ -342,7 +363,18 @@ async function attachDebugger(tabId) {
     recordAttachEvent({ kind, tabId, debuggee: pageDebuggee });
     return attemptAttach(pageDebuggee);
   };
-  let err = await attemptAttach();
+  // Prefer the explicit page target over the bare { tabId } debuggee. Chrome and Edge can keep
+  // several CDP targets anchored to a single tab (extension overlays, autofill and password
+  // managers, devtools front-ends). Attaching by { tabId } binds to whichever target the browser
+  // currently treats as primary, and that session can be torn down mid-command, surfacing as
+  // "Detached while handling command" on Page.captureScreenshot and Input.dispatchMouseEvent
+  // while simpler commands still succeed. Binding to the page target is how Codex's browser
+  // service addresses a tab, so try it first and fall back to { tabId } when unavailable.
+  const preferredPageDebuggee = await pageDebuggeeForTab(tabId).catch(() => null);
+  let err = preferredPageDebuggee && preferredPageDebuggee.targetId
+    ? await attemptAttach(preferredPageDebuggee)
+    : await attemptAttach();
+  if (err) err = await attemptAttach();
   if (err) err = await retryPageTargetIfExtensionBlocked(err, "attach-page-target-retry");
   if (err) {
     const msg = String(err?.message || err);
@@ -375,6 +407,20 @@ async function attachDebugger(tabId) {
   // Seed pointer in a plausible "just left the address bar" location.
   const entry = { detachAt: Date.now() + INPUT_IDLE_DETACH_MS, pointer: { x: 120 + Math.random() * 200, y: 80 + Math.random() * 120 }, debuggee: attachedDebuggee || { tabId } };
   attachedTabs.set(tabId, entry);
+  // Best-effort focus emulation, gated by FOCUS_EMULATION_ON_ATTACH. It makes
+  // document.hasFocus() report true, which some focus-dependent widgets require. It does NOT
+  // guarantee visibilityState === "visible" and does NOT resume requestAnimationFrame in a
+  // hidden tab, so it must never be treated as a screenshot/compositing fix. Detach-on-timeout
+  // is disabled and every failure is recorded in the in-memory attach log (attachDebugLog, last
+  // 20 entries, not currently exposed to Pi) but otherwise ignored: attach is what makes
+  // click/type work today, so a failure here must never reject or break it.
+  if (FOCUS_EMULATION_ON_ATTACH) {
+    try {
+      await cdpRaw(tabId, "Emulation.setFocusEmulationEnabled", { enabled: true }, { timeoutMs: 1_500, detachOnTimeout: false });
+    } catch (error) {
+      recordAttachEvent({ kind: "focus-emulation-failed", tabId, message: String(error?.message || error) });
+    }
+  }
   return entry;
 }
 
@@ -435,14 +481,41 @@ setInterval(() => {
   }
 }, 5000);
 
-function cdpRaw(tabId, method, params) {
+// Deadline policy for cdp.call (FORK BUILD). CDP_COMMAND_TIMEOUT_MS is the default;
+// callers may ask for a different deadline via params.timeoutMs, clamped so a stuck command can
+// never pin the debugger session forever. The cap stays below the MV3 service-worker hard
+// lifetime (5 minutes): a max-length command could otherwise be reaped by the browser before
+// the inner deadline fires, leaving the caller with the generic bridge timeout.
+// The outer handleCommand wrapper is widened by CDP_CALL_GRACE_MS so the inner cdpRaw timeout
+// normally fires first and reports a precise `CDP <method> timed out` error. That precision is
+// best-effort: the grace covers only the CDP command itself, while getTabByParams + the
+// attach/retry path (ATTACH_TIMEOUT_MS) run before cdpRaw and can still consume the margin.
+const CDP_CALL_MAX_TIMEOUT_MS = 120_000;
+const CDP_CALL_GRACE_MS = 5_000;
+function cdpCallTimeoutMs(params) {
+  const requested = Number(params?.timeoutMs);
+  if (!Number.isFinite(requested) || requested <= 0) return CDP_COMMAND_TIMEOUT_MS;
+  return Math.min(Math.floor(requested), CDP_CALL_MAX_TIMEOUT_MS);
+}
+function commandTimeoutMs(action, params) {
+  if (action !== "cdp.call") return COMMAND_TIMEOUT_MS;
+  return Math.max(COMMAND_TIMEOUT_MS, cdpCallTimeoutMs(params) + CDP_CALL_GRACE_MS);
+}
+
+// `opts.timeoutMs` overrides the default per-command deadline. `opts.detachOnTimeout === false`
+// suppresses the cleanup detach for best-effort commands that must never tear down a session that
+// was just attached. Both default to the original behaviour, so existing callers are unchanged.
+// On timeout the session is detached and forgotten, so the next call cleanly re-attaches.
+function cdpRaw(tabId, method, params, opts) {
   const debuggee = attachedTabs.get(tabId)?.debuggee || { tabId };
+  const requested = Number(opts?.timeoutMs);
+  const timeoutMs = Number.isFinite(requested) && requested > 0 ? requested : CDP_COMMAND_TIMEOUT_MS;
   return withTimeout(new Promise((resolve, reject) => {
     chrome.debugger.sendCommand(debuggee, method, params || {}, (result) => {
       if (chrome.runtime.lastError) reject(new Error(`${method}: ${chrome.runtime.lastError.message}`));
       else resolve(result);
     });
-  }), CDP_COMMAND_TIMEOUT_MS, `CDP ${method}`, async () => {
+  }), timeoutMs, `CDP ${method}`, opts?.detachOnTimeout === false ? undefined : async () => {
     attachedTabs.delete(tabId);
     try { await chrome.debugger.detach(debuggee); } catch {}
   });
@@ -494,9 +567,9 @@ async function dismissOverlayViaEscape(tabId) {
   } catch {}
 }
 
-async function cdp(tabId, method, params) {
+async function cdp(tabId, method, params, opts) {
   try {
-    return await cdpRaw(tabId, method, params);
+    return await cdpRaw(tabId, method, params, opts);
   } catch (error) {
     const msg = String(error?.message || error);
     const isStale = /Debugger is not attached|Detached while|Target closed|No tab with id/i.test(msg);
@@ -508,7 +581,7 @@ async function cdp(tabId, method, params) {
       recordAttachEvent({ kind: "foreign-ext-detected", tabId, method, foreignExtId: extractForeignExtId(before), targetCount: before.length });
       await dismissOverlayViaEscape(tabId);
       try {
-        return await cdpRaw(tabId, method, params);
+        return await cdpRaw(tabId, method, params, opts);
       } catch (retryErr) {
         const retryMsg = String(retryErr?.message || retryErr);
         if (/Cannot access a chrome-extension:\/\/ URL of different extension/i.test(retryMsg)) {
@@ -525,7 +598,7 @@ async function cdp(tabId, method, params) {
     if (!isStale) throw error;
     attachedTabs.delete(tabId);
     await attachDebugger(tabId).catch(() => undefined);
-    return cdpRaw(tabId, method, params);
+    return cdpRaw(tabId, method, params, opts);
   }
 }
 
@@ -1138,9 +1211,21 @@ async function pollLoop() {
   polling = true;
   try {
     while (true) {
-      const response = await fetch(`${BRIDGE_URL}/next?name=${encodeURIComponent(CLIENT_NAME)}`, {
-        cache: "no-store",
-      });
+      // /next is a server-side long poll (see POLL_ABORT_MS), so a fetch that outlives the
+      // deadline means the bridge died and the socket will never settle. Abort it so the catch
+      // below backs off and retries instead of parking on a zombie connection.
+      const abortController = new AbortController();
+      const abortTimer = setTimeout(() => abortController.abort(), POLL_ABORT_MS);
+      let response;
+      try {
+        response = await fetch(`${BRIDGE_URL}/next?name=${encodeURIComponent(CLIENT_NAME)}`, {
+          cache: "no-store",
+          signal: abortController.signal,
+        });
+      } finally {
+        // Clear before reading the body: a late abort during response.json() would fail a good response.
+        clearTimeout(abortTimer);
+      }
       if (!response.ok) throw new Error(`bridge /next HTTP ${response.status}`);
       const expected = response.headers.get("x-pi-chrome-version");
       const ours = chrome.runtime.getManifest().version;
@@ -1153,6 +1238,10 @@ async function pollLoop() {
       if (payload.type === "command") await handleCommand(payload.command);
     }
   } catch (error) {
+    if (error?.name === "AbortError" && Date.now() - lastAbortWarnAt >= ABORT_WARN_THROTTLE_MS) {
+      lastAbortWarnAt = Date.now();
+      console.warn(`[pi-chrome] bridge request aborted after its deadline; retrying in ${POLL_ERROR_BACKOFF_MS}ms`);
+    }
     await sleep(POLL_ERROR_BACKOFF_MS);
   } finally {
     polling = false;
@@ -1163,7 +1252,7 @@ async function handleCommand(command) {
   try {
     const result = await withTimeout(
       dispatch(command.action, command.params ?? {}),
-      COMMAND_TIMEOUT_MS,
+      commandTimeoutMs(command.action, command.params ?? {}),
       command.action || "Chrome command",
       () => detachAll(),
     );
@@ -1174,11 +1263,18 @@ async function handleCommand(command) {
 }
 
 async function postResult(result) {
-  await fetch(`${BRIDGE_URL}/result`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(result),
-  });
+  const abortController = new AbortController();
+  const abortTimer = setTimeout(() => abortController.abort(), RESULT_ABORT_MS);
+  try {
+    await fetch(`${BRIDGE_URL}/result`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(result),
+      signal: abortController.signal,
+    });
+  } finally {
+    clearTimeout(abortTimer);
+  }
 }
 
 function isVersionOlder(a, b) {
@@ -1194,8 +1290,8 @@ function isVersionOlder(a, b) {
 }
 
 function cleanGroupTitle(value) {
-  const text = String(value || "Pi").replace(/\s+/g, " ").trim().slice(0, 80);
-  return text || "Pi";
+  const text = String(value || PI_GROUP_NAME).replace(/\s+/g, " ").trim().slice(0, 80);
+  return text || PI_GROUP_NAME;
 }
 
 function cleanGroupColor(value) {
@@ -1277,7 +1373,7 @@ async function dispatch(action, params) {
       // Every Pi-opened tab must join a tab group. There is intentionally no opt-out: an ungrouped
       // Pi-created tab is easy to lose among user tabs. If grouping fails after creation, close the
       // tab best-effort before surfacing the error so tab.new never leaves an ungrouped Pi tab.
-      const groupTitle = params.groupTitle || "Pi";
+      const groupTitle = params.groupTitle || PI_GROUP_NAME;
       const existingGroup = await findGroupRecordByTitle(groupTitle);
       const createParams = { url: params.url || "about:blank", active: foregroundRequested(params) };
       if (existingGroup && typeof existingGroup.windowId === "number") createParams.windowId = existingGroup.windowId;
@@ -1303,7 +1399,7 @@ async function dispatch(action, params) {
     }
     case "tab.group": {
       const tab = await getTabByParams(params, { createOwnedTarget: false });
-      const grouped = await groupTab(tab, params.groupTitle || "Pi", params.groupColor);
+      const grouped = await groupTab(tab, params.groupTitle || PI_GROUP_NAME, params.groupColor);
       if (!(tab.groupId >= 0)) await trackSessionTab(sessionKeyOf(params), tab.id, false, grouped.group?.id);
       return grouped;
     }
@@ -1395,6 +1491,52 @@ async function dispatch(action, params) {
     }
     case "page.screenshot":
       return takeScreenshot(params);
+    // -------- raw CDP passthrough (FORK BUILD) --------
+    // Diagnostic: the CDP targets anchored to the resolved tab, including foreign/overlay
+    // targets (password managers, autofill, devtools front-ends). This is what makes cdp.call
+    // failures like "Detached while handling command" debuggable. chrome.debugger.getTargets
+    // returns targets browser-wide, so when a tab is resolved only its targets are reported;
+    // targets on other tabs are counted but not echoed into the conversation. With no resolved
+    // tab (no owned target yet) every target is reported so the caller can still diagnose.
+    case "cdp.targets": {
+      // Diagnostics must not create an automation window: resolve an owned target if one exists,
+      // otherwise report targets without a tab. An explicit selector miss ("No Chrome tab with
+      // id N" / "No matching Chrome tab found") must propagate instead of degrading to an
+      // empty-looking list that hides the mistake; any other failure (for example a transient
+      // chrome.tabs.query error) is still swallowed so diagnostics keep working. Empty
+      // urlIncludes/titleIncludes count as "no selector", matching getTabByParams' own truthiness
+      // checks.
+      const hasSelector = params.targetId !== undefined || Boolean(params.urlIncludes) || Boolean(params.titleIncludes);
+      const tab = await getTabByParams(params, { createOwnedTarget: false }).catch((error) => {
+        const message = String(error?.message || error);
+        if (hasSelector && /No Chrome tab with id|No matching Chrome tab found/.test(message)) throw error;
+        return null;
+      });
+      const allTargets = await new Promise((resolve) => chrome.debugger.getTargets((t) => resolve(t || []))).catch(() => []);
+      const targets = tab ? allTargets.filter((t) => t.tabId === tab.id) : allTargets;
+      // Only targets anchored to another tab count as "more on other tabs". Tab-less targets
+      // (service workers, browser-level targets) are on no tab at all.
+      return {
+        tab: tab ? { id: tab.id, windowId: tab.windowId, url: tab.url, title: tab.title } : null,
+        targets: targets.map((t) => ({ id: t.id, tabId: t.tabId, type: t.type, url: t.url, title: t.title, attached: t.attached, extensionId: t.extensionId })),
+        ...(tab ? { otherTabTargetCount: allTargets.filter((t) => typeof t.tabId === "number" && t.tabId !== tab.id).length } : {}),
+      };
+    }
+    case "cdp.call": {
+      // Validate before touching the debugger: a clear error beats Chrome's opaque
+      // "sendCommand: Invalid parameters" for a missing/blank method.
+      if (typeof params.method !== "string" || !params.method.trim()) {
+        throw new Error('cdp.call requires a non-empty string "method" (for example "Runtime.evaluate" or "Page.captureScreenshot").');
+      }
+      if (params.params !== undefined && params.params !== null && (typeof params.params !== "object" || Array.isArray(params.params))) {
+        throw new Error('cdp.call "params" must be a plain object of CDP parameters when provided.');
+      }
+      const method = params.method.trim();
+      const tab = await getTabByParams(params);
+      await attachDebugger(tab.id);
+      const timeoutMs = cdpCallTimeoutMs(params);
+      return await cdp(tab.id, method, params.params ?? {}, { timeoutMs });
+    }
     case "automation.status": {
       // Report this session's owned automation target (ids only). Used for diagnostics/tests.
       await hydrateAutomationTargets();

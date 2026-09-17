@@ -1,0 +1,2 @@
+# Keep byte-identical copies of upstream extension files: no EOL conversion.
+* -text

@@ -4,3 +4,5 @@ node_modules/
 .DS_Store
 dist/
 build/
+# Timestamped backups written by deploy.sh next to the files it overwrites.
+*.pi-backup-*

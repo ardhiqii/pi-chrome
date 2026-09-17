@@ -474,7 +474,9 @@ test("full-page tiles remain CDP-only, pin the resolved target, and restore both
       scrolls.push(clone(args));
     };
     let captures = 0;
-    h.cdpResult = () => { if (++captures === 2 && fail) throw new Error("tile failed"); return { data: "dGlsZQ==" }; };
+    // Count only real screenshot captures: attachDebugger also issues a best-effort
+    // Emulation.setFocusEmulationEnabled command over the same mocked CDP channel.
+    h.cdpResult = (method) => { if (method === "Page.captureScreenshot" && ++captures === 2 && fail) throw new Error("tile failed"); return { data: "dGlsZQ==" }; };
     const shot = h.w.dispatch("page.screenshot", { urlIncludes: "target.test", fullPage: true, background: true, foreground: true });
     if (fail) await assert.rejects(shot, /tile failed/);
     else {
@@ -486,4 +488,124 @@ test("full-page tiles remain CDP-only, pin the resolved target, and restore both
     assert.deepEqual(scrolls, [[0], [600], [73, 31]]);
     assertNoFocus(h);
   }
+});
+
+// Regression: /next is a server-side long poll, so a dead bridge used to leave the fetch parked
+// forever and wedge the worker. pollLoop must abort a stalled poll on its deadline and come back
+// for a retry, without leaving the abort timer behind once the fetch settles. The deadline is
+// compared against the bridge's real hold literal in index.ts, not against the worker's unrelated
+// COMMAND_TIMEOUT_MS (which merely happens to be 25s today). Fake timers make the deadline
+// deterministic; the fetch stub only settles when the test says so.
+function pollHarness() {
+  const h = workerHarness();
+  const timers = new Map();
+  let nextTimerId = 1;
+  h.w.AbortController = AbortController;
+  h.w.setTimeout = (fn, ms) => { const id = nextTimerId++; timers.set(id, { fn, ms }); return id; };
+  h.w.clearTimeout = (id) => timers.delete(id);
+  const fetches = [];
+  h.w.fetch = (url, options = {}) => {
+    const call = { url, options, signal: options.signal, settle: {} };
+    fetches.push(call);
+    return new Promise((resolve, reject) => {
+      call.settle.resolve = resolve;
+      call.settle.reject = reject;
+      const abort = () => reject(Object.assign(new Error("The operation was aborted."), { name: "AbortError" }));
+      if (options.signal?.aborted) abort();
+      else options.signal?.addEventListener("abort", abort, { once: true });
+    });
+  };
+  // Let pollLoop's microtask chain drain up to the next (stubbed) fetch.
+  const flush = () => new Promise((resolve) => setImmediate(resolve));
+  return { h, timers, fetches, flush };
+}
+
+const bridgeHoldMatch = indexSource.match(/waitForCommand\(([\d_]+),/);
+assert.ok(bridgeHoldMatch, "could not find the bridge long-poll hold in index.ts");
+const bridgeHoldMs = Number(bridgeHoldMatch[1].replace(/_/g, ""));
+
+test("pollLoop aborts a stalled /next long poll and retries instead of parking the worker", async () => {
+  const { h, timers, fetches } = pollHarness();
+  const stalled = h.w.pollLoop();
+  assert.equal(fetches.length, 1, "pollLoop starts one /next long poll");
+  assert.equal(fetches[0].url, `http://127.0.0.1:17318/next?name=${encodeURIComponent(vm.runInContext("CLIENT_NAME", h.w))}`);
+  assert.equal(fetches[0].options.cache, "no-store", "long poll keeps cache: no-store");
+  assert.ok(fetches[0].signal, "long poll is abortable");
+  assert.equal(timers.size, 1, "one abort deadline is armed");
+  const pollAbortMs = vm.runInContext("POLL_ABORT_MS", h.w);
+  assert.ok(pollAbortMs > bridgeHoldMs, `abort deadline ${pollAbortMs}ms must exceed the bridge's ${bridgeHoldMs}ms hold`);
+  assert.equal(timers.values().next().value.ms, pollAbortMs);
+  timers.values().next().value.fn(); // Simulate the browser firing the deadline.
+  await stalled;
+  assert.equal(fetches[0].signal.aborted, true, "stalled long poll was aborted");
+  assert.equal(timers.size, 0, "abort timer cleared once the fetch settled");
+
+  const retry = h.w.pollLoop();
+  assert.equal(fetches.length, 2, "the next pollLoop run retries /next");
+  assert.equal(fetches[1].signal.aborted, false);
+  assert.equal(timers.size, 1, "retry armed a fresh deadline");
+  fetches[1].settle.resolve({ ok: false, status: 503 }); // Error paths must not leave a dangling timer either.
+  await retry;
+  assert.equal(timers.size, 0, "abort timer cleared on the non-OK path too");
+});
+
+test("a healthy /next response is never aborted and polls again with a fresh deadline", async () => {
+  const { h, timers, fetches, flush } = pollHarness();
+  let jsonCalls = 0;
+  const run = h.w.pollLoop();
+  assert.equal(timers.size, 1);
+  fetches[0].settle.resolve({
+    ok: true,
+    status: 200,
+    headers: { get: () => null },
+    json: async () => { jsonCalls += 1; return { type: "none" }; },
+  });
+  await flush();
+  assert.equal(jsonCalls, 1, "the healthy body is read after the deadline was cleared");
+  assert.equal(fetches.length, 2, "a healthy response loops straight into the next poll");
+  assert.equal(fetches[0].signal.aborted, false, "a healthy poll is never aborted");
+  assert.equal(timers.size, 1, "the next poll armed exactly one fresh deadline");
+  fetches[1].settle.resolve({ ok: false, status: 503 });
+  await run;
+  assert.equal(timers.size, 0, "leaving pollLoop clears the in-flight deadline");
+});
+
+test("the version-mismatch reload path returns without a dangling abort deadline", async () => {
+  const { h, timers, fetches } = pollHarness();
+  let reloads = 0;
+  h.chrome.runtime.reload = () => { reloads += 1; };
+  let jsonCalls = 0;
+  const run = h.w.pollLoop();
+  fetches[0].settle.resolve({
+    ok: true,
+    status: 200,
+    headers: { get: (name) => (name === "x-pi-chrome-version" ? "9.9.9" : null) },
+    json: async () => { jsonCalls += 1; return { type: "none" }; },
+  });
+  await run;
+  assert.equal(reloads, 1, "an extension older than pi reloads itself");
+  assert.equal(jsonCalls, 0, "the reload branch returns before reading the body");
+  assert.equal(fetches.length, 1, "the reload branch stops polling");
+  assert.equal(timers.size, 0, "the reload return path left no abort deadline behind");
+});
+
+test("postResult aborts a stalled /result POST instead of wedging handleCommand", async () => {
+  const { h, timers, fetches } = pollHarness();
+  const posting = h.w.postResult({ id: "cmd-1", ok: true, result: {} });
+  assert.equal(fetches.length, 1);
+  assert.equal(fetches[0].url, "http://127.0.0.1:17318/result");
+  assert.equal(fetches[0].options.method, "POST");
+  assert.equal(timers.size, 1, "the result POST has its own abort deadline");
+  const resultAbortMs = vm.runInContext("RESULT_ABORT_MS", h.w);
+  assert.ok(resultAbortMs > 0 && resultAbortMs < bridgeHoldMs, "result deadline stays a short-request deadline");
+  assert.equal(timers.values().next().value.ms, resultAbortMs);
+  timers.values().next().value.fn();
+  await assert.rejects(posting, (error) => error?.name === "AbortError");
+  assert.equal(timers.size, 0, "the result abort timer is cleared on failure");
+
+  const healthy = h.w.postResult({ id: "cmd-2", ok: true, result: {} });
+  assert.equal(fetches.length, 2);
+  fetches[1].settle.resolve({ ok: true, status: 200 });
+  await healthy;
+  assert.equal(timers.size, 0, "the result abort timer is cleared on success");
 });

@@ -2,6 +2,134 @@
 
 All notable user-facing changes to `pi-chrome`.
 
+## FORK ADDITIONS — NOT AN OFFICIAL RELEASE
+
+> **This section is not part of any official `pi-chrome` release.** It documents the changes this
+> fork (`0.15.51.1`, based on upstream `0.15.51`) carries on top of the released package. Upstream
+> releases do not contain them, and nothing here is offered upstream or as a pull request.
+> `service_worker.js` here also carries a pre-existing fork fix (explicit page target on attach)
+> that predates this section.
+
+### Fork additions on top of 0.15.51
+
+- **Raw CDP passthrough (`cdp.call` / `chrome_cdp`).** Execute an arbitrary Chrome DevTools
+  Protocol method against a resolved tab. `method` must be a non-empty string and `params`
+  must be an object (both validated before touching the debugger), and unknown top-level
+  parameters are rejected so raw CDP fields cannot be silently reduced to `params: {}`; the tab
+  is resolved with the same target rules as every other `page.*` action, then attached through
+  the existing page-target attach path. Optional `timeoutMs` (default 5000 ms, capped at
+  120000 ms) widens both the inner CDP deadline and the outer command wrapper so the requested
+  deadline is actually honoured; the cap stays below the MV3 service-worker hard lifetime. On
+  timeout the session is detached and forgotten, so the next call cleanly re-attaches.
+  Screenshot/binary payloads (base64 can be megabytes) are summarised by byte length and are
+  omitted from both the text result and `details`; any non-payload result whose JSON exceeds
+  256 KiB is likewise summarised in `details`, so multi-megabyte `Runtime.evaluate` /
+  `DOM.getOuterHTML` values cannot bloat the persisted transcript. Raw CDP is **not** covered
+  by background mode: methods such as `Page.bringToFront` or `Target.activateTarget` run as
+  given and can steal focus even while background mode is on.
+- **CDP target diagnostics (`cdp.targets` / `chrome_cdp_targets`).** List the CDP targets
+  anchored to the resolved tab (`id`, `tabId`, `type`, `url`, `title`, `attached`,
+  `extensionId`) plus the tab itself, so foreign/overlay targets (password managers, autofill,
+  devtools front-ends) are visible. Targets on other tabs are excluded and only counted, so
+  unrelated tab URLs never reach the conversation; when no tab can be resolved, every target is
+  reported. This is the diagnostic that makes `cdp.call` failures such as "Detached while
+  handling command" debuggable. It attaches nothing and never creates an automation window.
+- **`/chrome revoke` really deactivates every chrome tool.** The deactivation set behind
+  `/chrome revoke` and authorization expiry now lists every registered `chrome_*` tool.
+  `chrome_find`/`chrome_inspect` previously survived revoke and expiry as listed, callable tools
+  (calls still failed the authorization check, so this was not a control bypass), and a unit test
+  now asserts set equality against every `pi.registerTool` registration so a new tool cannot
+  drift out of it.
+- **Best-effort focus emulation on attach.** Every fresh debugger attach (unless the
+  `FOCUS_EMULATION_ON_ATTACH` constant in `service_worker.js` is set to false) sends
+  `Emulation.setFocusEmulationEnabled({ enabled: true })`. It makes `document.hasFocus()`
+  report focused, which some focus-gated widgets need. It does **not** guarantee
+  `visibilityState === "visible"` and does **not** resume `requestAnimationFrame` in a hidden
+  tab, so it is **not** a screenshot/compositing fix. The call is wrapped so it can never
+  throw, never reject the attach, and never detach the session; failures are recorded in the
+  extension's in-memory attach log (`attachDebugLog`, last 20 entries) and are **not currently
+  exposed to Pi** — no Pi-side tool reads it — so they otherwise go unseen.
+- **A dead bridge no longer parks the extension forever.** `/next` is a server-side long poll (the
+  bridge holds it open for up to 25 s: `waitForCommand(25_000, ...)` in `index.ts`), and the
+  extension issued it with **no timeout**. When a Pi process died, the socket could stay half-open:
+  the fetch never settled, so `pollLoop`'s `while` loop never iterated, the existing
+  `POLL_ERROR_BACKOFF_MS` retry never ran, and the worker sat on the zombie connection
+  indefinitely — `lastSeen never` on the bridge while `netstat` still showed the connection,
+  recoverable only by manually reloading the extension. `pollLoop` now arms an `AbortController`
+  deadline (`POLL_ABORT_MS`, **45 s** — 20 s of headroom over the 25 s hold, deliberately generous
+  because a false abort discards the command that was in flight) and clears it as soon as the fetch
+  settles, **before** `response.json()` reads the body, so a late abort can never fail a good
+  response. `postResult` gets the same treatment (`RESULT_ABORT_MS`, 10 s) because `handleCommand`
+  awaits it from inside `pollLoop`: a half-open `/result` socket wedged the worker identically.
+  Recovery is now self-healing in ~47 s (45 s deadline + 2 s backoff). Verified against a real hung
+  socket over real TCP: the pre-fix file is still parked after 55 s and never issues a retry, while
+  the fixed file aborts at the deadline and re-polls. Known residual, left for a follow-up: if an
+  abort lands just after the bridge marks a command delivered, that command is lost; the real fix is
+  bridge-side ack/redelivery on reconnect, which needs `/next` protocol changes in `index.ts`.
+- **One Pi tab group, named `Pi Agent`.** Pi-created groups had two different default names:
+  `index.ts`'s `sessionGroupTitle()` returned `"Pi Agent"`, while `service_worker.js` defaulted to
+  `"Pi"` in three places (`cleanGroupTitle`, and the `tab.new` / `tab.group` fallbacks). A raw
+  bridge call, or any caller that omitted `groupTitle`, therefore landed in a second, differently
+  named Pi group in the same window. Both now use a single `PI_GROUP_NAME = "Pi Agent"` constant.
+  `"Pi"` was also genuinely ambiguous on its own — it reads as the number pi — so the longer name is
+  the one worth standardising on.
+
+  This is a deliberate divergence from upstream, which names a group **per session**
+  (`Pi Session: <name-or-id>`) so that each Pi session gets its own group and tabs stay separated.
+  This fork instead uses one stable name for every Pi-created group, so all of Pi's tabs live
+  together in a single group per window and are instantly recognisable as Pi's rather than the
+  user's.
+
+### Fork tooling
+
+- **This build now identifies itself as `0.15.51.1`.** `package.json` and `manifest.json` both
+  carry it, plus `version_name: "0.15.51-aufa.1"` for display. Until now the local build was
+  byte-identical in version to upstream 0.15.51, so nothing — not `tab.version`, not `/chrome
+  doctor`, not the browser — could distinguish it from a stock install. The 4th integer sorts
+  above 0.15.51 and below a future 0.15.52, so upstream upgrades still win the comparison. Chrome
+  only accepts 1-4 dot-separated integers in a manifest `version`; a semver prerelease such as
+  `0.15.51-aufa.1` is rejected outright and would stop the extension loading, which is why the
+  suffix lives in `version_name` instead.
+- **`deploy.sh` copies `package.json` and `manifest.json` too**, and accepts either this build's
+  version or a clean upstream reinstall's as the live `package.json`. Because `index.ts` re-reads
+  `package.json` on every `/next`, a deploy now makes the extension notice the newer manifest
+  version and reload itself, so the manual Reload at `edge://extensions` is no longer required for
+  a version bump. `scripts/sync-manifest-version.mjs` was restored — the repo's `package.json`
+  pointed at a `scripts/` directory that was never imported, so `npm run version` failed with
+  `MODULE_NOT_FOUND`. It re-syncs the manifest and rejects any version Chrome would refuse.
+- **`deploy.sh`'s closing instructions are no longer boilerplate.** It used to print
+  "Reload the extension now (ALWAYS required when service_worker.js changes)" and "In Pi, run:
+  `/reload`" unconditionally, so a version-only deploy told the owner to do two things that were
+  not needed. The script now tracks which files actually changed and prints the Reload step only
+  when `service_worker.js` changed, and the `/reload` step only when `index.ts` changed — and says
+  so plainly when neither is required.
+
+- `deploy.sh` now refuses to overwrite a live install whose `package.json` version is not
+  0.15.51, or whose `service_worker.js` is neither the known base nor a previously deployed
+  local build, unless run with `--force`; `.pi-backup-*` names stay unique across same-second
+  runs. See `DEPLOY.md`.
+
+### Fork test changes
+
+- Added `test-suite/unit/cdp-passthrough.test.mjs` (invalid-`method`/`params` rejection, timeout
+  forwarding and clamping, detach-on-timeout recovery, `detachOnTimeout:false`, focus emulation
+  best-effort behaviour, `cdp.targets`, and the two new tool registrations) and wired it into
+  `npm test`. It also covers oversized-`details` summarisation, unknown top-level parameter
+  rejection, resolved-tab target scoping, and the declared parameter schema shape, selector-miss
+  propagation versus transient tab-lookup degradation in `cdp.targets`, and the `CHROME_TOOL_NAMES`
+  deactivation set matching every registered `chrome_*` tool.
+- One existing mock in `test-suite/unit/background-policy.test.mjs` was made method-aware so its
+  "second tile fails" counter still counts only `Page.captureScreenshot` calls; the new
+  best-effort focus-emulation command shares the same mocked CDP channel. No existing assertion
+  was weakened or removed.
+- `background-policy.test.mjs` gained four `pollLoop`/`postResult` regression tests: a stalled
+  `/next` long poll aborts and retries instead of parking the worker, a healthy `/next` response is
+  never aborted and re-polls with a fresh deadline, the version-mismatch `return` leaves no dangling
+  abort deadline, and a stalled `/result` POST aborts instead of wedging `handleCommand`. They parse
+  the bridge's real `waitForCommand(25_000, ...)` hold out of `index.ts` rather than comparing
+  against the worker's unrelated (and coincidentally equal) `COMMAND_TIMEOUT_MS`, and they **fail
+  against the pre-fix worker** — so they are genuinely load-bearing rather than vacuous.
+
 ## 0.15.51 — 2026-09-10
 
 - **Fewer Chrome commands.** Removed `/chrome status`; use bare `/chrome` for the quick connection, authorization, and background dashboard plus controls. The dashboard remains lightweight and does not run page probes.

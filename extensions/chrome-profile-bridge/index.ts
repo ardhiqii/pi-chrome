@@ -643,6 +643,8 @@ const CHROME_TOOL_NAMES = [
 	"chrome_launch",
 	"chrome_tab",
 	"chrome_snapshot",
+	"chrome_find",
+	"chrome_inspect",
 	"chrome_navigate",
 	"chrome_evaluate",
 	"chrome_click",
@@ -659,6 +661,8 @@ const CHROME_TOOL_NAMES = [
 	"chrome_tap",
 	"chrome_scroll",
 	"chrome_upload_file",
+	"chrome_cdp",
+	"chrome_cdp_targets",
 ] as const;
 const CHROME_TOOL_NAME_SET = new Set<string>(CHROME_TOOL_NAMES);
 
@@ -819,9 +823,7 @@ export default function (pi: ExtensionAPI): void {
 	// Tab-group title for this Pi session: prefer the user-set display name, else the session id.
 	const sessionGroupTitle = (ctx: ExtensionContext): string => {
 		const sm = ctx.sessionManager;
-		const name = sm.getSessionName?.();
-		const id = sm.getSessionId?.();
-		return `Pi Session: ${name || id || "unknown"}`;
+		return "Pi Agent";
 	};
 
 	const authCountdownLabel = (): string => {
@@ -1346,7 +1348,7 @@ Usage rules:
 			urlIncludes: Type.Optional(Type.String({ description: "Match the target tab by URL substring for activate/close/group/ungroup." })),
 			titleIncludes: Type.Optional(Type.String({ description: "Match the target tab by title substring for activate/close/group/ungroup." })),
 			group: Type.Optional(Type.Boolean({ description: "Deprecated; ignored. Pi-created tabs always join this session's own tab group." })),
-			groupTitle: Type.Optional(Type.String({ description: "Deprecated for action=new/group; ignored so one Pi session uses one tab group ('Pi Session: <name-or-id>')." })),
+			groupTitle: Type.Optional(Type.String({ description: "Deprecated for action=new/group; ignored so Pi-created tabs use the 'Pi Agent' tab group." })), 
 			groupColor: Type.Optional(Type.String({ description: "Tab group color for action=group/new: grey, blue, red, yellow, green, pink, purple, cyan, or orange. Defaults to blue." })),
 			host: Type.Optional(Type.String()),
 			port: Type.Optional(Type.Number()),
@@ -1908,6 +1910,101 @@ Usage rules:
 			const paths = params.paths.map((p) => resolve(cwd, p));
 			const result = await authorizedBridgeSend("page.upload", { ...params, paths }, DEFAULT_TIMEOUT_MS, signal);
 			return { content: [{ type: "text", text: `Uploaded ${paths.length} file(s) to ${params.uid ?? params.selector}` }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_cdp",
+		label: "Chrome CDP Call",
+		description:
+			"Execute an arbitrary Chrome DevTools Protocol (CDP) method against a Chrome tab. This is a powerful low-level escape hatch: it can read or change DOM, network, emulation and browser state far beyond what the chrome_* helpers expose, and nothing is filtered or validated against a safe list — destructive methods run as given. Pass method (e.g. Runtime.evaluate, Page.captureScreenshot, DOM.getDocument) and an optional params object. CDP fields must go inside params; unknown top-level keys are rejected. Screenshot/binary payloads, and any result whose JSON exceeds 256 KiB, are summarised instead of stored in full. Prefer the dedicated chrome_* tools when they cover the task. Unlike the chrome_* helpers, raw CDP is NOT covered by background mode (the default): methods such as Page.bringToFront, Target.activateTarget or Browser.setWindowBounds run as given and can steal focus even while background mode is on.",
+		promptSnippet: "Run a raw Chrome DevTools Protocol method against a Chrome tab (low-level escape hatch).",
+		parameters: Type.Object({
+			method: Type.String({ description: "CDP method name, for example \"Runtime.evaluate\" or \"Page.captureScreenshot\"." }),
+			params: Type.Optional(Type.Object({}, { additionalProperties: true, description: "Optional CDP parameter object for the method." })),
+			timeoutMs: Type.Optional(Type.Number({ description: "Deadline for the CDP command in milliseconds. Default 5000, capped at 120000. On timeout the debugger session is detached and the next call re-attaches cleanly." })),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean({ description: "Accepted for consistency with the chrome_* tools; raw CDP is not covered by background mode, so this flag does not block focus/tab-activation methods." })),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			// TypeBox validates the declared parameters, but if a permissive layer forwards raw CDP fields
+			// at the top level (for example expression), Chrome would see params:{} and fail with its
+			// opaque "Invalid parameters". Reject unknown top-level keys with a pointer to params instead.
+			const knownKeys = new Set(["method", "params", "timeoutMs", "targetId", "urlIncludes", "titleIncludes", "background", "host", "port"]);
+			const unknownKeys = Object.keys(params).filter((key) => !knownKeys.has(key));
+			if (unknownKeys.length > 0) {
+				throw new Error(`chrome_cdp received unknown top-level parameter(s): ${unknownKeys.join(", ")}. Put CDP fields inside "params", e.g. { method: "Runtime.evaluate", params: { expression: "1+1" } }.`);
+			}
+			// Keep the bridge deadline above the extension-side deadline so the extension's more precise
+			// "CDP <method> timed out after Nms" error wins the race.
+			const requested = Number(params.timeoutMs);
+			const bridgeTimeoutMs = Number.isFinite(requested) && requested > 0
+				? Math.min(Math.floor(requested), 120_000) + 8_000
+				: DEFAULT_TIMEOUT_MS;
+			const value = await authorizedBridgeSend("cdp.call", params, bridgeTimeoutMs, signal);
+			// 256 KiB of JSON text: above this, details are summarised instead of persisted verbatim.
+			const OVERSIZE_JSON_CHARS = 262_144;
+			// Never let a screenshot or other binary payload (base64 can be megabytes) reach the model
+			// context: summarise it and drop the data field from both text and details.
+			const data = value && typeof value === "object" ? (value as { data?: unknown }).data : undefined;
+			if (typeof data === "string" && (/captureScreenshot/i.test(params.method) || data.length >= OVERSIZE_JSON_CHARS)) {
+				const padding = data.endsWith("==") ? 2 : data.endsWith("=") ? 1 : 0;
+				const bytes = Math.floor((data.length / 4) * 3) - padding;
+				const fields = Object.keys(value as object).filter((key) => key !== "data");
+				const text = `CDP ${params.method} returned ~${bytes} bytes in its "data" field; the payload was omitted from this result to protect the context window.${fields.length ? ` Other fields: ${fields.join(", ")}.` : ""}`;
+				return { content: [{ type: "text", text }], details: { value: { omitted: "data-field", bytes, fields } as Json } };
+			}
+			const text = value === undefined
+				? "undefined"
+				: typeof value === "string"
+					? value
+					: safeJson(value) ?? "undefined";
+			// `content` is capped by truncateText, but `details` is stored on the persisted tool-result
+			// message and rendered per session. Summarise oversized non-data results (Runtime.evaluate
+			// strings, DOM.getOuterHTML, Debugger.getScriptSource) so multi-megabyte payloads cannot
+			// bloat the transcript; the model still sees the bounded, truncated content text.
+			let serialized: unknown;
+			try { serialized = safeJson(value); } catch { serialized = undefined; }
+			if (typeof serialized === "string" && serialized.length > OVERSIZE_JSON_CHARS) {
+				const fields = value && typeof value === "object" ? Object.keys(value as object) : [];
+				return {
+					content: [{ type: "text", text: `${truncateText(text)}\n\n[details omitted: ${serialized.length} chars of JSON]` }],
+					details: { value: { omitted: "oversized-result", chars: serialized.length, fields } as Json },
+				};
+			}
+			return { content: [{ type: "text", text: truncateText(text) }], details: { value: value as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_cdp_targets",
+		label: "Chrome CDP Targets",
+		description:
+			"List the Chrome DevTools Protocol targets anchored to the resolved tab (id, tabId, type, url, title, attached, extensionId) plus the tab itself. Use it to diagnose CDP problems: foreign extension overlays, autofill/password-manager targets and devtools front-ends anchored to one tab are why attach, input and screenshots can fail with \"Detached while handling command\". Targets that belong to other tabs are excluded (their count is reported instead); when no tab can be resolved, every target is reported. Attaches nothing and does not create an automation window; with no explicit target it reports the session's existing automation tab if one exists.",
+		promptSnippet: "List CDP targets (including foreign/overlay targets) anchored to a Chrome tab.",
+		parameters: Type.Object({
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean({ description: BACKGROUND_PARAM_DESCRIPTION })),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const value = await authorizedBridgeSend("cdp.targets", params, DEFAULT_TIMEOUT_MS, signal);
+			const result = value as { tab?: { id?: number; title?: string; url?: string } | null; targets?: Array<{ type?: string; tabId?: number; attached?: boolean; url?: string }>; otherTabTargetCount?: number } | undefined;
+			const targets = result?.targets ?? [];
+			const otherTabs = result?.otherTabTargetCount ? ` (${result.otherTabTargetCount} more on other tabs, hidden)` : "";
+			const text = [
+				result?.tab ? `Tab ${result.tab.id}: ${result.tab.title ?? ""} — ${result.tab.url ?? ""}` : "No resolved tab (pass targetId/urlIncludes/titleIncludes, or run chrome_navigate first).",
+				`${targets.length} CDP target(s) on this tab${otherTabs}:`,
+				...targets.map((t) => `- ${t.type ?? "?"}\ttab=${t.tabId ?? "-"}\t${t.attached ? "attached" : "detached"}\t${t.url ?? ""}`),
+			].join("\n");
+			return { content: [{ type: "text", text: truncateText(text) }], details: { value: (value ?? null) as Json } };
 		},
 	});
 	}

@@ -6,6 +6,19 @@ Debug your app, inspect signed-in dashboards, and capture screenshots using your
 
 Built for the [Pi coding agent](https://pi.dev).
 
+> ## ⚠️ This is a personal fork
+>
+> This repository is a fork of [`tianrendong/pi-chrome`](https://github.com/tianrendong/pi-chrome)
+> carrying a small set of additions: raw CDP passthrough (`chrome_cdp`), CDP target diagnostics
+> (`chrome_cdp_targets`), stalled long-poll recovery, and a unified `Pi Agent` tab group. It is
+> **not an official release**, and is not affiliated with or endorsed by upstream. Its version
+> (`0.15.51.1`) sorts above upstream's `0.15.51` and below a future `0.15.52`.
+>
+> `CHANGELOG.md` lists exactly what this fork changes; `DEPLOY.md` explains how the fork is put
+> onto a local `pi-chrome` install.
+>
+> Everything below is upstream's own README, unmodified.
+
 ## What you can do
 
 Try prompts like these after setup:
