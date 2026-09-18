@@ -3,6 +3,7 @@ import { Type } from "typebox";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { mkdir, readdir, stat, unlink, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
 /**
@@ -1795,9 +1796,9 @@ Usage rules:
 		label: "Chrome Screenshot",
 		description:
 			"Capture a screenshot of a Chrome tab via CDP and save it to disk without activating background tabs. Requires debugger access; failures never fall back to activating a tab. Background mode (default) ignores background=false; /chrome background off allows foreground/watch mode.",
-		promptSnippet: "Capture Chrome screenshots and save them under .pi/chrome-screenshots by default.",
+		promptSnippet: "Capture Chrome screenshots; by default they land in the OS temp for your own inspection.",
 		parameters: Type.Object({
-			path: Type.Optional(Type.String({ description: "Output path. Defaults to .pi/chrome-screenshots/<timestamp>.<format>." })),
+			path: Type.Optional(Type.String({ description: "Output path, resolved against the session cwd. Pass an explicit path when the user asked for a screenshot they will look at; the default is the OS temp, which exists for your own inspection and may be reclaimed by the OS." })),
 			retentionDays: Type.Optional(Type.Number({ minimum: 0, description: "Prune older captures in the default screenshot folder after this many days; 0 disables pruning. Defaults to 7. The newest 20 captures are always kept, and hand-named files are never touched." })),
 			format: Type.Optional(StringEnum(imageFormatValues)),
 			quality: Type.Optional(Type.Number({ minimum: 0, maximum: 100, description: "JPEG quality 0-100." })),
@@ -1812,7 +1813,11 @@ Usage rules:
 		async execute(_id, params, signal, _onUpdate, ctx: ExtensionContext): Promise<ToolTextResult> {
 			const format = params.format ?? "png";
 			const cwd = workspaceCwd(ctx);
-			const screenshotDir = join(cwd, ".pi", "chrome-screenshots");
+			// Agent-facing captures default to the OS temp. They exist so the agent can look at
+			// something mid-task, and the OS is entitled to reclaim them — so they are deliberately not
+			// dropped into the user's project. When a capture is meant for the *user* to keep, pass an
+			// explicit `path` (resolved against the session cwd) and it is written there instead.
+			const screenshotDir = join(tmpdir(), "pi-chrome-screenshots");
 			const defaultPath = join(screenshotDir, `${new Date().toISOString().replace(/[:.]/g, "-")}.${format}`);
 			const outputPath = params.path ? resolve(cwd, params.path) : defaultPath;
 			const result = (await authorizedBridgeSend("page.screenshot", params, params.fullPage ? 120_000 : DEFAULT_TIMEOUT_MS, signal)) as {

@@ -79,16 +79,19 @@ All notable user-facing changes to `pi-chrome`.
   This fork instead uses one stable name for every Pi-created group, so all of Pi's tabs live
   together in a single group per window and are instantly recognisable as Pi's rather than the
   user's.
-- **Screenshot retention.** `chrome_screenshot` wrote a new timestamped file on every capture and
-  nothing ever removed them, so `<cwd>/.pi/chrome-screenshots/` grew without bound — and a
-  `fullPage` capture adds one file per tile plus a `.json` manifest on top of that. Captures now
-  prune that folder at capture time: files older than 7 days are deleted once more than 20 of this
-  tool's own captures are present. Only files this tool generated are eligible — an ISO timestamp
-  (colons and dots replaced with dashes), the optional `-tileN` suffix, and the matching `.json`
-  manifest — so a hand-named file sitting in the same folder is never touched, and an explicit
+- **Screenshots default to the OS temp, and the folder prunes itself.** `chrome_screenshot` used to
+  write every capture into `<cwd>/.pi/chrome-screenshots/` and never remove any, so the user's own
+  project accumulated files that existed only for the agent's benefit. Captures now default to
+  `<os temp>/pi-chrome-screenshots/`, which the OS is entitled to reclaim and which is never the
+  user's project; pass an explicit `path:` when a capture is meant for the *user* to keep (resolved
+  against the session cwd). A `fullPage` capture adds one file per tile plus a `.json` manifest.
+  The folder also prunes itself at capture time: files older than 7 days are deleted once more than
+  20 of this tool's own captures are present. Only files this tool generated are eligible — an ISO
+  timestamp (colons and dots replaced with dashes), the optional `-tileN` suffix, and the matching
+  `.json` manifest — so a hand-named file in the same folder is never touched, and an explicit
   `path:` is never pruned. The newest 20 are always kept, so a burst of captures cannot empty the
-  folder. The whole prune is best-effort: a locked or unreadable file is kept, and a prune failure
-  can never fail or delay the capture into an error. `retentionDays` overrides the window per call;
+  folder. The prune is best-effort: a locked or unreadable file is kept, and a prune failure can
+  never fail or delay the capture. `retentionDays` overrides the window per call;
   `retentionDays: 0` disables pruning entirely.
 
 ### Fork tooling
@@ -140,12 +143,14 @@ All notable user-facing changes to `pi-chrome`.
   the bridge's real `waitForCommand(25_000, ...)` hold out of `index.ts` rather than comparing
   against the worker's unrelated (and coincidentally equal) `COMMAND_TIMEOUT_MS`, and they **fail
   against the pre-fix worker** — so they are genuinely load-bearing rather than vacuous.
-- `background-policy.test.mjs` also gained five `chrome_screenshot` retention tests (keeps the
-  newest 20 while pruning older captures; spares hand-named files; treats full-page tiles and their
-  manifest as eligible; never prunes inside the retention window; `retentionDays: 0` opts out; a
-  failing `unlink` never fails the capture). All five fail against the pre-retention `index.ts`, so
-  none of them is vacuous — including the two that assert *absence* of deletion, which now also
-  assert that pruning was attempted at all.
+- `background-policy.test.mjs` also gained seven `chrome_screenshot` tests: five for retention
+  (keeps the newest 20 while pruning older captures; spares hand-named files; treats full-page tiles
+  and their manifest as eligible; never prunes inside the retention window; `retentionDays: 0` opts
+  out; a failing `unlink` never fails the capture) and two for the output location (captures default
+  under the OS temp and never into the session cwd's `.pi` folder; an explicit `path:` is still
+  honoured). Six of the seven fail against the pre-retention `index.ts`. The seventh — explicit
+  `path:` — passes against it too, because the old code already honoured explicit paths: it is a
+  guard on that contract, not new behaviour, and is labelled as such rather than counted as proof.
 
 ## 0.15.51 — 2026-09-10
 

@@ -53,7 +53,7 @@ function piHarness({ session = "alpha", send, files, unlinkFails = false } = {})
     tabActionValues: [], snapshotModeValues: [], waitForValues: [], imageFormatValues: [],
     safeJson: JSON.stringify, truncateText: (s) => s, formatChromeSnapshot: JSON.stringify,
     formatChromeInspect: JSON.stringify, summarizeActionResult: () => "", formatIncludedSnapshotText: (_r, text) => text,
-    workspaceCwd: () => ctx.cwd, ...path,
+    workspaceCwd: () => ctx.cwd, tmpdir: () => "/fixture-tmp", ...path,
     mkdir: async () => {}, writeFile: async (...args) => writes.push(args),
     readdir: async () => [...folder.keys()],
     stat: async (p) => {
@@ -702,4 +702,30 @@ test("a failing prune never fails the capture", async () => {
   assert.equal(h.removed.length, 0, "nothing was deleted");
   assert.match(result.content[0].text, /Saved Chrome screenshot to/);
   assert.equal(h.writes.length, 1, "the capture still wrote its file");
+});
+
+// Agent-facing captures must not litter the user's project. They default to the OS temp, which the
+// OS is entitled to reclaim; a capture meant for the *user* to keep must be written where they asked.
+// Normalise Windows separators without writing a backslash literal (char code 92 = "\\").
+const norm = (p) => String(p).split(String.fromCharCode(92)).join("/");
+
+test("screenshots default to the OS temp, not the user's project", async () => {
+  const h = piHarness();
+  const result = await h.tool("chrome_screenshot", {});
+  const written = norm(h.writes[0][0]);
+  assert.ok(
+    written.startsWith("/fixture-tmp/pi-chrome-screenshots/"),
+    `default capture should land under the OS temp, got ${written}`,
+  );
+  assert.ok(!written.includes("/fixture/.pi/"), "must not write into the session cwd's .pi folder");
+  assert.equal(norm(result.details.path), written);
+});
+
+test("an explicit path is honoured instead, resolved against the session cwd", async () => {
+  const h = piHarness();
+  await h.tool("chrome_screenshot", { path: "shots/keep-me.png" });
+  assert.ok(
+    norm(h.writes[0][0]).endsWith("shots/keep-me.png"),
+    `explicit path should be used, got ${norm(h.writes[0][0])}`,
+  );
 });
