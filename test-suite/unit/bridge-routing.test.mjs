@@ -485,3 +485,38 @@ test("pruning a connector that stopped polling must not discard the saved prefer
   });
   assert.throws(() => bridge.resolveTargetClient(), /preferred connector \(edge\) is not connected/);
 });
+
+// The duplicate-load guard, loaded on its own (it is a pure function).
+function loadIsDuplicateExtensionRoot() {
+  const start = indexSource.indexOf("function isDuplicateExtensionRoot(");
+  assert.ok(start >= 0, "could not locate isDuplicateExtensionRoot");
+  const end = indexSource.indexOf("\n}\n", start);
+  assert.ok(end > start, "could not locate the end of isDuplicateExtensionRoot");
+  const sandbox = { console };
+  vm.runInNewContext(
+    stripTypeScriptTypes(indexSource.slice(start, end + 3)) + "\n;globalThis.__f = isDuplicateExtensionRoot;",
+    sandbox,
+  );
+  return sandbox.__f;
+}
+
+test("a reload from the SAME root must replace, never skip — skipping breaks /chrome silently", () => {
+  const isDuplicate = loadIsDuplicateExtensionRoot();
+  const ROOT = "C:/x/pi-chrome";
+
+  // First load: nothing recorded yet.
+  assert.equal(isDuplicate(undefined, ROOT), false, "first load proceeds");
+
+  // A reload: the flag is from this same root. It must proceed. Skipping here is the bug that made
+  // /chrome and every chrome_* tool vanish, with no error, until Pi was fully restarted.
+  assert.equal(isDuplicate({ version: "0.15.51.2", root: ROOT, token: Symbol("old") }, ROOT), false,
+    "a reload replaces the previous instance");
+
+  // No token either (written by an older build that never cleared it on reload): still same root.
+  assert.equal(isDuplicate({ version: "0.15.19", root: ROOT }, ROOT), false, "stale old-build flag is replaced");
+
+  // A genuinely different root IS a duplicate install and must be skipped.
+  assert.equal(isDuplicate({ version: "0.15.51.2", root: "C:/other/pi-chrome", token: Symbol("x") }, ROOT), true,
+    "a second copy from another root is refused");
+  assert.equal(isDuplicate({ version: "0.1.0", root: "C:/other/pi-chrome" }, ROOT), true, "and so is an old one");
+});

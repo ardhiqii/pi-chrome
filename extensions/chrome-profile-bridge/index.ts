@@ -1029,6 +1029,24 @@ function StringEnum<T extends readonly [string, ...string[]]>(values: T) {
 	return Type.Union(values.map((value) => Type.Literal(value)) as [ReturnType<typeof Type.Literal>, ...ReturnType<typeof Type.Literal>[]]);
 }
 
+// A second copy of the extension from a DIFFERENT root is a genuine duplicate install and must be
+// skipped. A flag from this SAME root is just the previous instance of it, i.e. a reload, and must be
+// replaced.
+//
+// This deliberately does not skip merely because the flag carries a token. That was the old rule, on
+// the reasoning that a token means a modern instance which clears the flag on session_shutdown — true
+// only if that shutdown runs before the replacement is evaluated. When it runs after, the replacement
+// skips, the dying instance then clears the flag (its token no longer matches, so it does not), and the
+// next reload skips again: the extension ends up loaded by nobody. It then registers no /chrome command
+// and no chrome_* tools, and says so nowhere except a console.warn, so /chrome simply disappears and
+// reloading appears to do nothing. Recovering needed a full Pi restart.
+function isDuplicateExtensionRoot(
+	alreadyLoaded: { version: string; root: string; token?: symbol } | undefined,
+	currentRoot: string,
+): boolean {
+	return alreadyLoaded !== undefined && alreadyLoaded.root !== currentRoot;
+}
+
 export default function (pi: ExtensionAPI): void {
 	const instanceToken = Symbol("pi-chrome-instance");
 	const currentRoot = extensionRoot();
@@ -1037,15 +1055,14 @@ export default function (pi: ExtensionAPI): void {
 		[PI_CHROME_AUTH_KEY]?: { until: number | "indefinite" };
 	};
 	const alreadyLoaded = globalState[PI_CHROME_GLOBAL_KEY];
-	if (alreadyLoaded?.token || (alreadyLoaded && alreadyLoaded.root !== currentRoot)) {
+	if (isDuplicateExtensionRoot(alreadyLoaded, currentRoot)) {
 		console.warn(
-			`pi-chrome already loaded from ${alreadyLoaded.root} (v${alreadyLoaded.version}); skipping duplicate from ${currentRoot}.`,
+			`pi-chrome already loaded from ${alreadyLoaded?.root} (v${alreadyLoaded?.version}); skipping duplicate from ${currentRoot}.`,
 		);
 		return;
 	}
-	// pi-chrome <=0.15.19 set the singleton flag but did not clear it on reload.
-	// If the stale flag points at this same extension root, replace it instead of
-	// skipping the freshly reloaded extension.
+	// Replace anything left behind by a previous instance of this same root so a reload always takes
+	// effect, rather than being silently skipped.
 	globalState[PI_CHROME_GLOBAL_KEY] = { version: PI_CHROME_VERSION, root: currentRoot, token: instanceToken };
 
 	const bridge = new ChromeProfileBridge(DEFAULT_HOST, DEFAULT_PORT);
