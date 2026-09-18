@@ -260,7 +260,11 @@ async function run() {
       /group blew up/,
       "tab.new-group-fail: surfaces grouping error",
     );
-    ok(state.tabs.size === tabsBefore, "tab.new-group-fail: closes the created tab instead of leaving it ungrouped");
+    // Assert on the tab tab.new created, not on the total: tab.new now also ensures the session's
+    // automation window exists, and that deliberate extra tab is not the thing this test is about.
+    const leftBehind = [...state.tabs.values()].filter((t) => (t.url || "").includes("group-fail"));
+    ok(leftBehind.length === 0, "tab.new-group-fail: closes the created tab instead of leaving it ungrouped");
+    ok(state.tabs.size >= tabsBefore, "tab.new-group-fail: no tab was lost either");
   }
 
   // ===== Grouping is best-effort: a tabGroups failure must not break navigation. =====
@@ -493,6 +497,35 @@ async function run() {
     const opened = await w.dispatch("tab.new", { sessionKey: SK });
     await w.dispatch("automation.cleanup", { sessionKey: SK });
     ok(!state.tabs.has(opened.tab.id) && state.tabs.has(state.userGmail.id), "no storage: created tab cleaned up safely");
+  }
+
+  // ===== a leftover generic "Pi Agent" group in the USER's window must not capture a new target. =====
+  // The real failure: an earlier session left a grouped tab in the user's own window, then the extension
+  // reloaded. Automation targets live in chrome.storage.session, which an extension reload clears, so the
+  // next command recreated the target — and the old code chose the window by matching ANY group titled
+  // "Pi Agent", found that leftover in the user's window, and put Pi's tab there among theirs.
+  {
+    const state = makeChromeState();
+    const w = loadWorker(makeChrome(state, { withTabGroups: true }));
+    const gid = state.alloc.group();
+    const leftover = {
+      id: state.alloc.tab(), windowId: state.userWindowId,
+      url: "https://x.com/home", active: false, groupId: gid,
+    };
+    state.tabs.set(leftover.id, leftover);
+    state.groups.set(gid, { id: gid, title: "Pi Agent", color: "blue", collapsed: false, windowId: state.userWindowId });
+    const userTabsBefore = [...state.tabs.values()].filter((t) => t.windowId === state.userWindowId).length;
+
+    // tab.new was the path that actually did this: it chose the window by matching ANY group titled
+    // "Pi Agent" (params.groupTitle || PI_GROUP_NAME), so the leftover above captured it.
+    const opened = await w.dispatch("tab.new", { url: "https://pi.test/new-tab", sessionKey: "session:fresh" });
+    const userTabsAfter = [...state.tabs.values()].filter((t) => t.windowId === state.userWindowId).length;
+    ok(opened.tab.windowId !== state.userWindowId,
+      "generic-group: tab.new did NOT open in the user's window");
+    ok(userTabsAfter === userTabsBefore,
+      "generic-group: the user's window gained no tabs");
+    ok(state.tabs.has(leftover.id) && state.tabs.get(leftover.id).groupId === gid,
+      "generic-group: the leftover grouped tab was left exactly as it was");
   }
 
   console.log(`\n${passes} passed, ${failures} failed`);

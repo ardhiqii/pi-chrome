@@ -247,13 +247,21 @@ async function createIsolatedWindowTarget(sessionKey) {
   return tab;
 }
 
-// Create a fresh automation target for `sessionKey`. If this session already has a tab group,
-// create the tab inside that group's window so one Pi session keeps one Chrome tab group (Chrome
-// groups cannot span windows). If no group exists yet, prefer an isolated window; fall back to a
-// tab. When the tab is created in a pre-existing group window, leave windowId unset so cleanup only
-// closes our tab, never that whole window.
+// Create a fresh automation target for `sessionKey`.
+//
+// The window of an existing group is reused ONLY when the group title identifies THIS session
+// ("Pi Session: alpha"). That is the case the grouping contract is about: one session keeps one group,
+// and Chrome groups cannot span windows.
+//
+// The generic "Pi Agent" title is shared by every session, so a leftover group carrying it says nothing
+// about where this session works — and it may sit in a window the user owns. Matching it by title across
+// every window is how a target recreated after an extension reload (the target lives in
+// chrome.storage.session, which an extension reload clears) put Pi's tab among the user's tabs with
+// nobody having asked for it.
+//
 async function createAutomationTarget(sessionKey, groupTitle) {
-  const existingGroup = groupTitle ? await findGroupRecordByTitle(groupTitle) : null;
+  const sessionScoped = !!groupTitle && cleanGroupTitle(groupTitle) !== cleanGroupTitle(PI_GROUP_NAME);
+  const existingGroup = sessionScoped ? await findGroupRecordByTitle(groupTitle) : null;
   if (existingGroup && typeof existingGroup.windowId === "number") {
     const tab = await chrome.tabs.create({ url: "about:blank", active: false, windowId: existingGroup.windowId });
     automationTargets.set(sessionKey, { windowId: undefined, tabId: typeof tab.id === "number" ? tab.id : undefined });
@@ -1420,9 +1428,14 @@ async function dispatch(action, params) {
       // Pi-created tab is easy to lose among user tabs. If grouping fails after creation, close the
       // tab best-effort before surfacing the error so tab.new never leaves an ungrouped Pi tab.
       const groupTitle = params.groupTitle || PI_GROUP_NAME;
-      const existingGroup = await findGroupRecordByTitle(groupTitle);
       const createParams = { url: params.url || "about:blank", active: foregroundRequested(params) };
-      if (existingGroup && typeof existingGroup.windowId === "number") createParams.windowId = existingGroup.windowId;
+      // Put the tab in the window THIS session works in — the one the user chose, or Pi's own — rather
+      // than in whichever window happens to hold a "Pi Agent" group. That lookup matched by title across
+      // every window, so a leftover group sitting in the user's window sent Pi's tabs there uninvited.
+      // This CREATES the session's automation window if it does not exist yet, which is the point: the
+      // first tab Pi opens must not land among the user's.
+      const targetTab = await getOrCreateAutomationTarget(sessionKeyOf(params), params.groupTitle);
+      if (targetTab && typeof targetTab.windowId === "number") createParams.windowId = targetTab.windowId;
       const tab = await chrome.tabs.create(createParams);
       await trackSessionTab(sessionKeyOf(params), tab.id, true);
       try {
