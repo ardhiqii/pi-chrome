@@ -35,6 +35,7 @@ function loadBridgeClass() {
   assert.notEqual(source, before, "the constructor shim did not apply — update it if the class changed");
 
   const saved = { value: undefined, writes: [] };
+  const names = { value: {} };
   // Controllable stand-in for the owner's HTTP surface: nothing here opens a socket.
   const net = { status: undefined, calls: 0, fail: false };
   const sandbox = {
@@ -47,12 +48,14 @@ function loadBridgeClass() {
     },
     readPreferredConnector: () => saved.value,
     writePreferredConnector: (value) => { saved.writes.push(value); saved.value = value; },
+    // The real one reads ~/.pi/agent/pi-chrome.json; a test must not touch the user's state file.
+    readConnectorNames: () => names.value,
   };
   vm.runInNewContext(stripTypeScriptTypes(source) + "\n;globalThis.__Bridge = ChromeProfileBridge;", sandbox);
-  return { Bridge: sandbox.__Bridge, saved, net };
+  return { Bridge: sandbox.__Bridge, saved, net, names };
 }
 
-const { Bridge, saved, net } = loadBridgeClass();
+const { Bridge, saved, net, names } = loadBridgeClass();
 
 // describeConnectorStatus is pure, so it can be loaded and called on its own.
 function loadDescribeConnectorStatus() {
@@ -140,6 +143,7 @@ function newBridge(preference) {
   net.status = undefined;
   net.calls = 0;
   net.fail = false;
+  names.value = {};
   return new Bridge("127.0.0.1", 17318);
 }
 
@@ -569,4 +573,32 @@ test("the connector picker never collapses two entries onto one key", () => {
   assert.equal(new Set(built.options).size, 3, "every entry is selectable independently");
   const keys = [...built.keyByLabel.values()];
   assert.deepEqual([...keys].sort(), ["edge:aaaaaaaa", "edge:bbbbbbbb"], "both keys are reachable");
+});
+
+test("a connector given a name shows that name instead of its profile hash", () => {
+  // "edge:9d233ecf" tells the user nothing about which of their profiles it is — they see names like
+  // "Clover Agent" in the browser's own switcher. A name they gave beats the hash; without one the hash
+  // is still the only thing telling two connectors apart, so it stays.
+  const bridge = withClients([{ browser: "edge", profileId: "ab12cd34" }]);
+  assert.equal(bridge.status().clients[0].label, "Edge (profile ab12cd34)", "unnamed keeps the profile id");
+
+  names.value = { "edge:ab12cd34": "Clover Agent" };
+  assert.equal(bridge.status().clients[0].label, "Edge — Clover Agent");
+
+  // Only the connector that was named changes.
+  bridge.clients.set("chrome:11223344", {
+    key: "chrome:11223344", browser: "chrome", profileId: "11223344", lastSeenAt: Date.now(),
+  });
+  const labels = [...bridge.status().clients].map((client) => client.label);
+  assert.deepEqual(labels, ["Edge — Clover Agent", "Chrome (profile 11223344)"]);
+
+  // clientLabel() (what chrome_launch reports) uses the same name, so both paths agree. It reads the
+  // fields stamped by the most recent poll, which the harness has to set explicitly.
+  bridge.clientBrowser = "edge";
+  bridge.clientProfileId = "ab12cd34";
+  assert.equal(bridge.clientLabel(), "Edge — Clover Agent");
+
+  // And it falls back to the profile id when the connector has no name.
+  names.value = {};
+  assert.equal(bridge.clientLabel(), "Edge (profile ab12cd34)");
 });

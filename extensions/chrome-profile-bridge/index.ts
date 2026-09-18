@@ -1,6 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { mkdir, readdir, stat, unlink, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { homedir, tmpdir } from "node:os";
@@ -100,6 +100,82 @@ function writePreferredConnector(value: string | undefined): void {
 	}
 }
 
+// Connector keys are profile hashes ("edge:9d233ecf"), which tell the user nothing about WHICH of their
+// browser profiles this is — they see names like "Clover Agent" or "Work" in the browser's own profile
+// switcher. These are the names they have given each connector, so labels can use them instead.
+function readConnectorNames(): Record<string, string> {
+	try {
+		const raw = JSON.parse(readFileSync(PI_CHROME_STATE_PATH, "utf8")) as { connectorNames?: unknown };
+		const names = raw.connectorNames;
+		if (!names || typeof names !== "object") return {};
+		const out: Record<string, string> = {};
+		for (const [key, value] of Object.entries(names as Record<string, unknown>)) {
+			if (typeof value === "string" && value.trim()) out[key] = value.trim();
+		}
+		return out;
+	} catch {
+		return {};
+	}
+}
+
+function writeConnectorName(key: string, name: string | undefined): void {
+	try {
+		mkdirSync(dirname(PI_CHROME_STATE_PATH), { recursive: true });
+		let existing: Record<string, unknown> = {};
+		try {
+			const parsed = JSON.parse(readFileSync(PI_CHROME_STATE_PATH, "utf8")) as Record<string, unknown>;
+			if (parsed && typeof parsed === "object") existing = parsed;
+		} catch {
+			// No readable file yet; start a fresh one.
+		}
+		const names = { ...readConnectorNames() };
+		if (name === undefined) delete names[key];
+		else names[key] = name;
+		writeFileSync(PI_CHROME_STATE_PATH, `${JSON.stringify({ ...existing, connectorNames: names }, null, 2)}\n`);
+	} catch {
+		// Best effort, as above.
+	}
+}
+
+// Best-effort list of the browser profile names on this machine, so naming a connector can offer the
+// names the user already sees in the browser's profile switcher rather than asking them to invent one.
+// Read-only, and returns nothing at all if the layout is not what we expect — the caller falls back to
+// typing a name.
+function suggestBrowserProfileNames(): string[] {
+	const home = homedir();
+	const local = process.env.LOCALAPPDATA ?? join(home, "AppData", "Local");
+	const roots =
+		process.platform === "win32"
+			? [join(local, "Microsoft", "Edge", "User Data"), join(local, "Google", "Chrome", "User Data")]
+			: process.platform === "darwin"
+				? [join(home, "Library", "Application Support", "Microsoft Edge"), join(home, "Library", "Application Support", "Google", "Chrome")]
+				: [join(home, ".config", "microsoft-edge"), join(home, ".config", "google-chrome")];
+	const names: string[] = [];
+	for (const root of roots) {
+		let entries: string[];
+		try {
+			entries = readdirSync(root);
+		} catch {
+			continue;
+		}
+		for (const entry of entries) {
+			try {
+				const raw = JSON.parse(readFileSync(join(root, entry, "Preferences"), "utf8")) as {
+					profile?: { name?: unknown };
+				};
+				const name = raw.profile?.name;
+				if (typeof name === "string" && name.trim() && !names.includes(name.trim())) names.push(name.trim());
+			} catch {
+				// Not a profile folder, or not readable: skip it.
+			}
+		}
+	}
+	return names;
+}
+
+// The picker's last entry: name a connector after the profile the user actually sees in the browser.
+const RENAME_CONNECTOR_ENTRY = "Rename a browser…";
+
 // The entries offered by /chrome connector's picker, and the map from what the user clicks back to the
 // connector it means. Pure so that mapping can be tested directly: the keys are profile hashes
 // ("edge:9d233ecf") that nobody should have to read or type, so the menu shows the same human labels the
@@ -121,6 +197,8 @@ function connectorMenuOptions(
 	}
 	return { autoLabel, options, keyByLabel };
 }
+
+type ClientSummary = { key: string; label: string };
 
 type ConnectorStatus = {
 	connected?: boolean;
@@ -489,7 +567,11 @@ class ChromeProfileBridge {
 			return typeof label === "string" && label ? label : undefined;
 		}
 		if (!this.clientBrowser && !this.clientProfileId) return undefined;
-		return this.describeClient({ browser: this.clientBrowser, profileId: this.clientProfileId });
+		return this.describeClient({
+			browser: this.clientBrowser,
+			profileId: this.clientProfileId,
+			key: this.clientKeyOf(this.clientBrowser, this.clientProfileId, this.clientName),
+		});
 	}
 
 	private clientKeyOf(browser?: string, profileId?: string, name?: string): string {
@@ -499,10 +581,13 @@ class ChromeProfileBridge {
 		return name ?? "unknown";
 	}
 
-	private describeClient(client: { browser?: string; profileId?: string }): string {
+	private describeClient(client: { browser?: string; profileId?: string; key?: string }): string {
 		const browser = client.browser
 			? client.browser[0].toUpperCase() + client.browser.slice(1)
 			: "Unknown browser";
+		// A name the user gave this connector beats a profile hash, which means nothing to them.
+		const given = client.key ? readConnectorNames()[client.key] : undefined;
+		if (given) return `${browser} — ${given}`;
 		return client.profileId ? `${browser} (profile ${client.profileId})` : browser;
 	}
 
@@ -1600,6 +1685,31 @@ Usage rules:
 		}
 	};
 
+	// Give a connector the name the user sees in their browser's profile switcher, so "Edge (profile
+	// 9d233ecf)" becomes "Edge — Clover Agent". Offered as a list of the profile names found on this
+	// machine, with an escape hatch to type any name.
+	const renameConnector = async (ctx: ExtensionContext, clients: ClientSummary[]): Promise<void> => {
+		let target = clients[0];
+		if (clients.length > 1) {
+			const picked = await ctx.ui.select("Which browser do you want to name?", clients.map((c) => c.label));
+			if (!picked) return;
+			target = clients.find((client) => client.label === picked) ?? clients[0];
+		}
+		const suggestions = suggestBrowserProfileNames();
+		let name: string | undefined;
+		if (suggestions.length > 0) {
+			const typeOwn = "Type a name…";
+			const choice = await ctx.ui.select(`What should “${target.label}” be called?`, [...suggestions, typeOwn]);
+			if (!choice) return;
+			name = choice === typeOwn ? ((await ctx.ui.input("Name this browser", "")) ?? undefined) : choice;
+		} else {
+			name = (await ctx.ui.input("Name this browser", "")) ?? undefined;
+		}
+		if (!name?.trim()) return;
+		writeConnectorName(target.key, name.trim());
+		ctx.ui.notify(`This browser will be shown as “${name.trim()}”.`, "info");
+	};
+
 	const openConnectorMenu = async (ctx: ExtensionContext): Promise<void> => {
 		const status = (await bridge.refreshStatus()) as ConnectorStatus;
 		const clients = status.clients ?? [];
@@ -1609,8 +1719,13 @@ Usage rules:
 			return;
 		}
 		const { autoLabel, options, keyByLabel } = connectorMenuOptions(clients, status.selectedKey ?? status.selectedClient);
+		options.push(RENAME_CONNECTOR_ENTRY);
 		const choice = await ctx.ui.select("Which browser should Pi drive?", options);
 		if (!choice) return;
+		if (choice === RENAME_CONNECTOR_ENTRY) {
+			await renameConnector(ctx, clients);
+			return;
+		}
 		const key = choice === autoLabel ? "auto" : keyByLabel.get(choice);
 		if (!key) return;
 		ctx.ui.notify(
