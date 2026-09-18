@@ -127,6 +127,10 @@ function makeChrome(state, { withWindows = true, withStorage = true, withTabGrou
       get: async (id) => { const w = windows.get(id); if (!w) throw new Error(`No window with id ${id}`); return { ...w }; },
       remove: async (id) => { windows.delete(id); for (const [tid, t] of [...tabs]) if (t.windowId === id) tabs.delete(tid); },
       update: async () => {},
+      getAll: async () => [...windows.values()].map((w) => ({
+        ...w,
+        tabs: [...tabs.values()].filter((t) => t.windowId === w.id).map((t) => ({ ...t })),
+      })),
     };
   } else {
     chrome.windows = { update: async () => {} }; // no create/get/remove -> tab fallback path
@@ -369,17 +373,122 @@ async function run() {
     ok(status.tabId === null, "explicit: explicit targeting does not create/claim an automation target");
   }
 
-  // ===== Window-unavailable fallback: a dedicated TAB is used, and the user's window is safe. =====
+  // ===== No window can be created: the implicit paths must FAIL, never fall back into whichever
+  // window Chrome picks. That fallback creates a tab with NO windowId, and Chrome puts it in the FOCUSED
+  // window — the user's. The user asked Pi to stay out of their browser, so an actionable error naming
+  // /chrome window is the only acceptable outcome. Covered via the three implicit paths: the first
+  // page.* action, tab.new, and the target creation helpers they both go through — once when the API is
+  // missing entirely, once when Chrome refuses the create call. =====
+  for (const mode of ["api-absent", "create-refused"]) {
+    const state = makeChromeState();
+    const chrome = makeChrome(state, { withWindows: mode === "create-refused", withTabGroups: true });
+    let createAttempts = 0;
+    if (mode === "create-refused") {
+      chrome.windows.create = async () => { createAttempts += 1; throw new Error("window creation refused by policy"); };
+    }
+    const w = loadWorker(chrome);
+    const tabsBefore = state.tabs.size;
+    const windowsBefore = state.windows.size;
+
+    await throwsWith(
+      () => w.createAutomationTarget(SK),
+      /\/chrome window/,
+      `no-window-strict (${mode}): createAutomationTarget refuses instead of creating a tab in a window Chrome picks`,
+    );
+    await throwsWith(
+      () => w.getOrCreateAutomationTarget(SK),
+      /\/chrome window/,
+      `no-window-strict (${mode}): getOrCreateAutomationTarget refuses instead of creating a tab in a window Chrome picks`,
+    );
+    await throwsWith(
+      () => w.dispatch("page.navigate", { url: "https://pi.test/no-window", waitUntilLoad: false, sessionKey: SK }),
+      /\/chrome window/,
+      `no-window-strict (${mode}): the first page.* action refuses instead of touching the user's window`,
+    );
+    await throwsWith(
+      () => w.dispatch("tab.new", { url: "https://pi.test/no-window", sessionKey: SK }),
+      /\/chrome window/,
+      `no-window-strict (${mode}): tab.new refuses instead of touching the user's window`,
+    );
+
+    ok(state.tabs.size === tabsBefore, `no-window-strict (${mode}): no tab was created anywhere`);
+    ok(state.tabs.has(state.userArticle.id) && state.tabs.has(state.userGmail.id), `no-window-strict (${mode}): user tabs untouched`);
+    ok(state.tabs.get(state.userArticle.id).windowId === state.userWindowId, `no-window-strict (${mode}): the user's active tab never moved`);
+    if (mode === "create-refused") {
+      // Meaningful here: windows.create exists and WAS attempted, so an unchanged window count proves
+      // the four strict paths refused rather than leaving a window behind (with the API absent the
+      // count could never change and the assertion would carry no signal).
+      ok(createAttempts === 4, "no-window-strict (create-refused): every implicit path attempted the create and was refused");
+      ok(state.windows.size === windowsBefore, "no-window-strict (create-refused): the refused attempts left no window behind");
+    }
+  }
+
+  // ===== windows.create answering with a window but no usable first tab must not strand an untracked,
+  // unowned window. It is closed before the strict error is raised, so the failure leaves no partial
+  // target behind. =====
+  {
+    const state = makeChromeState();
+    const chrome = makeChrome(state, { withTabGroups: true });
+    let orphanId = null;
+    chrome.windows.create = async () => {
+      orphanId = state.alloc.window();
+      state.windows.set(orphanId, { id: orphanId });
+      return { id: orphanId, focused: false, tabs: [] };
+    };
+    const w = loadWorker(chrome);
+    const tabsBefore = state.tabs.size;
+    await throwsWith(() => w.createAutomationTarget(SK), /\/chrome window/, "orphan-window: the strict path still errors");
+    ok(orphanId !== null, "orphan-window: windows.create was attempted");
+    ok(!state.windows.has(orphanId), "orphan-window: the window with no usable tab was closed, not left untracked");
+    ok(state.tabs.size === tabsBefore, "orphan-window: no tab was created");
+  }
+
+  // ===== The shared-tab fallback remains available, but ONLY under an explicit opt-in. The
+  // window-select path opts into one of the user's windows by naming it; nothing implicit may.
   {
     const state = makeChromeState();
     const w = loadWorker(makeChrome(state, { withWindows: false }));
-    const target = await w.getOrCreateAutomationTarget(SK);
-    ok(target.id !== state.userArticle.id && target.id !== state.userGmail.id, "fallback: created a dedicated tab, not a user tab");
-    ok(w.isPiChromeOwnedTarget(target.id, SK) === true, "fallback: dedicated tab is owned");
+    const target = await w.createIsolatedWindowTarget(SK, { allowSharedTabFallback: true });
+    ok(target.id !== state.userArticle.id && target.id !== state.userGmail.id, "opt-in fallback: created a dedicated tab, not a user tab");
+    ok(w.isPiChromeOwnedTarget(target.id, SK) === true, "opt-in fallback: dedicated tab is owned");
     const cleanup = await w.cleanupAutomationTarget(SK);
-    ok(cleanup.closedTabId === target.id && cleanup.closedWindowId === null, "fallback: cleanup closes only the owned tab (never the shared window)");
-    ok(state.windows.has(state.userWindowId), "fallback: cleanup never closes the user/shared window");
-    ok(state.tabs.has(state.userArticle.id) && state.tabs.has(state.userGmail.id), "fallback: cleanup leaves user tabs intact");
+    ok(cleanup.closedTabId === target.id && cleanup.closedWindowId === null, "opt-in fallback: cleanup closes only the owned tab (never the shared window)");
+    ok(state.windows.has(state.userWindowId), "opt-in fallback: cleanup never closes the user/shared window");
+    ok(state.tabs.has(state.userArticle.id) && state.tabs.has(state.userGmail.id), "opt-in fallback: cleanup leaves user tabs intact");
+  }
+
+  // ===== A tab dragged out of Pi's window must not be driven there. The ownership record is checked
+  // against the tab's real window on every resolve; the stale target is retired and a fresh Pi window
+  // is created instead of Pi following the user's tab into their browser. =====
+  {
+    const state = makeChromeState();
+    const w = loadWorker(makeChrome(state));
+    const first = await w.dispatch("page.navigate", { url: "https://pi.test/in-place", waitUntilLoad: false, sessionKey: SK });
+    // The user drags Pi's automation tab into their own window.
+    state.tabs.get(first.id).windowId = state.userWindowId;
+
+    const moved = await w.dispatch("page.navigate", { url: "https://pi.test/moved-away", waitUntilLoad: false, sessionKey: SK });
+    ok(moved.windowId !== state.userWindowId, "moved-target: the next action does not work in the user's window");
+    ok(moved.id !== first.id, "moved-target: the moved tab was retired, not reused");
+    ok(!state.tabs.has(first.id), "moved-target: the stale automation tab is closed");
+    ok(state.tabs.get(moved.id).windowId === moved.windowId, "moved-target: the new target is where it claims to be");
+  }
+
+  // ===== window.select's "Pi's own window" reuse must check the tab is actually still in that window.
+  // A tab dragged into the user's window must not be reported as Pi's own window on the promise that a
+  // later resolve will notice. =====
+  {
+    const state = makeChromeState();
+    const w = loadWorker(makeChrome(state));
+    const first = await w.dispatch("page.navigate", { url: "https://pi.test/in-place", waitUntilLoad: false, sessionKey: SK });
+    state.tabs.get(first.id).windowId = state.userWindowId;
+
+    const selected = await w.dispatch("window.select", { windowId: null, sessionKey: SK });
+    ok(selected.reused !== true, "select-own-moved: the moved tab is not reported as Pi's own window");
+    ok(selected.tabId !== first.id, "select-own-moved: a fresh target was created");
+    ok(state.tabs.get(selected.tabId).windowId === selected.windowId, "select-own-moved: the reported window actually holds the target");
+    ok(selected.windowId !== state.userWindowId, "select-own-moved: the fresh target is not in the user's window");
+    ok(!state.tabs.has(first.id), "select-own-moved: the moved tab was retired");
   }
 
   // ===== Robust cleanup: no-op when nothing created, and when target already closed manually. =====
@@ -573,6 +682,172 @@ async function run() {
     ok(nav.windowId !== state.userWindowId, "stale-group: the target was NOT created in the user's window");
     ok(userTabsAfter === userTabsBefore, "stale-group: the user's window gained no tabs");
     ok(state.tabs.get(nav.id).windowId === nav.windowId, "stale-group: the automation tab is what moved");
+  }
+
+  // ===== A group in a window PI created is inherited even when its title is the generic one. =====
+  // The old discriminator compared the group title against PI_GROUP_NAME, and in this fork
+  // sessionGroupTitle always returns exactly PI_GROUP_NAME, so that comparison was always false: the
+  // ownership check behind it never ran and a session with an existing Pi-created window churned a new
+  // one. The title says nothing about who owns the window; the recorded window id does.
+  {
+    const state = makeChromeState();
+    const w = loadWorker(makeChrome(state, { withTabGroups: true }));
+    const seed = await w.dispatch("page.navigate", {
+      url: "https://pi.test/seed", waitUntilLoad: false, sessionKey: "session:alpha",
+      joinSessionGroup: true, sessionGroupTitle: "Pi Agent",
+    });
+    ok(seed.windowId !== state.userWindowId, "owned-group: seed target is a window Pi created");
+    const seedGroupId = state.tabs.get(seed.id).groupId;
+    ok(typeof seedGroupId === "number" && seedGroupId >= 0, "owned-group: seed tab joined a 'Pi Agent' group");
+    const windowsBefore = state.windows.size;
+
+    const nav = await w.dispatch("page.navigate", {
+      url: "https://pi.test/reuse", waitUntilLoad: false, sessionKey: "session:beta",
+      joinSessionGroup: true, sessionGroupTitle: "Pi Agent",
+    });
+    ok(nav.windowId === seed.windowId, "owned-group: a 'Pi Agent' group in Pi's own window was inherited instead of churning a new window");
+    ok(state.windows.size === windowsBefore, "owned-group: no new window was created");
+    ok(nav.groupId === seedGroupId, "owned-group: the new target joined the existing group in that window");
+    ok(nav.windowId !== state.userWindowId, "owned-group: still not the user's window");
+  }
+
+  // ===== Ownership evidence must outlive the session that created the Pi window. The creating session
+  // is cleaned up while another session's tab keeps the window open; a third session must still reuse
+  // it. Keying ownership off per-session records made that check refuse the live window and churn a
+  // replacement. =====
+  {
+    const state = makeChromeState();
+    const w = loadWorker(makeChrome(state, { withTabGroups: true }));
+    const alpha = await w.dispatch("page.navigate", {
+      url: "https://pi.test/alpha", waitUntilLoad: false, sessionKey: "session:alpha",
+      joinSessionGroup: true, sessionGroupTitle: "Pi Agent",
+    });
+    const beta = await w.dispatch("page.navigate", {
+      url: "https://pi.test/beta", waitUntilLoad: false, sessionKey: "session:beta",
+      joinSessionGroup: true, sessionGroupTitle: "Pi Agent",
+    });
+    ok(beta.windowId === alpha.windowId, "owner-survives: beta inherited alpha's Pi window");
+    await w.dispatch("automation.cleanup", { sessionKey: "session:alpha" });
+    ok(state.windows.has(alpha.windowId), "owner-survives: beta's tab keeps the Pi window open");
+
+    const windowsBefore = state.windows.size;
+    const gamma = await w.dispatch("page.navigate", {
+      url: "https://pi.test/gamma", waitUntilLoad: false, sessionKey: "session:gamma",
+      joinSessionGroup: true, sessionGroupTitle: "Pi Agent",
+    });
+    ok(gamma.windowId === alpha.windowId, "owner-survives: a new session still reuses the live Pi window");
+    ok(state.windows.size === windowsBefore, "owner-survives: no replacement window was churned");
+  }
+
+  // ===== ...and after the creating session is gone, the surviving Pi window is still reused WITHOUT
+  // attempting a window create at all, so a refused windows.create cannot turn a working setup into an
+  // error (the failure mode when ownership lived only in the creating session's record). =====
+  {
+    const state = makeChromeState();
+    const chrome = makeChrome(state, { withTabGroups: true });
+    const w = loadWorker(chrome);
+    const alpha = await w.dispatch("page.navigate", {
+      url: "https://pi.test/alpha", waitUntilLoad: false, sessionKey: "session:alpha",
+      joinSessionGroup: true, sessionGroupTitle: "Pi Agent",
+    });
+    await w.dispatch("page.navigate", {
+      url: "https://pi.test/keeper", waitUntilLoad: false, sessionKey: "session:keeper",
+      joinSessionGroup: true, sessionGroupTitle: "Pi Agent",
+    });
+    await w.dispatch("automation.cleanup", { sessionKey: "session:alpha" });
+    ok(state.windows.has(alpha.windowId), "reuse-no-create: the keeper's tab keeps the Pi window open");
+
+    let createAttempts = 0;
+    chrome.windows.create = async () => { createAttempts += 1; throw new Error("window creation refused"); };
+
+    let gamma = null;
+    try {
+      gamma = await w.dispatch("page.navigate", {
+        url: "https://pi.test/gamma", waitUntilLoad: false, sessionKey: "session:gamma",
+        joinSessionGroup: true, sessionGroupTitle: "Pi Agent",
+      });
+    } catch {
+      // Asserted below: with a live Pi window this must not throw.
+    }
+    ok(gamma !== null, "reuse-no-create: a live Pi window prevents the refused-create error");
+    ok(gamma?.windowId === alpha.windowId, "reuse-no-create: the live Pi window was reused");
+    ok(createAttempts === 0, "reuse-no-create: no window creation was attempted");
+  }
+
+  // ===== ...and even when no session record names the window at all: a user tab moved into it keeps
+  // it alive, and the persisted window registry is the only remaining ownership evidence. window.list
+  // must agree that it is Pi's. =====
+  {
+    const state = makeChromeState();
+    const w = loadWorker(makeChrome(state, { withTabGroups: true }));
+    const alpha = await w.dispatch("page.navigate", {
+      url: "https://pi.test/alpha", waitUntilLoad: false, sessionKey: "session:alpha",
+      joinSessionGroup: true, sessionGroupTitle: "Pi Agent",
+    });
+    const windowId = alpha.windowId;
+    const groupId = state.tabs.get(alpha.id).groupId;
+    // The user drags one of their own tabs into the Pi window (and its group), so the window outlives
+    // every Pi-owned tab.
+    const guestId = state.alloc.tab();
+    state.tabs.set(guestId, { id: guestId, windowId, url: "https://example.com/user-tab", active: false, groupId });
+    await w.dispatch("automation.cleanup", { sessionKey: "session:alpha" });
+    ok(!state.tabs.has(alpha.id), "owner-gone: Pi's tab was cleaned up");
+    ok(state.windows.has(windowId), "owner-gone: the user's moved-in tab keeps the window open");
+
+    const report = await w.dispatch("window.list", { sessionKey: "session:beta" });
+    const listed = (report.windows || []).find((win) => win.windowId === windowId);
+    ok(listed && listed.ownedByPi === true, "owner-gone: window.list still marks the window as Pi's from the registry alone");
+
+    const windowsBefore = state.windows.size;
+    const beta = await w.dispatch("page.navigate", {
+      url: "https://pi.test/beta", waitUntilLoad: false, sessionKey: "session:beta",
+      joinSessionGroup: true, sessionGroupTitle: "Pi Agent",
+    });
+    ok(beta.windowId === windowId, "owner-gone: the registry still recognizes the Pi window");
+    ok(state.windows.size === windowsBefore, "owner-gone: no new window was created");
+  }
+
+  // ===== Query order is not evidence: a stale "Pi Agent" group in one of the user's windows must not
+  // shadow the live Pi group, whichever Chrome lists first. =====
+  {
+    const state = makeChromeState();
+    const w = loadWorker(makeChrome(state, { withTabGroups: true }));
+    const staleGroupId = state.alloc.group();
+    const stale = { id: state.alloc.tab(), windowId: state.userWindowId, url: "https://x.com/home", active: false, groupId: staleGroupId };
+    state.tabs.set(stale.id, stale);
+    state.groups.set(staleGroupId, { id: staleGroupId, title: "Pi Agent", color: "blue", collapsed: false, windowId: state.userWindowId });
+
+    const alpha = await w.dispatch("page.navigate", {
+      url: "https://pi.test/alpha", waitUntilLoad: false, sessionKey: "session:alpha",
+      joinSessionGroup: true, sessionGroupTitle: "Pi Agent",
+    });
+    ok(alpha.windowId !== state.userWindowId, "stale-first: alpha's target is not in the user's window");
+    const windowsBefore = state.windows.size;
+
+    const beta = await w.dispatch("page.navigate", {
+      url: "https://pi.test/beta", waitUntilLoad: false, sessionKey: "session:beta",
+      joinSessionGroup: true, sessionGroupTitle: "Pi Agent",
+    });
+    ok(beta.windowId === alpha.windowId, "stale-first: the live Pi group won over the stale user-window group");
+    ok(state.windows.size === windowsBefore, "stale-first: no replacement window was churned");
+  }
+
+  // ===== createAutomationTarget must hydrate by itself: a direct caller with a cold map must still
+  // recognize a persisted Pi window and reuse it instead of silently churning a new one. =====
+  {
+    const state = makeChromeState();
+    const w1 = loadWorker(makeChrome(state, { withTabGroups: true }));
+    const seed = await w1.dispatch("page.navigate", {
+      url: "https://pi.test/seed-hydrate", waitUntilLoad: false, sessionKey: "session:alpha",
+      joinSessionGroup: true, sessionGroupTitle: "Pi Agent",
+    });
+    ok(Array.isArray(state.storage.piChromeCreatedWindowIds), "hydrate-direct: Pi-created windows are persisted");
+
+    const w2 = loadWorker(makeChrome(state, { withTabGroups: true })); // SW restart: fresh, cold maps
+    const windowsBefore = state.windows.size;
+    const tab = await w2.createAutomationTarget("session:beta", "Pi Agent");
+    ok(tab.windowId === seed.windowId, "hydrate-direct: reuses the persisted Pi window without a prior resolve");
+    ok(state.windows.size === windowsBefore, "hydrate-direct: no new window was created");
   }
 
   console.log(`\n${passes} passed, ${failures} failed`);

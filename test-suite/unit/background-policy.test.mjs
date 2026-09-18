@@ -364,13 +364,28 @@ test("background-only worker aliases force safe behavior even with foreground fl
   assertNoFocus(h);
 });
 
-test("implicit automation windows stay unfocused; tab fallback stays inactive", async () => {
-  for (const withWindows of [true, false]) {
-    const h = workerHarness({ withWindows });
+test("implicit automation windows stay unfocused; opted-in tab fallback stays inactive", async () => {
+  {
+    const h = workerHarness({ withWindows: true });
     const tab = await h.w.dispatch("page.navigate", { url: "https://fixture.test", waitUntilLoad: false, background: true, foreground: true, sessionKey: "alpha" });
     assert.notEqual(tab.id, 1);
     assertNoFocus(h);
     assert.ok(h.calls.filter((c) => c.action === "windows.create").every((c) => c.params.focused === false));
+  }
+  {
+    // With no window API the implicit path is a hard failure now: the old fallback created a tab
+    // with no windowId, which Chrome places in the focused (user) window.
+    const h = workerHarness({ withWindows: false });
+    await assert.rejects(
+      h.w.dispatch("page.navigate", { url: "https://fixture.test", waitUntilLoad: false, background: true, foreground: true, sessionKey: "alpha" }),
+      /\/chrome window/,
+    );
+    assertNoFocus(h);
+    // Explicitly opted in, the shared-tab fallback must still never activate the tab or a window.
+    const tab = await h.w.createIsolatedWindowTarget("alpha", { allowSharedTabFallback: true });
+    assert.notEqual(tab.id, 1);
+    assert.equal(tab.active, false);
+    assertNoFocus(h);
   }
 });
 
