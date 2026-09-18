@@ -294,21 +294,209 @@ async function run() {
     ok(state.tabs.get(nav.id).windowId !== state.userWindowId, "group-fail: still used the dedicated automation window");
   }
 
-  // ===== Concurrency: two sessions get separate windows; cleanup is per-session. =====
+  // ===== ONE dedicated Pi window for the whole browser: a second session ADOPTS the first
+  // session's window instead of creating another. Each session still gets its own tab there and
+  // ownership/cleanup stay per-session. Before this, every session without a group title churned a
+  // window of its own, so "another session" always meant another window. =====
   {
     const state = makeChromeState();
     const w = loadWorker(makeChrome(state));
+    const windowsBefore = state.windows.size;
+    const userTabsBefore = [...state.tabs.values()].filter((t) => t.windowId === state.userWindowId).map((t) => t.id).sort();
     const a = await w.dispatch("page.navigate", { url: "https://pi.test/a", waitUntilLoad: false, sessionKey: "session:A" });
     const b = await w.dispatch("page.navigate", { url: "https://pi.test/b", waitUntilLoad: false, sessionKey: "session:B" });
-    ok(a.id !== b.id && a.windowId !== b.windowId, "concurrency: each session gets its own dedicated window/tab");
-    ok(w.isPiChromeOwnedTarget(a.id, "session:A") && !w.isPiChromeOwnedTarget(a.id, "session:B"), "concurrency: ownership is scoped to the creating session");
+    ok(b.windowId === a.windowId, "shared-window: the second session reuses the first session's dedicated window");
+    ok(b.id !== a.id, "shared-window: each session still gets its own tab");
+    ok(state.windows.size === windowsBefore + 1, "shared-window: exactly one dedicated window was created in total");
+    ok(a.windowId !== state.userWindowId && b.windowId !== state.userWindowId, "shared-window: neither session moved into the user's window");
+    const userTabsAfter = [...state.tabs.values()].filter((t) => t.windowId === state.userWindowId).map((t) => t.id).sort();
+    ok(userTabsAfter.join(",") === userTabsBefore.join(","), "shared-window: the user's window gained no tab");
+    ok(w.isPiChromeOwnedTarget(a.id, "session:A") && !w.isPiChromeOwnedTarget(a.id, "session:B"), "shared-window: ownership is scoped to the creating session");
 
-    // Cleaning up session A must not touch session B's target.
-    await w.dispatch("automation.cleanup", { sessionKey: "session:A" });
-    ok(!state.tabs.has(a.id), "concurrency: cleanup closed session A's tab");
-    ok(state.tabs.has(b.id), "concurrency: cleanup left session B's tab open");
+    // Cleaning up session A must not touch session B's target nor the shared window.
+    const cleanupA = await w.dispatch("automation.cleanup", { sessionKey: "session:A" });
+    ok(!state.tabs.has(a.id), "shared-window: cleanup closed session A's tab");
+    ok(state.tabs.has(b.id), "shared-window: cleanup left session B's tab open");
+    ok(state.windows.has(a.windowId), "shared-cleanup: the window survives session A's cleanup while session B still works there");
+    ok(cleanupA.closedWindowId === null, "shared-cleanup: cleanup did not report closing the shared window");
     const bStatus = await w.dispatch("automation.status", { sessionKey: "session:B" });
-    ok(bStatus.tabId === b.id, "concurrency: session B still owns its target after A cleanup");
+    ok(bStatus.tabId === b.id && bStatus.windowId === b.windowId, "shared-window: session B still owns its target after A cleanup");
+    const b2 = await w.dispatch("page.navigate", { url: "https://pi.test/b-2", waitUntilLoad: false, sessionKey: "session:B" });
+    ok(b2.id === b.id && b2.windowId === a.windowId, "shared-window: session B keeps working in the shared window after A cleanup");
+  }
+
+  // ===== tab.new needs the session's automation target too: the second session's tab.new opens in
+  // the SAME dedicated window instead of churning another one. =====
+  {
+    const state = makeChromeState();
+    const w = loadWorker(makeChrome(state, { withTabGroups: true }));
+    const seed = await w.dispatch("page.navigate", { url: "https://pi.test/first", waitUntilLoad: false, sessionKey: "session:A" });
+    const windowsBefore = state.windows.size;
+    const opened = await w.dispatch("tab.new", { url: "https://pi.test/new", sessionKey: "session:B" });
+    ok(opened.tab.windowId === seed.windowId, "tab-new-shared: the second session's tab.new opened in the existing dedicated window");
+    ok(state.windows.size === windowsBefore, "tab-new-shared: no new window was created");
+    ok(opened.tab.windowId !== state.userWindowId, "tab-new-shared: still not the user's window");
+  }
+
+  // ===== Rule 4, plainly: a user window with no #pi-chrome marker and no "Pi Agent" group is
+  // never adopted. Pi creates its own window and the user's window is left with exactly its tabs. =====
+  {
+    const state = makeChromeState();
+    const w = loadWorker(makeChrome(state));
+    const windowsBefore = state.windows.size;
+    const userTabsBefore = [...state.tabs.values()].filter((t) => t.windowId === state.userWindowId).map((t) => t.id).sort();
+    const nav = await w.dispatch("page.navigate", { url: "https://pi.test/ordinary", waitUntilLoad: false, sessionKey: "session:ordinary" });
+    ok(nav.windowId !== state.userWindowId, "user-window: an ordinary unmarked user window is never adopted");
+    ok(state.windows.size === windowsBefore + 1, "user-window: Pi created a dedicated window instead");
+    const userTabsAfter = [...state.tabs.values()].filter((t) => t.windowId === state.userWindowId).map((t) => t.id).sort();
+    ok(userTabsAfter.join(",") === userTabsBefore.join(","), "user-window: the user's window gained no tab");
+  }
+
+  // ===== A user window with an ordinary tab alongside a leftover "Pi Agent" group is NOT a
+  // dedicated Pi window: a group among the user's own tabs must never turn their window into a
+  // candidate. Only a window whose tabs are ALL Pi tabs (marker or Pi group) is dedicated. =====
+  {
+    const state = makeChromeState();
+    const w = loadWorker(makeChrome(state, { withTabGroups: true }));
+    const gid = state.alloc.group();
+    const leftover = { id: state.alloc.tab(), windowId: state.userWindowId, url: "https://x.com/home", active: false, groupId: gid };
+    state.tabs.set(leftover.id, leftover);
+    state.groups.set(gid, { id: gid, title: "Pi Agent", color: "blue", collapsed: false, windowId: state.userWindowId });
+    const windowsBefore = state.windows.size;
+    const userTabsBefore = [...state.tabs.values()].filter((t) => t.windowId === state.userWindowId).map((t) => t.id).sort();
+    const nav = await w.dispatch("page.navigate", { url: "https://pi.test/not-dedicated", waitUntilLoad: false, sessionKey: "session:leftover" });
+    ok(nav.windowId !== state.userWindowId, "user-window-guard: a leftover 'Pi Agent' group among the user's tabs does not make their window dedicated");
+    ok(state.windows.size === windowsBefore + 1, "user-window-guard: Pi created its own window instead");
+    const userTabsAfter = [...state.tabs.values()].filter((t) => t.windowId === state.userWindowId).map((t) => t.id).sort();
+    ok(userTabsAfter.join(",") === userTabsBefore.join(","), "user-window-guard: the user's window gained no tab");
+    ok(state.tabs.get(leftover.id).groupId === gid, "user-window-guard: the user's grouped tab is untouched");
+  }
+
+  // ===== The dedicated window is discovered from the #pi-chrome marker of its fresh automation tab
+  // even after an EXTENSION RELOAD wipes chrome.storage.session (the registry). Before this, a
+  // wiped registry meant a brand-new window for the next session. =====
+  {
+    const state = makeChromeState();
+    const w1 = loadWorker(makeChrome(state));
+    const seed = await w1.getOrCreateAutomationTarget("session:alpha");
+    ok(seed.url === "about:blank#pi-chrome", "marker-discovery: the created target carries the #pi-chrome marker");
+    // Extension reload: every in-memory map and storage.session entry is gone; windows/tabs stay.
+    for (const key of Object.keys(state.storage)) delete state.storage[key];
+    const w2 = loadWorker(makeChrome(state));
+    const windowsBefore = state.windows.size;
+    const nav = await w2.dispatch("page.navigate", { url: "https://pi.test/after-reload", waitUntilLoad: false, sessionKey: "session:beta" });
+    ok(nav.windowId === seed.windowId, "marker-discovery: the marked window was adopted after the registry was wiped");
+    ok(state.windows.size === windowsBefore, "marker-discovery: no new window was created");
+    ok(nav.windowId !== state.userWindowId, "marker-discovery: still not the user's window");
+  }
+
+  // ===== ...and once the automation tab has navigated away (marker gone, registry wiped), the
+  // "Pi Agent" group is the evidence: a window whose tabs are ALL Pi-group tabs is still Pi's. =====
+  {
+    const state = makeChromeState();
+    const w1 = loadWorker(makeChrome(state, { withTabGroups: true }));
+    const seed = await w1.dispatch("page.navigate", {
+      url: "https://pi.test/seed-reload", waitUntilLoad: false, sessionKey: "session:alpha",
+      joinSessionGroup: true, sessionGroupTitle: "Pi Agent",
+    });
+    for (const key of Object.keys(state.storage)) delete state.storage[key]; // extension reload
+    const w2 = loadWorker(makeChrome(state, { withTabGroups: true }));
+    const windowsBefore = state.windows.size;
+    const nav = await w2.dispatch("page.navigate", {
+      url: "https://pi.test/after-reload", waitUntilLoad: false, sessionKey: "session:beta",
+      joinSessionGroup: true, sessionGroupTitle: "Pi Agent",
+    });
+    ok(nav.windowId === seed.windowId, "group-discovery: the all-Pi-group window was adopted after the registry was wiped");
+    ok(state.windows.size === windowsBefore, "group-discovery: no new window was created");
+    ok(nav.groupId === seed.groupId, "group-discovery: the new tab joined the existing Pi group");
+    ok(nav.windowId !== state.userWindowId, "group-discovery: still not the user's window");
+  }
+
+  // ===== Several dedicated Pi windows exist: the pick is the LOWEST window id, never the order
+  // chrome.tabs.query returns, and the extras are left exactly as they are. The higher-id window's
+  // marker tab is inserted first so query order would pick it. =====
+  {
+    const state = makeChromeState();
+    const lowerId = state.alloc.window();
+    const higherId = state.alloc.window();
+    state.windows.set(lowerId, { id: lowerId });
+    state.windows.set(higherId, { id: higherId });
+    const highTab = { id: state.alloc.tab(), windowId: higherId, url: "about:blank#pi-chrome", active: false, groupId: -1 };
+    const lowTab = { id: state.alloc.tab(), windowId: lowerId, url: "about:blank#pi-chrome", active: false, groupId: -1 };
+    state.tabs.set(highTab.id, highTab); // query order: higher-id window's marker tab comes first
+    state.tabs.set(lowTab.id, lowTab);
+    const w = loadWorker(makeChrome(state));
+    const windowsBefore = state.windows.size;
+    const nav = await w.dispatch("page.navigate", { url: "https://pi.test/pick", waitUntilLoad: false, sessionKey: "session:pick" });
+    ok(nav.windowId === lowerId, "deterministic-pick: the lowest window id wins regardless of tabs.query order");
+    ok(state.windows.size === windowsBefore, "deterministic-pick: no new window was created");
+    ok(state.tabs.has(highTab.id) && state.tabs.get(highTab.id).url === "about:blank#pi-chrome", "deterministic-pick: the extra Pi window's tab was not closed or moved");
+    ok(state.windows.has(higherId), "deterministic-pick: the extra Pi window was not closed");
+    ok(state.tabs.get(nav.id).windowId === lowerId, "deterministic-pick: the session's tab lives in the picked window");
+  }
+
+  // ===== The deterministic pick spans BOTH discovery sources: a "Pi Agent" group window with a
+  // lower id beats a #pi-chrome marker window with a higher id, even though the marker source is
+  // listed first in the rule. Extras stay open and untouched. =====
+  {
+    const state = makeChromeState();
+    const lowerId = state.alloc.window();
+    const higherId = state.alloc.window();
+    state.windows.set(lowerId, { id: lowerId });
+    state.windows.set(higherId, { id: higherId });
+    const gid = state.alloc.group();
+    const highTab = { id: state.alloc.tab(), windowId: higherId, url: "about:blank#pi-chrome", active: false, groupId: -1 };
+    const lowTab = { id: state.alloc.tab(), windowId: lowerId, url: "https://pi.test/old", active: false, groupId: gid };
+    state.tabs.set(highTab.id, highTab); // query order puts the marker window first
+    state.tabs.set(lowTab.id, lowTab);
+    state.groups.set(gid, { id: gid, title: "Pi Agent", color: "blue", collapsed: false, windowId: lowerId });
+    const w = loadWorker(makeChrome(state, { withTabGroups: true }));
+    const nav = await w.dispatch("page.navigate", { url: "https://pi.test/pick-mixed", waitUntilLoad: false, sessionKey: "session:pick-mixed" });
+    ok(nav.windowId === lowerId, "deterministic-pick-mixed: the lowest id wins across marker and group sources");
+    ok(state.windows.has(higherId) && state.tabs.has(highTab.id), "deterministic-pick-mixed: the extra marker window is untouched");
+    ok(state.tabs.has(lowTab.id), "deterministic-pick-mixed: the group window's original tab is untouched");
+  }
+
+  // ===== "Pi's own window" (window.select windowId:null) adopts the existing dedicated window too,
+  // even after an extension reload: it must not churn a second window on a machine that has one. =====
+  {
+    const state = makeChromeState();
+    const w1 = loadWorker(makeChrome(state, { withTabGroups: true }));
+    const seed = await w1.dispatch("page.navigate", {
+      url: "https://pi.test/seed-own", waitUntilLoad: false, sessionKey: "session:alpha",
+      joinSessionGroup: true, sessionGroupTitle: "Pi Agent",
+    });
+    for (const key of Object.keys(state.storage)) delete state.storage[key]; // extension reload
+    const w2 = loadWorker(makeChrome(state, { withTabGroups: true }));
+    const windowsBefore = state.windows.size;
+    const selected = await w2.dispatch("window.select", { windowId: null, sessionKey: "session:beta", groupTitle: "Pi Agent" });
+    ok(selected.windowId === seed.windowId, "own-window-discovery: window.select null adopted the existing dedicated window");
+    ok(state.windows.size === windowsBefore, "own-window-discovery: no second Pi window was created");
+    ok(selected.tabId !== seed.id, "own-window-discovery: the new session got its own tab there");
+    ok(state.tabs.get(selected.tabId).windowId === seed.windowId, "own-window-discovery: the tab is in the adopted window");
+    ok(selected.windowId !== state.userWindowId, "own-window-discovery: still not the user's window");
+  }
+
+  // ===== Rule 5: an explicit window assignment still wins over automatic discovery. A session told
+  // to work in the user's window stays a guest there even while Pi has its own windows, and a
+  // session explicitly assigned a higher-id Pi window is not stolen into the lowest-id one. =====
+  {
+    const state = makeChromeState();
+    const w = loadWorker(makeChrome(state, { withTabGroups: true }));
+    const lower = await w.dispatch("page.navigate", { url: "https://pi.test/lower", waitUntilLoad: false, sessionKey: "session:alpha" });
+    const higherSel = await w.dispatch("window.select", { windowId: null, fresh: true, sessionKey: "session:beta", groupTitle: "Pi Agent" });
+    ok(higherSel.windowId > lower.windowId, "explicit-wins: the second Pi window has the higher id");
+
+    const gamma = await w.dispatch("window.select", { windowId: higherSel.windowId, sessionKey: "session:gamma" });
+    const gammaNav = await w.dispatch("page.navigate", { url: "https://pi.test/gamma", waitUntilLoad: false, sessionKey: "session:gamma" });
+    ok(gammaNav.windowId === higherSel.windowId, "explicit-wins: the assigned Pi window is not overridden by discovery");
+    ok(gammaNav.windowId !== lower.windowId, "explicit-wins: discovery did not move the session to the lowest-id Pi window");
+    ok(gammaNav.id === gamma.tabId, "explicit-wins: the explicitly chosen window's tab is reused");
+
+    const guest = await w.dispatch("window.select", { windowId: state.userWindowId, sessionKey: "session:delta" });
+    const guestNav = await w.dispatch("page.navigate", { url: "https://pi.test/delta", waitUntilLoad: false, sessionKey: "session:delta" });
+    ok(guestNav.windowId === state.userWindowId, "explicit-wins: a user-window assignment is not overridden by the Pi windows");
+    ok(guestNav.id === guest.tabId, "explicit-wins: the guest tab in the user's window is reused");
   }
 
   // ===== Service-worker restart / reconnect: persisted ownership re-hydrates from storage. =====
