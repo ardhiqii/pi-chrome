@@ -77,6 +77,17 @@ dest_version=""
 if [ -f "$DEST_ROOT/package.json" ]; then
   dest_version="$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$DEST_ROOT/package.json" | head -n 1)"
 fi
+src_version=""
+if [ -f "$SRC/package.json" ]; then
+  src_version="$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$SRC/package.json" | head -n 1)"
+fi
+# A version change makes the running extension reload ITSELF on its next poll (it compares the
+# manifest version against the package.json version the bridge advertises), so a manual Reload is
+# only genuinely required when service_worker.js changed WITHOUT a version change.
+version_changed=0
+if [ -n "$dest_version" ] && [ -n "$src_version" ] && [ "$dest_version" != "$src_version" ]; then
+  version_changed=1
+fi
 dest_sw_sha=""
 if [ -f "$dest_sw" ]; then
   dest_sw_sha="$(sha256_of "$dest_sw")"
@@ -189,17 +200,26 @@ fi
 echo
 echo "NEXT STEPS"
 echo
-if [ "$sw_changed" -eq 1 ]; then
-  echo "  1) RELOAD THE EXTENSION (service_worker.js changed):"
+if [ "$sw_changed" -eq 1 ] && [ "$version_changed" -eq 1 ]; then
+  echo "  1) No manual Reload needed: service_worker.js and the version both changed, so the"
+  echo "     extension reloads itself within a few seconds of its next poll"
+  echo "     (${dest_version:-unknown} -> ${src_version:-unknown}). Clicking Reload at"
+  echo "     edge://extensions still works if you would rather not wait."
+elif [ "$sw_changed" -eq 1 ]; then
+  echo "  1) RELOAD THE EXTENSION (service_worker.js changed, version unchanged):"
   echo "       - open  edge://extensions"
   echo "       - find  \"Pi Chrome Connector\""
   echo "       - click the Reload (circular arrow) button on its card"
-  echo "     Extension code cannot hot-reload: without this the old service worker keeps"
-  echo "     running and none of the new code executes."
+  echo "     Extension code cannot hot-reload, and with no version change there is nothing for the"
+  echo "     extension to notice on its own: without this the old service worker keeps running."
 else
   echo "  1) No Reload needed: service_worker.js is unchanged."
-  echo "     (A version bump on its own is picked up by the extension's own version-skew"
-  echo "     reload; with no version change there is nothing for the browser to reload.)"
+  if [ "$version_changed" -eq 1 ]; then
+    echo "     The version changed (${dest_version:-unknown} -> ${src_version:-unknown}), which the extension"
+    echo "     picks up on its own within a few seconds of its next poll."
+  else
+    echo "     (Nothing changed on the browser side at all.)"
+  fi
 fi
 echo
 if [ "$index_changed" -eq 1 ]; then
