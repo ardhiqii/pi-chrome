@@ -352,6 +352,32 @@ async function resolveOwnedAutomationTarget(sessionKey) {
   return null;
 }
 
+// A pi-chrome-owned automation tab that was moved out of the window its record names must never be
+// driven or regrouped where it sits. `resolveOwnedAutomationTarget` enforces that on the implicit
+// path, but explicit targeting (targetId/urlIncludes/titleIncludes) bypasses the resolver by design;
+// this is the check that keeps those selectors from following a Pi tab the user dragged into their
+// own window. The stale tab is retired (closed) and the record removed, exactly like the resolver
+// does, so the next untargeted action builds a fresh target. Returns an error message, or null when
+// the tab is not a moved Pi-owned target.
+async function movedAutomationTargetError(tab, sessionKey) {
+  if (!tab || typeof tab.id !== "number" || typeof tab.windowId !== "number") return null;
+  await hydrateAutomationTargets();
+  let ownerKey = null;
+  if (isPiChromeOwnedTarget(tab.id, sessionKey)) ownerKey = sessionKey;
+  else for (const [key, record] of automationTargets) if (record.tabId === tab.id) { ownerKey = key; break; }
+  if (ownerKey === null) return null;
+  const record = automationTargets.get(ownerKey);
+  if (!record || typeof record.windowId !== "number" || record.windowId === tab.windowId) return null;
+  await chrome.tabs.remove(tab.id).catch(() => {});
+  automationTargets.delete(ownerKey);
+  await persistAutomationTargets();
+  return (
+    `Pi's automation tab ${tab.id} was moved out of its own window (it is in window ${tab.windowId}, ` +
+    `not window ${record.windowId}); pi-chrome does not drive or regroup a tab in a window it does not own. ` +
+    `The tab has been closed — retry without targetId to get a fresh automation target, or run /chrome window to choose a window on purpose.`
+  );
+}
+
 // Return the session's dedicated automation target, creating it on first use (or after the user
 // closed it). Used by page/navigation actions that need a live surface to drive. Creation is strict by
 // default: an implicit action must never end up in a window Chrome picks for us (see
@@ -1441,6 +1467,11 @@ async function groupRecord(groupId) {
 // group's window (Chrome tab groups cannot span windows).
 async function findGroupByTitle(windowId, title) {
   if (!chrome.tabGroups) return null;
+  // Never query without a window: an unscoped `tabGroups.query` answers with groups from EVERY
+  // window, and grouping a tab with a group from another window makes Chrome MOVE the tab into that
+  // group's window. Refusing here is the difference between a window-scoped group id and a silently
+  // relocated tab.
+  if (typeof windowId !== "number") return null;
   const wanted = cleanGroupTitle(title).toLowerCase();
   const groups = await chrome.tabGroups.query({ windowId }).catch(() => []);
   const match = groups.find((g) => (g.title || "").trim().toLowerCase() === wanted);
@@ -1463,6 +1494,9 @@ async function findPiOwnedGroupRecordByTitle(title) {
 async function groupTab(tab, title, color) {
   if (!chrome.tabGroups) throw new Error("chrome.tabGroups API unavailable; reload the extension after granting the tabGroups permission");
   if (!tab || typeof tab.id !== "number") throw new Error("No tab to group");
+  // A tab without a window cannot be scoped to a window, and guessing would be how a group in another
+  // window captures it (Chrome moves the tab when it joins a foreign group).
+  if (typeof tab.windowId !== "number") throw new Error("Cannot group a tab without a window id");
   const groupTitle = cleanGroupTitle(title);
   let groupId = tab.groupId;
   if (typeof groupId !== "number" || groupId < 0) {
@@ -1677,6 +1711,17 @@ async function dispatch(action, params) {
       const windows = await chrome.windows.getAll({ populate: true });
       await hydrateAutomationTargets();
       const target = automationTargets.get(sessionKeyOf(params));
+      // The per-session record is a claim about where the tab IS, and it goes stale the moment the tab
+      // is moved (the user dragging it, or Chrome following a foreign group). Reading it raw was the
+      // live bug: window.list reported ownsTargetWindow=true / targetWindowId=<Pi's window> while the
+      // same report said holdsTargetTab=true for the USER's window. Resolve the claim against the
+      // tab's real window and report ownership from that — a window the tab is not in is not ours.
+      const targetTab = typeof target?.tabId === "number"
+        ? await chrome.tabs.get(target.tabId).catch(() => null)
+        : null;
+      const targetTabWindowId = targetTab && typeof targetTab.windowId === "number" ? targetTab.windowId : null;
+      const recordedWindowId = typeof target?.windowId === "number" ? target.windowId : null;
+      const ownsTargetWindow = targetTabWindowId !== null && isPiOwnedWindow(targetTabWindowId);
       return {
         windows: windows.map((win) => {
           const tabs = Array.isArray(win.tabs) ? win.tabs : [];
@@ -1693,10 +1738,15 @@ async function dispatch(action, params) {
             ownedByPi: isPiOwnedWindow(win.id),
           };
         }),
-        // windowId is only recorded when WE created that window. Otherwise the tab is a guest in a
-        // window the user owns, and cleanup must close only the tab.
-        targetWindowId: typeof target?.windowId === "number" ? target.windowId : null,
-        ownsTargetWindow: typeof target?.windowId === "number",
+        // Report the window the tab is really in, and only when WE created it. A record naming a Pi
+        // window the tab has left (or a tab that no longer exists) is reported as owning no window:
+        // the picker then marks the window that actually holds the tab, and cleanup never claims to
+        // have closed a window it did not.
+        targetWindowId: ownsTargetWindow ? targetTabWindowId : null,
+        ownsTargetWindow,
+        // Diagnostic only (index.ts ignores it): the session has a target whose record no longer
+        // matches where that tab lives, i.e. the state the live report caught in the act.
+        targetStale: typeof target?.tabId === "number" && (targetTabWindowId === null || (recordedWindowId !== null && targetTabWindowId !== recordedWindowId)),
       };
     }
     case "window.select": {
@@ -1744,6 +1794,13 @@ async function dispatch(action, params) {
       if (typeof current?.tabId === "number") {
         const existing = await chrome.tabs.get(current.tabId).catch(() => null);
         if (existing && existing.windowId === wanted) {
+          // The user has now chosen this window on purpose, so the tab is a guest in it and the record
+          // must say so. Keeping a stale numeric Pi-window id here would make the next action "retire"
+          // the tab the user just chose and silently put Pi back in isolation.
+          if (typeof current.windowId === "number") {
+            automationTargets.set(sessionKey, { windowId: undefined, tabId: current.tabId });
+            await persistAutomationTargets();
+          }
           return { windowId: wanted, tabId: current.tabId, reused: true };
         }
       }
@@ -1845,6 +1902,12 @@ async function getTabByParams(params, { createOwnedTarget = true } = {}) {
     }
   }
   if (!tab?.id) throw new Error("No matching Chrome tab found");
+  // A Pi-owned tab that was moved out of its Pi window must not be driven or regrouped where it sits.
+  // The implicit path already retired it in resolveOwnedAutomationTarget; this covers the explicit
+  // selectors, which bypass that resolver by design, and refuses loudly instead of working in a window
+  // the user owns.
+  const movedTargetError = await movedAutomationTargetError(tab, sessionKeyOf(params));
+  if (movedTargetError) throw new Error(movedTargetError);
   const url = tab.url || "";
   if (url.startsWith("chrome://") || url.startsWith("chrome-extension://") || url.startsWith("devtools://")) {
     throw new Error(`Chrome blocks extension automation on protected URL: tab=${tab.id} url=${url}`);

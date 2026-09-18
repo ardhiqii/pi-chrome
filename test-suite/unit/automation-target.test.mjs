@@ -94,7 +94,16 @@ function makeChrome(state, { withWindows = true, withStorage = true, withTabGrou
           const firstTab = tabs.get(tabIds[0]);
           groups.set(gid, { id: gid, title: "", color: "grey", collapsed: false, windowId: firstTab ? firstTab.windowId : userWindowId });
         }
-        for (const tid of tabIds) { const t = tabs.get(tid); if (t) t.groupId = gid; }
+        const group = groups.get(gid);
+        for (const tid of tabIds) {
+          const t = tabs.get(tid);
+          if (!t) continue;
+          t.groupId = gid;
+          // Chrome MOVES a tab into the group's window when it is grouped with a group that lives in
+          // another window. Modelling that here makes an unscoped group lookup fail loudly in the
+          // tests instead of silently passing while real Chrome relocates the tab.
+          if (group && typeof group.windowId === "number") t.windowId = group.windowId;
+        }
         return gid;
       },
       ungroup: async (id) => { const ids = Array.isArray(id) ? id : [id]; for (const tid of ids) { const t = tabs.get(tid); if (t) t.groupId = -1; } },
@@ -472,6 +481,119 @@ async function run() {
     ok(moved.id !== first.id, "moved-target: the moved tab was retired, not reused");
     ok(!state.tabs.has(first.id), "moved-target: the stale automation tab is closed");
     ok(state.tabs.get(moved.id).windowId === moved.windowId, "moved-target: the new target is where it claims to be");
+  }
+
+  // ===== The LIVE report, reproduced: a target recorded in Pi's window whose tab the user moved into
+  // their own window, with a leftover "Pi Agent" group there for a regroup to land in. window.list used
+  // to report ownsTargetWindow=true / targetWindowId=<Pi's window> while the same report said
+  // holdsTargetTab=true for the USER's window, so /chrome window claimed Pi was isolated while it was
+  // working among the user's tabs. The implicit page.* path must retire the moved tab — not drive it,
+  // and not regroup it into the user's group — and build its replacement in Pi's window. =====
+  {
+    const state = makeChromeState();
+    const w = loadWorker(makeChrome(state, { withTabGroups: true }));
+    // An ungrouped automation target, exactly like the live one at the moment it was moved.
+    const first = await w.dispatch("page.navigate", { url: "https://pi.test/recorded", waitUntilLoad: false, sessionKey: SK });
+    ok(first.windowId !== state.userWindowId, "live-state: the target started in a Pi window");
+
+    // The stale group in the USER's window that a regroup would land in.
+    const staleGroupId = state.alloc.group();
+    const leftover = { id: state.alloc.tab(), windowId: state.userWindowId, url: "https://x.com/home", active: false, groupId: staleGroupId };
+    state.tabs.set(leftover.id, leftover);
+    state.groups.set(staleGroupId, { id: staleGroupId, title: "Pi Agent", color: "blue", collapsed: false, windowId: state.userWindowId });
+    const userTabsBefore = [...state.tabs.values()].filter((t) => t.windowId === state.userWindowId).map((t) => t.id).sort();
+
+    // The user drags Pi's automation tab into their own window.
+    state.tabs.get(first.id).windowId = state.userWindowId;
+
+    const report = await w.dispatch("window.list", { sessionKey: SK });
+    const piWindow = (report.windows || []).find((win) => win.windowId === first.windowId);
+    const userWindow = (report.windows || []).find((win) => win.windowId === state.userWindowId);
+    ok(userWindow?.holdsTargetTab === true, "live-state: the report sees the target in the user's window");
+    ok(report.ownsTargetWindow === false, "live-state: window.list does not claim a window the tab is not in");
+    ok(report.targetWindowId === null, "live-state: targetWindowId does not name the stale Pi window");
+    ok(piWindow?.ownedByPi === true, "live-state: the Pi-created window is still flagged as Pi's");
+
+    const moved = await w.dispatch("page.navigate", {
+      url: "https://pi.test/after-move", waitUntilLoad: false, sessionKey: SK,
+      joinSessionGroup: true, sessionGroupTitle: "Pi Agent",
+    });
+    ok(moved.windowId !== state.userWindowId, "live-state: the next action does not work in the user's window");
+    ok(moved.id !== first.id, "live-state: the moved tab was retired, not followed");
+    ok(!state.tabs.has(first.id), "live-state: the moved automation tab was closed");
+    ok(state.tabs.get(moved.id).windowId === moved.windowId, "live-state: the fresh target is where it claims to be");
+    ok(state.tabs.get(leftover.id).groupId === staleGroupId, "live-state: the user-window group was not adopted or renamed");
+    const userTabsAfter = [...state.tabs.values()].filter((t) => t.windowId === state.userWindowId).map((t) => t.id).sort();
+    ok(userTabsAfter.join(",") === userTabsBefore.join(","), "live-state: the user's window ends with exactly its own tabs; no user tab was regrouped");
+    ok([...state.tabs.values()].every((t) => t.windowId !== state.userWindowId || t.groupId !== moved.groupId), "live-state: no user-window tab joined Pi's session group");
+  }
+
+  // ===== An explicitly targeted Pi tab that was moved into the user's window must fail loudly. The
+  // resolver guards the implicit path, but targetId/urlIncludes/titleIncludes bypass it — and that is
+  // how the moved tab could still be driven and grouped into the user's own "Pi Agent" group. =====
+  {
+    const state = makeChromeState();
+    const w = loadWorker(makeChrome(state, { withTabGroups: true }));
+    const first = await w.dispatch("page.navigate", { url: "https://pi.test/target-me", waitUntilLoad: false, sessionKey: SK });
+    const staleGroupId = state.alloc.group();
+    const leftover = { id: state.alloc.tab(), windowId: state.userWindowId, url: "https://x.com/home", active: false, groupId: staleGroupId };
+    state.tabs.set(leftover.id, leftover);
+    state.groups.set(staleGroupId, { id: staleGroupId, title: "Pi Agent", color: "blue", collapsed: false, windowId: state.userWindowId });
+    state.tabs.get(first.id).windowId = state.userWindowId;
+
+    await throwsWith(
+      () => w.dispatch("page.navigate", {
+        targetId: String(first.id), url: "https://pi.test/hijacked", waitUntilLoad: false,
+        sessionKey: SK, joinSessionGroup: true, sessionGroupTitle: "Pi Agent",
+      }),
+      /moved out of its own window/,
+      "moved-explicit: targeting the moved Pi tab refuses instead of using the user's window",
+    );
+    ok(state.userArticle.url === "https://example.com/research-article", "moved-explicit: the user's active tab was not navigated");
+    ok(!state.tabs.has(first.id), "moved-explicit: the moved automation tab was retired, not followed");
+    ok(state.tabs.get(leftover.id).groupId === staleGroupId, "moved-explicit: the user-window group was not adopted");
+    ok([...state.tabs.values()].every((t) => t.groupId !== staleGroupId || t.id === leftover.id), "moved-explicit: no Pi tab was regrouped into the user's group");
+  }
+
+  // ===== When the user deliberately chooses one of their windows and Pi's tab already sits there (moved
+  // or left by a stale record), that choice must be recorded: the tab becomes a guest of the user's
+  // window, the stale "Pi's window" claim is dropped, and the next page.* action works where the user
+  // pointed instead of retiring the tab the user just chose and silently re-isolating. =====
+  {
+    const state = makeChromeState();
+    const w = loadWorker(makeChrome(state, { withTabGroups: true }));
+    const first = await w.dispatch("page.navigate", { url: "https://pi.test/guest", waitUntilLoad: false, sessionKey: SK });
+    state.tabs.get(first.id).windowId = state.userWindowId;
+
+    const selected = await w.dispatch("window.select", { windowId: state.userWindowId, sessionKey: SK });
+    ok(selected.reused === true && selected.tabId === first.id, "select-guest: the user's chosen window reuses the tab already there");
+
+    const report = await w.dispatch("window.list", { sessionKey: SK });
+    ok(report.ownsTargetWindow === false, "select-guest: window.list does not claim Pi's old window");
+    ok(report.targetWindowId === null, "select-guest: targetWindowId is cleared after the user chose their window");
+    ok((report.windows || []).find((win) => win.windowId === state.userWindowId)?.holdsTargetTab === true, "select-guest: the tab is reported in the chosen window");
+
+    const nav = await w.dispatch("page.navigate", { url: "https://pi.test/guest-2", waitUntilLoad: false, sessionKey: SK });
+    ok(nav.id === first.id && nav.windowId === state.userWindowId, "select-guest: the user's chosen window survives the next implicit action");
+  }
+
+  // ===== A group lookup without a window must never fall back to "any window": groups cannot span
+  // windows, and grouping a tab with a foreign group makes Chrome MOVE the tab into that group's
+  // window. The lookup is the only place a foreign group id can be chosen. =====
+  {
+    const state = makeChromeState();
+    const w = loadWorker(makeChrome(state, { withTabGroups: true }));
+    const gid = state.alloc.group();
+    state.groups.set(gid, { id: gid, title: "Pi Agent", color: "red", collapsed: false, windowId: state.userWindowId });
+    const unscoped = await w.findGroupByTitle(undefined, "Pi Agent");
+    ok(unscoped === null, "group-scope: a windowless lookup never returns another window's group");
+    const scoped = await w.findGroupByTitle(state.userWindowId, "Pi Agent");
+    ok(scoped === gid, "group-scope: the same-window lookup still finds the group");
+    await throwsWith(
+      () => w.groupTab({ id: 999 }, "Pi Agent"),
+      /without a window id/,
+      "group-scope: grouping a tab with no window is refused instead of guessing one",
+    );
   }
 
   // ===== window.select's "Pi's own window" reuse must check the tab is actually still in that window.
