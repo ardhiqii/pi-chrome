@@ -204,6 +204,7 @@ type WindowSummary = {
 	title: string;
 	focused: boolean;
 	holdsTargetTab: boolean;
+	ownedByPi?: boolean;
 };
 
 type WindowReport = {
@@ -224,15 +225,27 @@ function truncateTitle(title: string, max = 40): string {
 // otherwise — and that difference decides whether cleanup may close a whole window.
 function windowMenuOptions(report: WindowReport): {
 	ownLabel: string;
+	newLabel: string;
 	options: string[];
 	windowByLabel: Map<string, number>;
 } {
 	const ownsOwn = report.ownsTargetWindow === true;
-	const ownLabel = `${ownsOwn ? "✓ " : "  "}Pi's own window (isolated, cleaned up automatically)`;
-	const options: string[] = [ownLabel];
+	const owned = (report.windows ?? []).find((win) => win.ownedByPi === true);
+	// Name the window Pi already owns, so the entry says which window it means instead of promising a
+	// vague "isolated" one. Without an owned window it describes what choosing it will create.
+	const ownText = owned
+		? `Window ${owned.windowId} — ${owned.tabCount} tab${owned.tabCount === 1 ? "" : "s"} — ${truncateTitle(owned.title)}`
+		: "isolated, cleaned up automatically";
+	const ownLabel = `${ownsOwn ? "✓ " : "  "}Pi's own window (${ownText})`;
+	// Opening another one is only a distinct choice when Pi already has a window to reuse; otherwise the
+	// entry above would do exactly the same thing.
+	const newLabel = "  Open a new window of Pi's own";
+	const options: string[] = owned ? [ownLabel, newLabel] : [ownLabel];
 	const windowByLabel = new Map<string, number>();
 	for (const win of report.windows ?? []) {
 		if (typeof win.windowId !== "number") continue;
+		// Pi's own window is represented by the entry above, not listed again as one of the user's.
+		if (win.ownedByPi === true) continue;
 		const mark = !ownsOwn && win.holdsTargetTab ? "✓ " : "  ";
 		const count = `${win.tabCount} tab${win.tabCount === 1 ? "" : "s"}`;
 		const base = `${mark}Window ${win.windowId} — ${count}${win.focused ? ", focused" : ""} — ${truncateTitle(win.title)}`;
@@ -241,7 +254,7 @@ function windowMenuOptions(report: WindowReport): {
 		options.push(label);
 		windowByLabel.set(label, win.windowId);
 	}
-	return { ownLabel, options, windowByLabel };
+	return { ownLabel, newLabel, options, windowByLabel };
 }
 
 function describeWindows(report: WindowReport): string {
@@ -1867,18 +1880,20 @@ Usage rules:
 	// user can see it.
 	const openWindowMenu = async (ctx: ExtensionContext): Promise<void> => {
 		const report = (await bridge.send("window.list", windowParams(ctx), 15_000)) as WindowReport;
-		const { ownLabel, options, windowByLabel } = windowMenuOptions(report);
+		const { ownLabel, newLabel, options, windowByLabel } = windowMenuOptions(report);
 		const choice = await ctx.ui.select("Which window should Pi use?", options);
 		if (!choice) return;
-		const windowId = choice === ownLabel ? null : windowByLabel.get(choice);
+		const fresh = choice === newLabel;
+		const windowId = choice === ownLabel || fresh ? null : windowByLabel.get(choice);
 		if (windowId === undefined) return;
-		const result = (await bridge.send("window.select", { ...windowParams(ctx), windowId }, 20_000)) as {
-			windowId?: number | null;
-			reused?: boolean;
-		};
+		const result = (await bridge.send(
+			"window.select",
+			{ ...windowParams(ctx), windowId, ...(fresh ? { fresh: true } : {}) },
+			20_000,
+		)) as { windowId?: number | null; reused?: boolean };
 		ctx.ui.notify(
 			windowId === null
-				? `Pi will use a window of its own${result.windowId ? ` (window ${result.windowId})` : ""}.`
+				? `Pi will use a window of its own${result.windowId ? ` (window ${result.windowId})` : ""}${result.reused ? " — the one it already has" : ""}.`
 				: `Pi will work in window ${result.windowId ?? windowId}${result.reused ? " (already there)" : ""}.`,
 			"info",
 		);

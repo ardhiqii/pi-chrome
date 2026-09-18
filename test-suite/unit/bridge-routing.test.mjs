@@ -670,21 +670,40 @@ test("the window picker marks the window Pi is ACTUALLY using, and maps clicks b
   assert.equal(built.windowByLabel.get("✓ Window 22 — 3 tabs — GitHub"), 22, "the marked one still maps correctly");
 });
 
-test("the window picker marks Pi's own window when that is what it is using", () => {
+test("Pi's own window is named once, not listed again as though it were the user's", () => {
+  // It used to appear twice: as "Pi's own window" and again as "Window 720722774", which read as two
+  // different windows. It is one window, so it is one entry.
   const menu = loadWindowMenuOptions();
   const built = menu({
     ownsTargetWindow: true,
     targetWindowId: 33,
     windows: [
-      { windowId: 33, tabCount: 1, title: "(empty window)", focused: false, holdsTargetTab: true },
+      { windowId: 33, tabCount: 1, title: "AI news - Search / X", focused: false, holdsTargetTab: true, ownedByPi: true },
       { windowId: 11, tabCount: 12, title: "WhatsApp", focused: true, holdsTargetTab: false },
     ],
   });
-  // ours is marked even though a window also "holds the tab" — the recorded ownership is what decides,
-  // because that is what governs whether cleanup may close the whole window.
+  // Marked from the recorded ownership, which is what decides whether cleanup may close the window.
   assert.match(built.ownLabel, /^✓ /);
-  assert.equal(built.options[1], "  Window 33 — 1 tab — (empty window)");
+  assert.match(built.ownLabel, /Window 33 — 1 tab — AI news - Search \/ X/, "names the window it means");
+  assert.equal(built.options[1], built.newLabel, "opening another is offered only when one already exists");
   assert.equal(built.options[2], "  Window 11 — 12 tabs, focused — WhatsApp");
+  assert.equal(built.options.length, 3, "no second entry for window 33");
+  assert.equal(built.windowByLabel.size, 1, "the owned window is not selectable as one of the user's");
+  assert.equal(built.windowByLabel.get("  Window 11 — 12 tabs, focused — WhatsApp"), 11);
+});
+
+test("with no window of its own yet, the entry describes what choosing it creates", () => {
+  const menu = loadWindowMenuOptions();
+  const built = menu({
+    ownsTargetWindow: false,
+    targetWindowId: null,
+    windows: [{ windowId: 11, tabCount: 12, title: "WhatsApp", focused: true, holdsTargetTab: false }],
+  });
+  assert.match(built.ownLabel, /^ {2}/);
+  assert.match(built.ownLabel, /\(isolated, cleaned up automatically\)/);
+  // Nothing to reuse, so "open a new one" would be the same action and is not offered.
+  assert.equal(built.options.length, 2, "own window plus the one real window");
+  assert.equal(built.newLabel.startsWith("  "), true, "and it must never look selected");
 });
 
 test("the window picker never collapses two windows onto one entry, and truncates long titles", () => {

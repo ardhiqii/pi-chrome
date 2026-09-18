@@ -1600,6 +1600,9 @@ async function dispatch(action, params) {
             title: (activeTab && (activeTab.title || activeTab.url)) || "(empty window)",
             focused: win.focused === true,
             holdsTargetTab: typeof target?.tabId === "number" && tabs.some((tab) => tab.id === target.tabId),
+            // A window we created. The caller shows it on the "Pi's own window" entry rather than listing
+            // it a second time as though it were one of the user's.
+            ownedByPi: typeof target?.windowId === "number" && win.id === target.windowId,
           };
         }),
         // windowId is only recorded when WE created that window. Otherwise the tab is a guest in a
@@ -1626,9 +1629,20 @@ async function dispatch(action, params) {
         // A window of our own means a window WE created, not the one an existing "Pi Agent" group lives
         // in — otherwise picking this after picking one of the user's windows would silently put Pi back
         // in that window and leave no way to get an isolated one again.
+        //
+        // Reuse it when it is still there. Creating a new window on every selection churned the window
+        // for no reason, and the entry reads as "the window Pi uses", not "open another one"; params.fresh
+        // is the explicit way to ask for a genuinely new one.
+        if (params.fresh !== true && typeof current?.tabId === "number" && typeof current?.windowId === "number") {
+          const existingTab = await chrome.tabs.get(current.tabId).catch(() => null);
+          const existingWindow = await chrome.windows.get(current.windowId).catch(() => null);
+          if (existingTab && existingWindow) {
+            return { windowId: current.windowId, tabId: current.tabId, reused: true, fresh: false };
+          }
+        }
         const tab = await createIsolatedWindowTarget(sessionKey);
         await retireCurrent(tab.id);
-        return { windowId: tab.windowId ?? null, tabId: tab.id ?? null, reused: false };
+        return { windowId: tab.windowId ?? null, tabId: tab.id ?? null, reused: false, fresh: true };
       }
       const win = await chrome.windows.get(wanted).catch(() => null);
       if (!win) throw new Error(`No browser window with id ${wanted}.`);

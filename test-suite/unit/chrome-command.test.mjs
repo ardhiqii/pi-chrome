@@ -285,3 +285,27 @@ test("/chrome window list names the window Pi is actually a guest in", async () 
   assert.doesNotMatch(text, /window \?/);
   assert.match(text, /cleanup closes only Pi's tab/);
 });
+
+test("choosing 'Open a new window' asks for a fresh one; choosing the existing one reuses it", async () => {
+  // Reuse-by-default means the two entries must be distinguishable on the wire, or the user cannot get a
+  // genuinely new window at all.
+  const report = {
+    windows: [
+      { windowId: 33, tabCount: 1, title: "AI news", focused: false, holdsTargetTab: true, ownedByPi: true },
+      { windowId: 11, tabCount: 5, title: "Terrarium", focused: true, holdsTargetTab: false },
+    ],
+    ownsTargetWindow: true,
+    targetWindowId: 33,
+  };
+  const send = async (action) => (action === "window.list" ? report : { windowId: 33, reused: false, fresh: true });
+
+  const freshRun = harness({ send, choices: ["  Open a new window of Pi's own"] });
+  await freshRun.run("window");
+  assert.equal(freshRun.calls[1].params.windowId, null);
+  assert.equal(freshRun.calls[1].params.fresh, true, "an explicit new-window request carries fresh");
+
+  const reuseRun = harness({ send, choices: ["✓ Pi's own window (Window 33 — 1 tab — AI news)"] });
+  await reuseRun.run("window");
+  assert.equal(reuseRun.calls[1].params.windowId, null);
+  assert.equal(reuseRun.calls[1].params.fresh, undefined, "reusing the existing one must NOT ask for a fresh window");
+});
