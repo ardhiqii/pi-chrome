@@ -72,69 +72,84 @@ const PI_CHROME_VERSION = readPiChromeVersion();
 // newly started session already knows which connector to drive instead of having to be told again.
 const PI_CHROME_STATE_PATH = join(homedir(), ".pi", "agent", "pi-chrome.json");
 
-function readPreferredConnector(): string | undefined {
+// The state file as an object. Every reader goes through here so a missing, corrupt or unreadable
+// file degrades to an empty record instead of throwing; each caller validates the field it wants.
+function readPIChromeState(): Record<string, unknown> {
 	try {
-		const raw = JSON.parse(readFileSync(PI_CHROME_STATE_PATH, "utf8")) as { preferredConnector?: unknown };
-		return typeof raw.preferredConnector === "string" && raw.preferredConnector.trim()
-			? raw.preferredConnector.trim()
-			: undefined;
+		const parsed = JSON.parse(readFileSync(PI_CHROME_STATE_PATH, "utf8")) as unknown;
+		return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : {};
 	} catch {
-		return undefined;
+		return {};
 	}
 }
 
-function writePreferredConnector(value: string | undefined): void {
+// The ONE writer for the state file. A caller mutates a copy of the current record and this writes
+// the whole thing, so a new preference can never clobber its siblings (preferredConnector,
+// connectorNames, preferredWindow) no matter which order they were written in. Explicit user choices
+// are the only callers: nothing here is ever called from a poll, a resolve or any other hot path.
+// Best effort by design — an unwritable state file must never break the session that is saving — but
+// the caller learns whether it worked so it can avoid telling the user something was saved when it
+// was not. Returns true only when the file was written.
+function writePIChromeState(mutate: (state: Record<string, unknown>) => void): boolean {
 	try {
 		mkdirSync(dirname(PI_CHROME_STATE_PATH), { recursive: true });
-		let existing: Record<string, unknown> = {};
-		try {
-			const parsed = JSON.parse(readFileSync(PI_CHROME_STATE_PATH, "utf8")) as Record<string, unknown>;
-			if (parsed && typeof parsed === "object") existing = parsed;
-		} catch {
-			// No readable file yet; start a fresh one.
-		}
-		const next = { ...existing, preferredConnector: value ?? null };
+		const next = { ...readPIChromeState() };
+		mutate(next);
 		writeFileSync(PI_CHROME_STATE_PATH, `${JSON.stringify(next, null, 2)}\n`);
+		return true;
 	} catch {
-		// Best effort: an unwritable state file must never break connector selection for this session.
+		// Best effort: preferences survive in the current session even when the file cannot be saved.
+		return false;
 	}
+}
+
+function readPreferredConnector(): string | undefined {
+	const raw = readPIChromeState();
+	return typeof raw.preferredConnector === "string" && raw.preferredConnector.trim()
+		? raw.preferredConnector.trim()
+		: undefined;
+}
+
+function writePreferredConnector(value: string | undefined): boolean {
+	return writePIChromeState((state) => {
+		state.preferredConnector = value ?? null;
+	});
+}
+
+// The browser window the user chose with /chrome window. Machine-wide like preferredConnector: a
+// new session with no assignment of its own inherits it, so the choice is made once. A number or
+// nothing; the extension is the side that resolves it against the windows that actually exist.
+function readPreferredWindow(): number | undefined {
+	const value = readPIChromeState().preferredWindow;
+	return typeof value === "number" && Number.isInteger(value) ? value : undefined;
+}
+
+function writePreferredWindow(value: number | undefined): boolean {
+	return writePIChromeState((state) => {
+		state.preferredWindow = value ?? null;
+	});
 }
 
 // Connector keys are profile hashes ("edge:9d233ecf"), which tell the user nothing about WHICH of their
 // browser profiles this is — they see names like "Clover Agent" or "Work" in the browser's own profile
 // switcher. These are the names they have given each connector, so labels can use them instead.
 function readConnectorNames(): Record<string, string> {
-	try {
-		const raw = JSON.parse(readFileSync(PI_CHROME_STATE_PATH, "utf8")) as { connectorNames?: unknown };
-		const names = raw.connectorNames;
-		if (!names || typeof names !== "object") return {};
-		const out: Record<string, string> = {};
-		for (const [key, value] of Object.entries(names as Record<string, unknown>)) {
-			if (typeof value === "string" && value.trim()) out[key] = value.trim();
-		}
-		return out;
-	} catch {
-		return {};
+	const names = readPIChromeState().connectorNames;
+	if (!names || typeof names !== "object") return {};
+	const out: Record<string, string> = {};
+	for (const [key, value] of Object.entries(names as Record<string, unknown>)) {
+		if (typeof value === "string" && value.trim()) out[key] = value.trim();
 	}
+	return out;
 }
 
-function writeConnectorName(key: string, name: string | undefined): void {
-	try {
-		mkdirSync(dirname(PI_CHROME_STATE_PATH), { recursive: true });
-		let existing: Record<string, unknown> = {};
-		try {
-			const parsed = JSON.parse(readFileSync(PI_CHROME_STATE_PATH, "utf8")) as Record<string, unknown>;
-			if (parsed && typeof parsed === "object") existing = parsed;
-		} catch {
-			// No readable file yet; start a fresh one.
-		}
-		const names = { ...readConnectorNames() };
-		if (name === undefined) delete names[key];
-		else names[key] = name;
-		writeFileSync(PI_CHROME_STATE_PATH, `${JSON.stringify({ ...existing, connectorNames: names }, null, 2)}\n`);
-	} catch {
-		// Best effort, as above.
-	}
+function writeConnectorName(key: string, name: string | undefined): boolean {
+	const names = { ...readConnectorNames() };
+	if (name === undefined) delete names[key];
+	else names[key] = name;
+	return writePIChromeState((state) => {
+		state.connectorNames = names;
+	});
 }
 
 // Best-effort list of the browser profile names on this machine, so naming a connector can offer the
@@ -228,14 +243,15 @@ function windowMenuOptions(report: WindowReport): {
 	windowByLabel: Map<string, number>;
 } {
 	const ownsOwn = report.ownsTargetWindow === true;
-	// The menu lists only windows that exist right now. Pi's own window is not a choice: an entry for it could
-	// put Pi's work into the user's window, and it duplicated a window that is already listed when it exists.
-	// /chrome window own remains the explicit way to ask for a window of Pi's own.
+	// The menu lists only windows that exist right now, and only real ones: an entry for a window Pi
+	// would have to create is gone for good, because that automatic path is what kept dropping the
+	// user's tab into their own window.
 	const options: string[] = [];
 	const windowByLabel = new Map<string, number>();
 	for (const win of report.windows ?? []) {
 		if (typeof win.windowId !== "number") continue;
-		// Pi's own window is reached with /chrome window own, not from this list.
+		// A window an earlier Pi build created is never offered: Pi does not create windows any more, so
+		// the only windows worth choosing are the user's own.
 		if (win.ownedByPi === true) continue;
 		const mark = !ownsOwn && win.holdsTargetTab ? "✓ " : "  ";
 		const count = `${win.tabCount} tab${win.tabCount === 1 ? "" : "s"}`;
@@ -248,7 +264,7 @@ function windowMenuOptions(report: WindowReport): {
 	return { options, windowByLabel };
 }
 
-function describeWindows(report: WindowReport): string {
+function describeWindows(report: WindowReport, preferredWindow?: number): string {
 	const { options } = windowMenuOptions(report);
 	// targetWindowId is only set for a window Pi created, so a guest tab has none — naming the window that
 	// actually holds our tab is the whole point of this list.
@@ -261,6 +277,9 @@ function describeWindows(report: WindowReport): string {
 	// A bare "Windows open:" header with nothing under it would contradict the sentence above when the only
 	// window is Pi's own, so say plainly that there is nothing else to list.
 	const lines = [`This session is working in ${where}.`];
+	// The machine-wide default is why a brand-new session already knows where to work; showing it makes
+	// the difference between "picked once" and "picked again" visible instead of implicit.
+	if (typeof preferredWindow === "number") lines.push(`Saved default: window ${preferredWindow} — new sessions inherit it.`);
 	if (options.length > 0) lines.push("Windows open:", ...options);
 	else lines.push("No other Chrome windows are open right now.");
 	return lines.join("\n");
@@ -1419,6 +1438,16 @@ export default function (pi: ExtensionAPI): void {
 		return typeof id === "string" && id ? `session:${id}` : undefined;
 	};
 
+	// The machine-wide window default, read from disk when each command is built rather than cached.
+	// The file is the source of truth (the connector preference works the same way): a window chosen
+	// in another session applies to this one's next command, with no /reload and no stale copy. The
+	// extension uses it only when the session has no assignment of its own, and refuses — naming
+	// /chrome window — when neither exists; it never creates or guesses a window on the strength of it.
+	const preferredWindowParams = (): Record<string, unknown> => {
+		const preferred = readPreferredWindow();
+		return preferred === undefined ? {} : { preferredWindow: preferred };
+	};
+
 	const updateChromeStatus = (ctx: ExtensionContext): void => {
 		if (chromeControlAuthorized()) {
 			ctx.ui.setStatus("chrome", ctx.ui.theme.fg("success", "●") + " Chrome Bridge" + authCountdownLabel());
@@ -1467,9 +1496,9 @@ export default function (pi: ExtensionAPI): void {
 		if (action === "tab.activate" && background) {
 			throw new Error("Tab activation is blocked by background mode. Ask the user to run /chrome background off to allow foreground work.");
 		}
-		// Scope every action to this session's dedicated automation target and tab group.
+		// Scope every action to this session's dedicated automation tab and tab group.
 		const sessionKey = sessionKeyFor(sessionCtx);
-		let wireParams: Record<string, unknown> = { ...params, background, foreground: !background };
+		let wireParams: Record<string, unknown> = { ...params, background, foreground: !background, ...preferredWindowParams() };
 		if (sessionKey !== undefined && params.sessionKey === undefined) wireParams.sessionKey = sessionKey;
 		const sessionTitle = sessionCtx !== undefined ? sessionGroupTitle(sessionCtx) : undefined;
 		// Any tab Pi opens through tab.new/tab.group must use THIS session's group, even if a caller
@@ -1610,7 +1639,7 @@ Usage rules:
 			if (extensionAlive && !versionMismatch) {
 				// Sanity-check that pi-chrome can actually run code in the active tab.
 				try {
-					const value = await bridge.send("page.evaluate", { expression: "1+1", awaitPromise: true, foreground: false }, 10_000);
+					const value = await bridge.send("page.evaluate", { ...preferredWindowParams(), expression: "1+1", awaitPromise: true, foreground: false }, 10_000);
 					if (value === 2) lines.push(`✓ pi-chrome can run code in the active Chrome tab.`);
 					else lines.push(`⚠ pi-chrome ran code in the active tab but got an unexpected result (${JSON.stringify(value)}). The current tab may be locked-down (a Chrome internal page or a strict site).`);
 				} catch (error) {
@@ -1619,7 +1648,7 @@ Usage rules:
 
 				// Surface obvious site-side automation flags so the user knows why a site might block pi.
 				try {
-					const probe = (await bridge.send("page.probe", { foreground: false }, 10_000)) as Record<string, unknown>;
+					const probe = (await bridge.send("page.probe", { ...preferredWindowParams(), foreground: false }, 10_000)) as Record<string, unknown>;
 					if (probe && probe.arithmetic === 2) lines.push(`✓ The active tab is ${hostnameOf(String(probe.location))} and accepts pi-chrome's commands.`);
 					if (probe && probe.webdriver) lines.push(`⚠ Your Chrome is reporting itself as automated to websites. Some sites use this signal to block sign-ins or bot checks.`);
 				} catch (error) {
@@ -1870,18 +1899,18 @@ Usage rules:
 		return key === undefined ? {} : { sessionKey: key };
 	};
 
-	// Where Pi's tabs and default-targeted actions live. By default each session gets a window of its own,
-	// so nothing lands among the user's tabs unnoticed. Choosing an existing window instead puts Pi's tab
-	// there — created inactive, and the window is never focused — for when the work should happen where the
-	// user can see it.
+	// Where Pi's tabs and default-targeted actions live. The user picks one of their existing windows with
+	// /chrome window; that choice is saved machine-wide (preferredWindow) and every later session inherits
+	// it. Pi's tab goes in there — created inactive, and the window is never focused. Pi never creates a
+	// window of its own, so a picker with nothing to offer just says so.
 	const openWindowMenu = async (ctx: ExtensionContext): Promise<void> => {
 		const report = (await bridge.send("window.list", windowParams(ctx), 15_000)) as WindowReport;
 		const { options, windowByLabel } = windowMenuOptions(report);
 		if (options.length === 0) {
-			// A zero-item select is a dead end in the TUI: Enter does nothing and only Esc exits. Pi's own window
-			// is deliberately not offered here, so when it is the only one open, point at what still works.
+			// A zero-item select is a dead end in the TUI: Enter does nothing and only Esc exits. Pi will not
+			// create a window to fill the list, so the user has to open one.
 			ctx.ui.notify(
-				"No Chrome windows are open to choose from. Open a window in Chrome and run /chrome window again — or run /chrome window own to use a window of Pi's own.",
+				"No Chrome windows are open to choose from. Open a window in Chrome and run /chrome window again.",
 				"info",
 			);
 			return;
@@ -1895,8 +1924,14 @@ Usage rules:
 			{ ...windowParams(ctx), windowId },
 			20_000,
 		)) as { windowId?: number | null; reused?: boolean };
+		// The pick is machine-wide state, not a per-session detail: save it so a new session inherits it
+		// instead of starting with nothing and falling back to the automatic choice this feature removed.
+		const chosenWindowId = typeof result.windowId === "number" ? result.windowId : windowId;
+		const saved = writePreferredWindow(chosenWindowId);
 		ctx.ui.notify(
-			`Pi will work in window ${result.windowId ?? windowId}${result.reused ? " (already there)" : ""}.`,
+			saved
+				? `Pi will work in window ${chosenWindowId}${result.reused ? " (already there)" : ""} — saved, so new sessions use it too.`
+				: `Pi will work in window ${chosenWindowId}${result.reused ? " (already there)" : ""} for this session, but the choice could not be saved for future sessions.`,
 			"info",
 		);
 	};
@@ -1905,14 +1940,17 @@ Usage rules:
 		const arg = args.trim().toLowerCase();
 		try {
 			if (arg === "list" || arg === "status") {
-				ctx.ui.notify(describeWindows((await bridge.send("window.list", windowParams(ctx), 15_000)) as WindowReport), "info");
+				ctx.ui.notify(describeWindows((await bridge.send("window.list", windowParams(ctx), 15_000)) as WindowReport, readPreferredWindow()), "info");
 				return;
 			}
 			if (arg === "own" || arg === "auto") {
-				const result = (await bridge.send("window.select", { ...windowParams(ctx), windowId: null }, 20_000)) as {
-					windowId?: number | null;
-				};
-				ctx.ui.notify(`Pi will use a window of its own${result.windowId ? ` (window ${result.windowId})` : ""}.`, "info");
+				// Automatic window creation is gone: that path is what kept creating a window Pi could not keep
+				// and then dropping the user's tab into their own window. Point at the picker instead of sending
+				// a null windowId the extension now refuses.
+				ctx.ui.notify(
+					"pi-chrome no longer creates a window of its own. Run /chrome window to pick one of your open windows; the choice is saved for future sessions.",
+					"info",
+				);
 				return;
 			}
 			await openWindowMenu(ctx);
@@ -1949,7 +1987,7 @@ Usage rules:
 
 	pi.registerCommand("chrome", {
 		description:
-			"All pi-chrome controls in one place.\n  /chrome authorize [15m|30m|<minutes>|indefinite] — allow this Pi session to use chrome_* tools.\n  /chrome revoke   — lock Chrome control.\n  /chrome doctor   — full health check plus authorization and background state.\n  /chrome onboard  — install the Chrome companion extension.\n  /chrome background [on|off|status|toggle] — enforce no explicit focus/tab activation, or allow foreground/watch mode.\n  /chrome connector [list|<key>|auto] — choose which installed connector (browser + profile) receives commands.\n  /chrome window [list|own] — choose which browser window Pi works in.\nRun with no arguments for an interactive picker that shows current state.",
+			"All pi-chrome controls in one place.\n  /chrome authorize [15m|30m|<minutes>|indefinite] — allow this Pi session to use chrome_* tools.\n  /chrome revoke   — lock Chrome control.\n  /chrome doctor   — full health check plus authorization and background state.\n  /chrome onboard  — install the Chrome companion extension.\n  /chrome background [on|off|status|toggle] — enforce no explicit focus/tab activation, or allow foreground/watch mode.\n  /chrome connector [list|<key>|auto] — choose which installed connector (browser + profile) receives commands.\n  /chrome window [list] — choose which browser window Pi works in (saved for future sessions).\nRun with no arguments for an interactive picker that shows current state.",
 		getArgumentCompletions: (prefix) => {
 			const raw = prefix;
 			const trimmedRight = raw.replace(/\s+$/, "");
@@ -1995,7 +2033,6 @@ Usage rules:
 			} else if (path[0] === "window" && path.length === 1) {
 				candidates = [
 					{ fullValue: "window list", label: "list", description: "Show the open browser windows and where Pi is working." },
-					{ fullValue: "window own", label: "own", description: "Use a window of Pi's own again (the default)." },
 				];
 			}
 			if (candidates.length === 0) return null;

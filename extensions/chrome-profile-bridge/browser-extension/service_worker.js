@@ -23,8 +23,8 @@ const PI_GROUP_NAME = "Pi Agent";
 // Initial URL of every automation target. The fragment is a marker, not content: a Pi-created blank
 // tab stays distinguishable from a blank tab the user opened (tab lists show the marker), while a
 // `urlIncludes: "about:blank"` hint still matches both and is settled by recorded identity, not by
-// whichever match Chrome lists first. The marker is also discovery evidence after an extension
-// reload (which clears chrome.storage.session): see `findDedicatedPiWindow`.
+// whichever match Chrome lists first. The marker is also legacy ownership evidence: `window.list`
+// recognizes windows Pi created in an earlier build so the picker never offers them.
 const PI_CHROME_MARKER = "#pi-chrome";
 const BLANK_AUTOMATION_URL = `about:blank${PI_CHROME_MARKER}`;
 const VALID_GROUP_COLORS = new Set(["grey", "blue", "red", "yellow", "green", "pink", "purple", "cyan", "orange"]);
@@ -75,37 +75,37 @@ let lastAbortWarnAt = 0;
 
 // =================== pi-chrome automation target ownership ===================
 // pi-chrome must never hijack the user's active tab. When a page/navigation action runs without
-// an explicit target (targetId/urlIncludes/titleIncludes), we route it to a dedicated automation
-// target that pi-chrome created and owns. We prefer a separate Chrome window so the user's
-// windows are left untouched; if the windows API is unavailable we fall back to a dedicated tab.
+// an explicit target (targetId/urlIncludes/titleIncludes), we route it to an automation tab inside
+// the window the user picked with /chrome window. Pi never creates a window, never uses the focused
+// window, and never puts a tab in a window the user did not choose: with no saved choice and no
+// per-session assignment, the action fails with a message naming /chrome window.
 //
 // Ownership is SESSION-SCOPED, keyed by the calling Pi session's `sessionKey` (forwarded on the
 // wire). One Chrome extension / service worker brokers commands for *all* Pi sessions (see the
-// client/server bridge in index.ts). There is ONE dedicated Pi window per browser: the first
-// session that needs a target creates it (marked), and every later session ADOPTS that window and
-// gets its own tab there — one shared window must not mean one shared tab. The per-session map
-// lets cleanup close exactly that session's tab — never another session's, never a user's, and
-// never the shared window while another session still works in it.
+// client/server bridge in index.ts). The machine-wide default the user picks with /chrome window is
+// inherited by every session that has no assignment of its own, so a new session does not have to
+// choose again. The per-session map lets cleanup close exactly that session's tab — never another
+// session's, never a user's, and never the chosen window itself.
 //
 // State is mirrored to chrome.storage.session so a service-worker restart (MV3 can suspend the
-// worker at any time) re-hydrates ownership instead of orphaning the window it already created.
-// storage.session is cleared on browser restart; any window restored by Chrome's session-restore
-// is then untracked and simply left alone (we only ever close ids we still recognize as ours).
+// worker at any time) re-hydrates ownership instead of orphaning the tab it already created.
+// storage.session is cleared on browser restart; any tab restored by Chrome's session-restore is
+// then untracked and simply left alone (we only ever close ids we still recognize as ours).
 //
 // A record's `windowId` is the session's WORKSPACE — the single source of truth for where Pi works —
-// and `piWindow` says who created it: true for a window Pi made (cleanup may close it once empty),
-// false for one of the user's that the session was pointed at (cleanup closes only Pi's tab). The
+// and `piWindow` says who created it: true for a window an earlier Pi build made, false for one of
+// the user's that the session was pointed at (cleanup closes only Pi's tab in either case). The
 // window id is kept even after the recorded tab is gone, so a replacement target is rebuilt in the
 // same window, or the action fails naming it ("the chosen window was closed") instead of silently
 // using a different one. Group titles, urls and query order are hints; they never decide the
 // workspace.
 const automationTargets = new Map(); // sessionKey -> { tabId?: number, windowId?: number, piWindow?: boolean }
-// Window ids `chrome.windows.create` made for Pi, independent of any session record. The per-session
-// target map alone is not ownership evidence: a session that INHERITS a Pi window need not record an id
-// of its own, and the creating session can be cleaned up or retargeted while the window lives on. Keying
-// ownership off those records made Pi refuse a live Pi-owned window (then churn a new one, or throw when
-// creation was refused). Mirrored to storage.session like the target map, and also re-derived from
-// numeric windowIds in the target map (those were only ever written after a successful windows.create).
+// Window ids `chrome.windows.create` made for Pi in an earlier build, independent of any session
+// record. Kept so `window.list` still recognizes legacy Pi windows and the picker never offers one.
+// New builds never add to this set: there is no window-creation path left. Mirrored to
+// storage.session like the target map. The set was originally the live-bug fix for "one dedicated Pi
+// window for the whole machine": the per-session map alone was not ownership evidence because a
+// session that INHERITS a Pi window need not record an id of its own.
 const piCreatedWindowIds = new Set();
 const DEFAULT_SESSION_KEY = "__default__";
 const AUTOMATION_STORAGE_KEY = "piChromeAutomationTargets";
@@ -249,15 +249,7 @@ async function persistAutomationTargets() {
   }
 }
 
-async function persistPiCreatedWindows() {
-  try {
-    await chrome.storage?.session?.set?.({ [PI_WINDOWS_STORAGE_KEY]: [...piCreatedWindowIds] });
-  } catch {
-    // Ignore: persistence is an optimization, not a correctness requirement.
-  }
-}
-
-// True when `windowId` names a window `chrome.windows.create` created for Pi. Deliberately independent
+// True when `windowId` names a window `chrome.windows.create` created for Pi by an earlier build. Deliberately independent
 // of the per-session target map: a session that only inherits a Pi window, or the creating session
 // itself once it is cleaned up or retargeted, must not make a live Pi window unrecognizable.
 function isPiOwnedWindow(windowId) {
@@ -277,126 +269,86 @@ function isPiChromeOwnedTarget(tabId, sessionKey) {
   return false;
 }
 
-// Create the automation target in a window of our OWN, for when the browser has no dedicated Pi
-// window yet (or the caller explicitly asked for a fresh one): a window we created, and therefore one
-// cleanup may close. Discovery (`findDedicatedPiWindow`) runs first, so this never lands in a window
-// among the user's own tabs just because a leftover "Pi Agent" group lives there.
-async function createIsolatedWindowTarget(sessionKey, { allowSharedTabFallback = false } = {}) {
-  if (chrome.windows && typeof chrome.windows.create === "function") {
-    try {
-      const win = await chrome.windows.create({ url: BLANK_AUTOMATION_URL, focused: false });
-      const created = win && Array.isArray(win.tabs) ? win.tabs[0] : undefined;
-      if (created && typeof created.id === "number") {
-        if (typeof win.id === "number") piCreatedWindowIds.add(win.id);
-        // The window id is authoritative; the returned tab's windowId is not guaranteed. Edge has been
-        // observed to answer windows.create with a Window whose `tabs` entries omit it, and a caller
-        // gating on `target.windowId` (tab.new) then created its tab with no window — the focused one,
-        // the user's. Fill it in from the window we just made.
-        const windowId = typeof created.windowId === "number" ? created.windowId : win.id;
-        automationTargets.set(sessionKey, { windowId, tabId: created.id, piWindow: true });
-        await persistAutomationTargets();
-        await persistPiCreatedWindows();
-        return typeof windowId === "number" ? { ...created, windowId } : created;
-      }
-      // Chrome answered with a window but no usable first tab. Leaving it behind would strand an
-      // untracked, unowned window; close it before deciding on the fallback below.
-      if (win && typeof win.id === "number" && typeof chrome.windows.remove === "function") {
-        await chrome.windows.remove(win.id).catch(() => {});
-      }
-    } catch {
-      // Window creation can fail (policy, headless, etc.); fall back to a dedicated tab below.
-    }
-  }
-  // A dedicated tab in a pre-existing (user/shared) window we did NOT create. windowId is left unset so
-  // cleanup closes only our tab, never the user's window. This is OPT-IN ONLY: the tab carries no
-  // windowId, so Chrome puts it in the FOCUSED window — the user's — which is exactly what "Pi must stay
-  // out of my browser" forbids. Every implicit path (the first page.* action, tab.new, a window of Pi's
-  // own) refuses and throws below instead; only a caller that explicitly passes allowSharedTabFallback
-  // may reach the tab create. An error the user can act on beats doing the opposite of what they chose.
-  if (!allowSharedTabFallback) {
-    throw new Error(
-      "Chrome refused to open a window for Pi, and pi-chrome will not put its tab in one of yours uninvited. " +
-        "Run /chrome window to choose one of your windows, or close a window and retry.",
-    );
-  }
-  const tab = await chrome.tabs.create({ url: BLANK_AUTOMATION_URL, active: false });
-  automationTargets.set(sessionKey, { windowId: undefined, tabId: typeof tab.id === "number" ? tab.id : undefined, piWindow: false });
-  await persistAutomationTargets();
-  return tab;
-}
-
-// Create a fresh automation target for `sessionKey` IN THE WINDOW THE SESSION'S RECORD NAMES — the
-// setting is the single source of truth for where Pi works. A recorded Pi window is reused even when
-// its tab is gone; a recorded user window (chosen via /chrome window) gets a fresh guest tab. If that
-// user window is gone this FAILS naming /chrome window: silently picking another window would do the
-// opposite of what the user chose. A session with no recorded window ADOPTS the browser's existing
-// dedicated Pi window (see `findDedicatedPiWindow`), so one window serves every session on the
-// machine; only when none exists does it create one.
+// Build the automation target for `sessionKey` in the window the session is allowed to work in.
+// The user picks a window once with /chrome window; that choice is saved machine-wide as
+// `preferredWindow` and inherited here by every session that has no assignment of its own. The
+// per-session record wins when it exists (an explicit pick inside this session), then the saved
+// default, and nothing else: pi-chrome NEVER creates a window, NEVER falls back to the focused
+// window, and NEVER moves into one of the user's uninvited. When neither source names a live
+// window, this fails with an actionable error naming /chrome window instead of guessing.
 //
-// The group title is NOT evidence and no longer decides the window: in this fork the session group
-// title is always the generic "Pi Agent" (index.ts `sessionGroupTitle`), so matching it across every
-// window let a leftover group in a window the user owns capture a target recreated after an extension
-// reload (the target lives in chrome.storage.session, which an extension reload clears). Groups are
-// chosen later, scoped to the target's own window, by groupTab.
-//
-// Window creation is STRICT by default: when no window of Pi's own can be created, this fails with an
-// actionable error instead of falling back to a tab in a window Chrome picks (the focused one, i.e.
-// usually the user's). The shared-tab fallback requires an explicit call-site opt-in.
-async function createAutomationTarget(sessionKey, groupTitle, { allowSharedTabFallback = false } = {}) {
+// The group title is NOT evidence and does not decide the window: in this fork the session group
+// title is always the generic "Pi Agent" (index.ts `sessionGroupTitle`), so matching it across
+// every window let a leftover group in a window the user owns capture a target recreated after an
+// extension reload (the target lives in chrome.storage.session, which an extension reload clears).
+// Groups are chosen later, scoped to the target's own window, by groupTab.
+async function createAutomationTarget(sessionKey, groupTitle, { preferredWindow } = {}) {
   // Hydrate here rather than relying on callers: the workspace is decided from hydrated state, and a
-  // direct caller with a cold map would silently churn a new window instead of reusing the recorded one.
+  // direct caller with a cold map would mistake a persisted assignment for "no assignment".
   await hydrateAutomationTargets();
   const record = automationTargets.get(sessionKey);
-  const settingWindowId = record && typeof record.windowId === "number" ? record.windowId : null;
-  if (settingWindowId !== null) {
-    const piWindow = record.piWindow === true || isPiOwnedWindow(settingWindowId);
+  const recordedWindowId = record && typeof record.windowId === "number" ? record.windowId : null;
+  if (recordedWindowId !== null) {
+    const piWindow = record.piWindow === true || isPiOwnedWindow(recordedWindowId);
     // A recorded Pi window whose own tab is gone may still hold an unowned marker from a wiped
     // record; adopt it instead of adding yet another marker to the shared window.
     if (piWindow) {
-      const reusable = await findReusableOrphanAutomationTab(settingWindowId);
+      const reusable = await findReusableOrphanAutomationTab(recordedWindowId);
       if (reusable) {
-        automationTargets.set(sessionKey, { windowId: settingWindowId, tabId: reusable.id, piWindow: true });
+        automationTargets.set(sessionKey, { windowId: recordedWindowId, tabId: reusable.id, piWindow: true });
         await persistAutomationTargets();
         return reusable;
       }
     }
     // Creating the tab is also the existence check: Chrome rejects a windowId whose window is gone.
-    const created = await chrome.tabs.create({ url: BLANK_AUTOMATION_URL, active: false, windowId: settingWindowId }).catch((error) => error);
+    const created = await chrome.tabs.create({ url: BLANK_AUTOMATION_URL, active: false, windowId: recordedWindowId }).catch((error) => error);
     if (created && typeof created.id === "number") {
-      automationTargets.set(sessionKey, { windowId: settingWindowId, tabId: created.id, piWindow });
+      automationTargets.set(sessionKey, { windowId: recordedWindowId, tabId: created.id, piWindow });
       await persistAutomationTargets();
       return created;
     }
-    if (!piWindow) {
+    // The window this session was told to use is gone. Never repair that by creating a window or
+    // picking another one: the user has to choose, because a silent replacement is exactly how Pi
+    // ended up working somewhere they did not choose.
+    throw new Error(
+      `The browser window ${recordedWindowId} this Pi session was told to use is gone (${String(created?.message || created)}). ` +
+        `Run /chrome window to choose a window, then retry. pi-chrome will not silently pick a different ` +
+        `window, create one, or fall back to the focused window.`,
+    );
+  }
+  // No per-session assignment. The only source that may decide the workspace now is the machine-wide
+  // default the user saved with /chrome window. Absent or unusable, this refuses: creating a window
+  // here is the exact behaviour this feature removed.
+  if (typeof preferredWindow !== "number" || !Number.isInteger(preferredWindow)) {
+    throw new Error(
+      "No browser window has been chosen for Pi yet. Run /chrome window to pick one of your open " +
+        "browser windows (the choice is saved for future sessions). pi-chrome will not create a window, " +
+        "use the focused window, or put a tab in a window you did not choose.",
+    );
+  }
+  // Check the saved window while the API is available, so a stale default fails with a message that
+  // names the fix instead of a raw Chrome error from tabs.create. Where windows.get is unavailable, the
+  // explicit-window tabs.create below is still the existence check. Either way the tab carries an
+  // explicit windowId, so there is no path where Chrome picks the focused window for us.
+  if (chrome.windows && typeof chrome.windows.get === "function") {
+    const savedWindow = await chrome.windows.get(preferredWindow).catch(() => null);
+    if (!savedWindow) {
       throw new Error(
-        `The browser window ${settingWindowId} this Pi session was told to use is gone (${String(created?.message || created)}). ` +
-        `pi-chrome will not silently put its tab in a different window — run /chrome window to choose a window, or a window of Pi's own, then retry.`,
+        `The saved browser window ${preferredWindow} is no longer open. Run /chrome window to choose ` +
+          `another one. pi-chrome will not silently use a different window, create one, or fall back to the focused window.`,
       );
     }
-    // Pi's own window is gone; drop the dead setting and build a fresh isolated one below.
-    automationTargets.delete(sessionKey);
-    await persistAutomationTargets();
   }
-  const dedicatedWindowId = await findDedicatedPiWindow();
-  if (dedicatedWindowId !== null) {
-    // The shared window may already hold an unowned automation marker (an extension reload wipes the
-    // session records but not the tabs). Adopt it so one marker serves the window instead of one per
-    // session that ever ran. A marker a live record names is owned and skipped by the helper.
-    const reusable = await findReusableOrphanAutomationTab(dedicatedWindowId);
-    if (reusable) {
-      automationTargets.set(sessionKey, { windowId: dedicatedWindowId, tabId: reusable.id, piWindow: true });
-      await persistAutomationTargets();
-      return reusable;
-    }
-    const created = await chrome.tabs.create({ url: BLANK_AUTOMATION_URL, active: false, windowId: dedicatedWindowId }).catch(() => null);
-    if (created && typeof created.id === "number") {
-      automationTargets.set(sessionKey, { windowId: dedicatedWindowId, tabId: created.id, piWindow: true });
-      await persistAutomationTargets();
-      return created;
-    }
-    // The window exists but Chrome refused the tab; fall through to a fresh window.
+  const created = await chrome.tabs.create({ url: BLANK_AUTOMATION_URL, active: false, windowId: preferredWindow }).catch((error) => error);
+  if (!created || typeof created.id !== "number") {
+    throw new Error(
+      `Chrome refused to open Pi's tab in window ${preferredWindow} (${String(created?.message || created)}). ` +
+        `Run /chrome window to choose a window, then retry.`,
+    );
   }
-  return createIsolatedWindowTarget(sessionKey, { allowSharedTabFallback });
+  automationTargets.set(sessionKey, { windowId: preferredWindow, tabId: created.id, piWindow: isPiOwnedWindow(preferredWindow) });
+  await persistAutomationTargets();
+  return created;
 }
 
 // True when a tab carries Pi's creation marker. Every automation target starts at
@@ -406,20 +358,18 @@ function isPiMarkerTab(tab) {
   return Boolean(tab) && typeof tab.url === "string" && tab.url.includes(PI_CHROME_MARKER);
 }
 
-// The candidate set for "this is Pi's dedicated window", from an already-fetched browser snapshot.
-// A window qualifies when either of these holds:
-//   - `chrome.windows.create` made it for Pi and the registry still remembers it (same browser
-//     session; storage.session outlives service-worker restarts); the registry is authority by
-//     construction, so even a user tab later dragged into that window does not revoke it;
+// The candidate set for "a window an earlier Pi build created", from an already-fetched browser
+// snapshot. Used only for reporting (`window.list`) so the picker never offers one: new builds never
+// create windows. A window qualifies when either of these holds:
+//   - `chrome.windows.create` made it for Pi in an earlier build and the registry still remembers it
+//     (same browser session; storage.session outlives service-worker restarts); the registry is
+//     authority by construction, so even a user tab later dragged into that window does not revoke it;
 //   - EVERY tab in it is a Pi tab — a #pi-chrome marker tab or a member of a "Pi Agent" group —
 //     and at least one piece of Pi evidence lives in it (a marker tab or a "Pi Agent" group),
 //     covering a Pi window whose automation tab has navigated away.
 // The all-Pi-tabs condition is what keeps a user's window out no matter how much Pi debris
 // (leftover marker tabs or "Pi Agent" groups) it holds: a dedicated window has no non-Pi tabs.
-// Accepting a window because it merely CONTAINED a marker tab was the live bug — a user window with
-// one leftover marker among their own tabs was adopted, and tab.new opened another Pi tab and group
-// there.
-// Split out from `findDedicatedPiWindow` so `window.list` reports the same evidence it acts on.
+// Shared with `window.list` so the report states the same evidence it acts on.
 function dedicatedPiWindowIds(windows, groups) {
   const ids = new Set();
   for (const id of piCreatedWindowIds) if (typeof id === "number") ids.add(id);
@@ -444,25 +394,6 @@ function dedicatedPiWindowIds(windows, groups) {
     if (tabs.some(isPiMarkerTab) || piGroupWindowIds.has(win.id)) ids.add(win.id);
   }
   return ids;
-}
-
-// The ONE lookup that decides which existing window is Pi's dedicated window for the whole browser.
-// Every session that has no recorded workspace asks this first, so one window is created on a machine
-// and every later session adopts it instead of opening another. Deterministic (never query order):
-// the lowest live window id wins, and every other candidate is left exactly as it is (never closed).
-async function findDedicatedPiWindow() {
-  await hydrateAutomationTargets();
-  if (!chrome.windows || typeof chrome.windows.getAll !== "function") return null;
-  const windows = await chrome.windows.getAll({ populate: true }).catch(() => []);
-  // Discovery only READS groups; grouping itself stays window-scoped (findGroupByTitle), because
-  // joining a group from another window would move the tab.
-  const groups = chrome.tabGroups && typeof chrome.tabGroups.query === "function"
-    ? await chrome.tabGroups.query({}).catch(() => [])
-    : [];
-  const liveWindowIds = new Set(windows.filter((win) => win && typeof win.id === "number").map((win) => win.id));
-  const candidates = [...dedicatedPiWindowIds(windows, groups)].filter((id) => liveWindowIds.has(id));
-  if (!candidates.length) return null;
-  return candidates.sort((a, b) => a - b)[0];
 }
 
 // An #pi-chrome marker tab that no session record names is an orphan: what an extension reload (which
@@ -553,12 +484,12 @@ async function withResolvedWindowId(tab) {
   return live && typeof live.windowId === "number" ? { ...tab, windowId: live.windowId } : tab;
 }
 
-// Return the session's dedicated automation target, creating it on first use (or after the user
-// closed it). Used by page/navigation actions that need a live surface to drive. Creation is strict by
-// default: an implicit action must never end up in a window Chrome picks for us (see
-// createAutomationTarget).
-async function getOrCreateAutomationTarget(sessionKey, groupTitle, { allowSharedTabFallback = false } = {}) {
-  const target = (await resolveOwnedAutomationTarget(sessionKey)) || await createAutomationTarget(sessionKey, groupTitle, { allowSharedTabFallback });
+// Return the session's automation target, creating it on first use (or after the user closed it).
+// Used by page/navigation actions that need a live surface to drive. The target is built only in the
+// session's recorded window or the machine-wide default; an implicit action never ends up in a window
+// Chrome picks for us (see createAutomationTarget).
+async function getOrCreateAutomationTarget(sessionKey, groupTitle, { preferredWindow } = {}) {
+  const target = (await resolveOwnedAutomationTarget(sessionKey)) || await createAutomationTarget(sessionKey, groupTitle, { preferredWindow });
   return withResolvedWindowId(target);
 }
 
@@ -1702,12 +1633,13 @@ async function dispatch(action, params) {
       // tab best-effort before surfacing the error so tab.new never leaves an ungrouped Pi tab.
       const groupTitle = params.groupTitle || PI_GROUP_NAME;
       const createParams = { url: params.url || "about:blank", active: foregroundRequested(params) };
-      // Put the tab in the window THIS session works in — the one the user chose, or Pi's own — rather
-      // than in whichever window happens to hold a "Pi Agent" group. That lookup matched by title across
-      // every window, so a leftover group sitting in the user's window sent Pi's tabs there uninvited.
-      // This CREATES the session's automation window if it does not exist yet, which is the point: the
-      // first tab Pi opens must not land among the user's.
-      const targetTab = await getOrCreateAutomationTarget(sessionKeyOf(params), params.groupTitle);
+      // Put the tab in the window THIS session works in — the window the user picked (or a legacy
+      // Pi-window assignment) — rather than in whichever window happens to hold a "Pi Agent" group.
+      // That lookup matched by title across every window, so a leftover group sitting in the user's
+      // window sent Pi's tabs there uninvited. Resolving the target can create Pi's guest tab inside
+      // the chosen window, but it never creates a window: with no assignment and no saved default it
+      // fails with a message naming /chrome window.
+      const targetTab = await getOrCreateAutomationTarget(sessionKeyOf(params), params.groupTitle, { preferredWindow: params.preferredWindow });
       // A tab must never be created without a window: chrome.tabs.create defaults to the FOCUSED window
       // — the user's — and that is exactly how the live Edge run left tab.new's tab and its new group
       // among the user's tabs while the automation marker sat in Pi's window. The helper resolves the
@@ -1933,7 +1865,7 @@ async function dispatch(action, params) {
     case "window.select": {
       const wanted = params.windowId;
       if (wanted !== null && !Number.isInteger(wanted)) {
-        throw new Error('window.select needs "windowId" as an integer, or null for a window of our own.');
+        throw new Error('window.select needs "windowId" as an integer. A window of Pi\'s own is no longer offered: run /chrome window to pick an existing window.');
       }
       const sessionKey = sessionKeyOf(params);
       const groupTitle = params.groupTitle || PI_GROUP_NAME;
@@ -1945,45 +1877,14 @@ async function dispatch(action, params) {
         }
       };
       if (wanted === null) {
-        // A window of our own means a DEDICATED Pi window — one Pi created, one marked #pi-chrome, or
-        // one whose tabs are all Pi-group tabs — never a window among the user's own tabs. Otherwise
-        // picking this after picking one of the user's windows would silently put Pi back in that
-        // window and leave no way to get an isolated one again.
-        //
-        // Reuse it when it is still there. Creating a new window on every selection churned the window
-        // for no reason, and the entry reads as "the window Pi uses", not "open another one"; params.fresh
-        // is the explicit way to ask for a genuinely new one.
-        if (params.fresh !== true && typeof current?.tabId === "number") {
-          const existingTab = await chrome.tabs.get(current.tabId).catch(() => null);
-          // An inherited Pi window records no windowId of its own; the tab's window is the fallback. It
-          // only counts as "ours" when the registry recognizes it, and the tab must actually be there —
-          // a tab the user dragged into their own window must not be reported as Pi's own window.
-          const ownedWindowId = typeof current.windowId === "number" ? current.windowId : existingTab?.windowId;
-          const existingWindow = typeof ownedWindowId === "number" && typeof chrome.windows?.get === "function"
-            ? await chrome.windows.get(ownedWindowId).catch(() => null)
-            : null;
-          if (existingTab && existingWindow && existingTab.windowId === ownedWindowId && (current.piWindow === true || isPiOwnedWindow(ownedWindowId))) {
-            return { windowId: ownedWindowId, tabId: current.tabId, reused: true, fresh: false };
-          }
-        }
-        // No live tab of our own: adopt the browser's dedicated Pi window if one exists, so "Pi's own
-        // window" does not churn a second one on a machine that already has its single Pi window.
-        if (params.fresh !== true) {
-          const dedicatedWindowId = await findDedicatedPiWindow();
-          if (dedicatedWindowId !== null) {
-            const adopted = await chrome.tabs.create({ url: BLANK_AUTOMATION_URL, active: false, windowId: dedicatedWindowId }).catch(() => null);
-            if (adopted && typeof adopted.id === "number") {
-              automationTargets.set(sessionKey, { windowId: dedicatedWindowId, tabId: adopted.id, piWindow: true });
-              await persistAutomationTargets();
-              await retireCurrent(adopted.id);
-              await groupTab(adopted, groupTitle, params.groupColor).catch(() => {});
-              return { windowId: adopted.windowId ?? null, tabId: adopted.id ?? null, reused: false, fresh: false };
-            }
-          }
-        }
-        const tab = await createIsolatedWindowTarget(sessionKey, { allowSharedTabFallback: false });
-        await retireCurrent(tab.id);
-        return { windowId: tab.windowId ?? null, tabId: tab.id ?? null, reused: false, fresh: true };
+        // "A window of Pi's own" is gone, deliberately: automatic window creation was removed
+        // because it kept creating a window Pi could not keep and then dropping the user's tab into
+        // their own window. A window can only be used if it already exists AND the user picked it, so
+        // there is nothing left for null to mean. Refuse with the fix instead of creating anything.
+        throw new Error(
+          "pi-chrome no longer creates a window of its own. Run /chrome window to pick one of your " +
+            "open browser windows; that choice is saved for future sessions.",
+        );
       }
       const win = await chrome.windows.get(wanted).catch(() => null);
       if (!win) throw new Error(`No browser window with id ${wanted}.`);
@@ -2108,7 +2009,7 @@ async function getTabByParams(params, { createOwnedTarget = true } = {}) {
     // existing tab pass targetId/urlIncludes/titleIncludes above.
     const sessionKey = sessionKeyOf(params);
     tab = createOwnedTarget
-      ? await getOrCreateAutomationTarget(sessionKey, params.sessionGroupTitle)
+      ? await getOrCreateAutomationTarget(sessionKey, params.sessionGroupTitle, { preferredWindow: params.preferredWindow })
       : await resolveOwnedAutomationTarget(sessionKey);
     if (!tab) {
       throw new Error(

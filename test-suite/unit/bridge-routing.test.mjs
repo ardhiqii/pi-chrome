@@ -15,6 +15,8 @@
 // ~/.pi/agent/pi-chrome.json, and a test must never touch the user's actual preference file.
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import vm from "node:vm";
 import { stripTypeScriptTypes } from "node:module";
 import { test } from "node:test";
@@ -748,4 +750,92 @@ test("the window picker offers exactly the real windows — and nothing when the
   const none = menu({ ownsTargetWindow: true, targetWindowId: null, windows: [] });
   assert.deepEqual([...none.options], []);
   assert.equal(none.windowByLabel.size, 0);
+});
+
+// ---- The state file: one writer, sibling-safe, never throwing on read or write. ----
+// The real helpers are loaded from index.ts against a throwaway home directory, so these tests
+// exercise the shipped read-modify-write (not a stub) without ever touching the user's actual
+// ~/.pi/agent/pi-chrome.json. A future preference that skips writePIChromeState is what would
+// reintroduce the clobbering bug this section exists to prevent.
+function loadStateHelpers({ failWrites = false } = {}) {
+  const start = indexSource.indexOf("const PI_CHROME_STATE_PATH = join(");
+  const end = indexSource.indexOf("\n// Best-effort list of the browser profile names", start);
+  assert.ok(start >= 0 && end > start, "could not locate the state-helper block in index.ts");
+  const source = indexSource.slice(start, end);
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "pi-chrome-state-"));
+  const sandbox = {
+    console, JSON, Object, Number, Array, Boolean, String,
+    homedir: () => home,
+    join: path.join,
+    dirname: path.dirname,
+    readFileSync: fs.readFileSync,
+    mkdirSync: fs.mkdirSync,
+    writeFileSync: failWrites
+      ? () => { throw new Error("EPERM: state file is read-only"); }
+      : fs.writeFileSync,
+  };
+  vm.runInNewContext(stripTypeScriptTypes(source) + `
+;globalThis.__state = {
+  statePath: PI_CHROME_STATE_PATH,
+  readPreferredConnector, writePreferredConnector,
+  readPreferredWindow, writePreferredWindow,
+  readConnectorNames, writeConnectorName,
+};`, sandbox);
+  return { state: sandbox.__state, home, filePath: path.join(home, ".pi", "agent", "pi-chrome.json") };
+}
+
+test("state file: every preference goes through one writer that preserves its siblings", (t) => {
+  const { state, home, filePath } = loadStateHelpers();
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  assert.equal(state.writePreferredWindow(42), true, "the write reports success");
+  assert.equal(state.writePreferredConnector("edge"), true, "writing a second field succeeds");
+  assert.equal(state.writeConnectorName("edge:ab12cd34", "Profile 1"), true, "writing a third field succeeds");
+  assert.equal(state.writePreferredWindow(43), true, "overwriting one field succeeds");
+
+  const raw = fs.readFileSync(filePath, "utf8");
+  assert.deepEqual(JSON.parse(raw), {
+    preferredConnector: "edge",
+    preferredWindow: 43,
+    connectorNames: { "edge:ab12cd34": "Profile 1" },
+  }, "no field clobbered another, whatever the order");
+  assert.ok(raw.endsWith("\n"), "the file ends with a newline");
+  assert.ok(!raw.includes("\r"), "the file is LF-exact");
+
+  // Exactly one write site and one read site for the state path: a divergent second writer would
+  // bypass the preserve-siblings discipline above.
+  assert.equal((indexSource.match(/writeFileSync\(PI_CHROME_STATE_PATH/g) || []).length, 1, "one state-file writer");
+  assert.equal((indexSource.match(/readFileSync\(PI_CHROME_STATE_PATH/g) || []).length, 1, "one state-file read site");
+});
+
+test("state file: reads tolerate missing, corrupt, and wrong-shaped values", (t) => {
+  const { state, home, filePath } = loadStateHelpers();
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+
+  assert.equal(state.readPreferredWindow(), undefined, "missing file reads as no choice");
+  assert.equal(state.readPreferredConnector(), undefined, "missing file reads as no connector");
+  assert.deepEqual({ ...state.readConnectorNames() }, {}, "missing file reads as no names");
+
+  fs.writeFileSync(filePath, "{ not json");
+  assert.equal(state.readPreferredWindow(), undefined, "corrupt file reads as no choice");
+  assert.equal(state.readPreferredConnector(), undefined, "corrupt file reads as no connector");
+
+  // A string id that happens to be numeric is not a window the user chose, and 12.5 is not an id.
+  for (const bad of ["12", 12.5, true, null, [12], { id: 12 }]) {
+    fs.writeFileSync(filePath, JSON.stringify({ preferredWindow: bad }));
+    assert.equal(state.readPreferredWindow(), undefined, `preferredWindow ${JSON.stringify(bad)} is rejected`);
+  }
+  fs.writeFileSync(filePath, JSON.stringify({ preferredWindow: 12, preferredConnector: " edge ", connectorNames: { a: "  X  ", b: 7 } }));
+  assert.equal(state.readPreferredWindow(), 12, "a real integer is returned");
+  assert.equal(state.readPreferredConnector(), "edge", "connector names are trimmed");
+  assert.deepEqual({ ...state.readConnectorNames() }, { a: "X" }, "only non-empty string names are kept");
+});
+
+test("state file: a write failure never throws and is reported, not hidden", (t) => {
+  const { state, home } = loadStateHelpers({ failWrites: true });
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  assert.equal(state.writePreferredWindow(1), false, "an unwritable file reports failure instead of throwing");
+  assert.equal(state.writePreferredConnector("edge"), false, "same for the connector preference");
+  assert.equal(state.writeConnectorName("edge:x", "X"), false, "same for connector names");
 });

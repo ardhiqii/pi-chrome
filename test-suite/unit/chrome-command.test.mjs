@@ -31,8 +31,9 @@ function healthyResponse(action) {
   }
 }
 
-function harness({ until, background = true, mode = "server", choices = [], send = healthyResponse, clientLabel, connectors, connectorNames = {}, profileSuggestions = [] } = {}) {
-  const calls = [], notices = [], menus = [], namesWritten = [];
+function harness({ until, background = true, mode = "server", choices = [], send = healthyResponse, clientLabel, connectors, connectorNames = {}, profileSuggestions = [], preferredWindow, writePreferredWindowFails = false } = {}) {
+  const calls = [], notices = [], menus = [], namesWritten = [], preferredWindowsWritten = [];
+  let savedPreferredWindow = preferredWindow;
   let command;
   const ctx = {
     ui: {
@@ -62,6 +63,12 @@ function harness({ until, background = true, mode = "server", choices = [], send
     // The real one derives the key from the session context; the command section reads it as a free
     // variable, so the harness supplies a fixed one and asserts it reaches the wire.
     sessionKeyFor: () => "session:test",
+    // The machine-wide window default is disk state: the real helpers read/write the user's
+    // ~/.pi/agent/pi-chrome.json, which a test must never touch. The stubs keep the value in memory
+    // so the picker's save path and the injected wire parameter can still be asserted.
+    readPreferredWindow: () => savedPreferredWindow,
+    writePreferredWindow: (value) => { preferredWindowsWritten.push(value); savedPreferredWindow = value; return !writePreferredWindowFails; },
+    preferredWindowParams: () => (typeof savedPreferredWindow === "number" ? { preferredWindow: savedPreferredWindow } : {}),
     bridge: {
       status: () => ({ mode }),
       refreshStatus: async () => ({ mode, clients: connectors }),
@@ -74,7 +81,7 @@ function harness({ until, background = true, mode = "server", choices = [], send
     pi: { registerCommand(name, definition) { assert.equal(name, "chrome"); command = definition; } },
   };
   vm.runInNewContext(commandSource, sandbox);
-  return { command, calls, notices, menus, namesWritten, sandbox, run: (args = "") => command.handler(args, ctx) };
+  return { command, calls, notices, menus, namesWritten, preferredWindowsWritten, sandbox, run: (args = "") => command.handler(args, ctx) };
 }
 
 test("command help and root completion omit status; nested background status remains available", () => {
@@ -94,7 +101,7 @@ test("command help and root completion omit status; nested background status rem
     "connector list", "connector auto",
   ]);
   assert.deepEqual(Array.from(h.command.getArgumentCompletions("window "), (item) => item.value), [
-    "window list", "window own",
+    "window list",
   ]);
 });
 
@@ -246,7 +253,7 @@ test("a name can be removed, falling back to the profile id", async () => {
   assert.deepEqual(h.namesWritten, [["edge:9d233ecf", undefined]], "the name is cleared");
 });
 
-test("/chrome window is routed AND carries this session's key", async () => {
+test("/chrome window is routed, carries this session's key, and saves the pick machine-wide", async () => {
   // Both of these were review findings. The subcommand was missing from the /chrome switch entirely, and
   // the wire calls omitted sessionKey — so the extension fell back to its default bucket and the feature
   // silently configured a DIFFERENT session's target. Neither is visible without asserting on what was
@@ -255,26 +262,48 @@ test("/chrome window is routed AND carries this session's key", async () => {
     action === "window.list"
       ? { windows: [{ windowId: 11, tabCount: 2, title: "T", focused: false, holdsTargetTab: true }], ownsTargetWindow: false, targetWindowId: null }
       : { windowId: 11, reused: false };
-  const h = harness({ send: windowResponse });
+  const h = harness({ send: windowResponse, preferredWindow: 11 });
 
   await h.run("window list");
   assert.equal(h.calls[0].action, "window.list", "window must be a real subcommand, not an unknown one");
   assert.doesNotMatch(String(h.notices[0][0]), /Unknown subcommand/);
   assert.equal(h.calls[0].params.sessionKey, "session:test", "the read is scoped to this session");
+  assert.match(String(h.notices[0][0]), /Saved default/, "window list shows the saved machine-wide default");
 
-  await h.run("window own");
-  assert.equal(h.calls[1].action, "window.select");
-  assert.equal(h.calls[1].params.sessionKey, "session:test", "and so is the write");
-  assert.equal(h.calls[1].params.windowId, null, "own means null, not an id");
-
-  // Picking a specific window sends that window's id, with the same session scope. The label carries the
-  // tick because that window holds Pi's tab, so it IS the current choice.
+  // Picking a specific window sends that window's id with the same session scope, and saves the id
+  // as the machine-wide default so a new session inherits it without being asked again.
   const picked = harness({ send: windowResponse, choices: ["✓ Window 11 — 2 tabs — T"] });
   await picked.run("window");
   assert.equal(picked.calls[0].action, "window.list");
   assert.equal(picked.calls[1].action, "window.select");
   assert.equal(picked.calls[1].params.windowId, 11);
   assert.equal(picked.calls[1].params.sessionKey, "session:test");
+  assert.deepEqual(picked.preferredWindowsWritten, [11], "the pick is persisted machine-wide");
+  assert.match(String(picked.notices.at(-1)[0]), /saved, so new sessions use it too/);
+});
+
+test("a pick that cannot be saved says so instead of claiming it was remembered", async () => {
+  const windowResponse = (action) =>
+    action === "window.list"
+      ? { windows: [{ windowId: 11, tabCount: 2, title: "T", focused: false, holdsTargetTab: false }], ownsTargetWindow: false, targetWindowId: null }
+      : { windowId: 11, reused: false };
+  const h = harness({ send: windowResponse, choices: ["  Window 11 — 2 tabs — T"], writePreferredWindowFails: true });
+  await h.run("window");
+  const text = String(h.notices.at(-1)[0]);
+  assert.match(text, /could not be saved/);
+  assert.doesNotMatch(text, /saved, so new sessions use it too/);
+});
+
+test("/chrome window own no longer exists and points at the picker instead", async () => {
+  // Automatic window creation was removed: /chrome window own used to create (or adopt) a window of
+  // Pi's own, which is the path that kept dropping the user's tab into their window. It must not send
+  // window.select at all now.
+  const h = harness();
+  await h.run("window own");
+  assert.equal(h.calls.length, 0, "no window.select is attempted for a removed command");
+  const text = String(h.notices.at(-1)[0]);
+  assert.match(text, /no longer creates a window/, "says why it is gone");
+  assert.match(text, /\/chrome window/, "names the way forward");
 });
 
 test("/chrome window list names the window Pi is actually a guest in", async () => {
@@ -308,9 +337,9 @@ test("/chrome window list says so plainly when there is nothing else to list", a
 });
 
 test("the window picker offers only open windows, never Pi's own or a create-new entry", async () => {
-  // The old picker offered "Pi's own window" and "Open a new window of Pi's own". Both are gone: the first
-  // could route work into the user's own window, and the second promised a window that did not exist yet.
-  // /chrome window own is still the explicit way to get (or reuse) a window of Pi's own.
+  // The old picker offered "Pi's own window" and "Open a new window of Pi's own". Both are gone for
+  // good: automatic window creation is removed, and a window only becomes Pi's workspace when the user
+  // picks one of their real windows with /chrome window.
   const report = {
     windows: [
       { windowId: 33, tabCount: 1, title: "AI news", focused: false, holdsTargetTab: true, ownedByPi: true },
@@ -344,5 +373,5 @@ test("an empty window picker explains how to proceed instead of showing a dead-e
   assert.equal(h.calls.length, 1, "no window.select is attempted");
   const text = String(h.notices.at(-1)[0]);
   assert.match(text, /Open a window in Chrome/);
-  assert.match(text, /\/chrome window own/, "names the route that still works");
+  assert.doesNotMatch(text, /own/, "there is no window of Pi's own to fall back to any more");
 });

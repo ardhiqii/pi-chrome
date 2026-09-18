@@ -19,8 +19,11 @@ function section(start, end) {
 
 // Load the shipped policy, existing command handler, and actual tool registrations. Only the
 // bridge/Pi UI/typebox/formatting/filesystem boundaries are replaced; no live server is opened.
-function piHarness({ session = "alpha", send, files, unlinkFails = false, clientLabel } = {}) {
+function piHarness({ session = "alpha", send, files, unlinkFails = false, clientLabel, preferredWindow } = {}) {
   const calls = [], tools = new Map(), notices = [], writes = [], removed = [];
+  // The saved window default is disk state read at command time; the harness keeps it in a box so a
+  // test can change it between calls and observe that authorizedBridgeSend re-reads it.
+  const preferred = { value: preferredWindow };
   // In-memory stand-in for the screenshot folder: name -> mtimeMs. Lets the retention tests drive
   // readdir/stat/unlink without touching the real filesystem.
   const folder = new Map(Object.entries(files ?? {}));
@@ -49,6 +52,7 @@ function piHarness({ session = "alpha", send, files, unlinkFails = false, client
     ChromeProfileBridge: function () { return bridge; },
     requireChromeControlAuthorized() { if (!authorized) throw new Error("Chrome control locked"); },
     sessionCtx: ctx, sessionKeyFor: (c) => c?.key, sessionGroupTitle: (c) => c.title,
+    readPreferredWindow: () => preferred.value,
     chromeToolsRegistered: false, StringEnum: () => ({}),
     tabActionValues: [], snapshotModeValues: [], waitForValues: [], imageFormatValues: [],
     safeJson: JSON.stringify, truncateText: (s) => s, formatChromeSnapshot: JSON.stringify,
@@ -72,7 +76,9 @@ function piHarness({ session = "alpha", send, files, unlinkFails = false, client
   const registrations = indexSource.slice(indexSource.indexOf("function registerChromeTools(pi:"), indexSource.lastIndexOf("\n}"));
   vm.runInNewContext(stripTypeScriptTypes([
     section("const bridge = new ChromeProfileBridge(", "\n\tlet chromeAuthorizedUntil:"),
-    section("const authorizedBridgeSend =", '\n\tpi.on("session_start",'),
+    // The real preferredWindowParams helper stays in the extracted section so the injection is
+    // tested, not stubbed; only the disk read itself is replaced.
+    section("const preferredWindowParams =", '\n\tpi.on("session_start",'),
     section("const BACKGROUND_DESC:", "\n\tconst authorizeFor ="),
     registrations,
     "globalThis.send = authorizedBridgeSend; globalThis.background = backgroundHandler;",
@@ -80,6 +86,7 @@ function piHarness({ session = "alpha", send, files, unlinkFails = false, client
   sandbox.registerChromeTools({ registerTool: (tool) => tools.set(tool.name, tool) });
   return {
     calls, tools, notices, writes, ctx, removed, folder, unlinkAttempts,
+    setPreferredWindow: (value) => { preferred.value = value; },
     send: async (...args) => sandbox.send(...args),
     background: (arg) => sandbox.background(ctx, arg),
     tool: (name, params = {}, signal) => tools.get(name).execute("test", params, signal, undefined, ctx),
@@ -92,6 +99,20 @@ const flagCases = [
   [{ foreground: true }, false], [{ foreground: false }, true],
   [{ background: false, foreground: false }, false], [{ background: true, foreground: true }, true],
 ];
+
+test("the machine-wide window default is injected from disk on every command, not cached", async () => {
+  // The saved default is what lets a NEW session work without being asked again. Disk is the source
+  // of truth: another session's pick must apply to this one's next command with no /reload.
+  const h = piHarness({ preferredWindow: 7 });
+  await h.send("page.snapshot", {});
+  assert.equal(h.calls.at(-1).params.preferredWindow, 7);
+  h.setPreferredWindow(9);
+  await h.send("page.snapshot", {});
+  assert.equal(h.calls.at(-1).params.preferredWindow, 9, "the value was re-read, not cached at session start");
+  h.setPreferredWindow(undefined);
+  await h.send("page.snapshot", {});
+  assert.ok(!("preferredWindow" in h.calls.at(-1).params), "with nothing saved, no default field is sent at all");
+});
 
 test("session background on overrides all per-call/legacy foreground flags; off preserves per-call background", async () => {
   const h = piHarness();
@@ -298,7 +319,11 @@ function workerHarness({ withWindows = true } = {}) {
     if (params.focused) focusedWindow = id;
     const tab = { id: nextTab++, windowId: id, active: true, url: params.url, groupId: -1 };
     tabs.set(tab.id, tab);
-    return { id, tabs: [clone(tab)] };
+    // Real Edge omits windowId on the tab returned by windows.create (live 0.15.51.13 finding). Keep
+    // the mock in that shape: production no longer calls this, and if a future change does, the quirk
+    // must be exercised rather than hidden. The tab in `tabs` still carries its real window.
+    const { windowId, ...returnedTab } = tab;
+    return { id, tabs: [returnedTab] };
   };
   const w = {
     chrome, console, setTimeout, clearTimeout, setInterval: () => 0, clearInterval() {},
@@ -324,7 +349,9 @@ function assertNoFocus(h) {
 
 test("Pi-to-worker background aliases preserve grouping, screenshot output, and ownership-aware cleanup", async () => {
   const h = workerHarness();
-  const pi = piHarness({ send: (action, params) => h.w.dispatch(action, params) });
+  // The saved default points at the harness's user window: the worker must create its guest tab and
+  // tab.new's tab there without creating or focusing a window (see assertNoFocus).
+  const pi = piHarness({ send: (action, params) => h.w.dispatch(action, params), preferredWindow: 1 });
   const opened = await pi.tool("chrome_tab", { action: "new", group: false, groupTitle: "wrong", background: false });
   assert.equal(opened.details.result.group.title, "Pi Session: alpha");
   const launched = await pi.tool("chrome_launch", { url: "https://fixture.test" });
@@ -343,7 +370,7 @@ test("worker advertises support, keeps new tabs inactive, and rejects activation
   const h = workerHarness();
   assert.equal((await h.w.dispatch("tab.version", {})).capabilities.hardBackground, true);
   for (const flags of [{}, { foreground: false }, { background: true, foreground: true }]) {
-    const result = await h.w.dispatch("tab.new", { ...flags, sessionKey: "alpha", groupTitle: "Pi Session: alpha" });
+    const result = await h.w.dispatch("tab.new", { ...flags, sessionKey: "alpha", groupTitle: "Pi Session: alpha", preferredWindow: 1 });
     assert.equal(result.tab.active, false);
     await assert.rejects(h.w.dispatch("tab.activate", { ...flags, targetId: "missing" }), /background mode/);
   }
@@ -351,41 +378,43 @@ test("worker advertises support, keeps new tabs inactive, and rejects activation
   const active = await h.w.dispatch("tab.activate", { targetId: "2", foreground: true, background: false });
   assert.equal(active.id, 2);
   assert.equal(active.active, true);
-  const opened = await h.w.dispatch("tab.new", { foreground: true });
+  const opened = await h.w.dispatch("tab.new", { foreground: true, preferredWindow: 1 });
   assert.equal(opened.tab.active, true);
 });
 
 test("background-only worker aliases force safe behavior even with foreground flags", async () => {
   const h = workerHarness();
-  const opened = await h.w.dispatch("tab.new.background", { foreground: true, background: false });
+  const opened = await h.w.dispatch("tab.new.background", { foreground: true, background: false, preferredWindow: 1 });
   assert.equal(opened.tab.active, false);
   const shot = await h.w.dispatch("page.screenshot.background", { targetId: "2", foreground: true, background: false });
   assert.equal(shot.method, "cdp");
   assertNoFocus(h);
 });
 
-test("implicit automation windows stay unfocused; opted-in tab fallback stays inactive", async () => {
+test("implicit automation tabs stay unfocused in the chosen window; nothing is ever created", async () => {
   {
     const h = workerHarness({ withWindows: true });
-    const tab = await h.w.dispatch("page.navigate", { url: "https://fixture.test", waitUntilLoad: false, background: true, foreground: true, sessionKey: "alpha" });
+    const userTabsBefore = [...h.tabs.values()].filter((t) => t.windowId === 1).map((t) => t.id).sort();
+    const tab = await h.w.dispatch("page.navigate", { url: "https://fixture.test", waitUntilLoad: false, background: true, foreground: true, sessionKey: "alpha", preferredWindow: 1 });
     assert.notEqual(tab.id, 1);
+    assert.equal(tab.windowId, 1, "the guest tab is in the window the user chose");
     assertNoFocus(h);
-    assert.ok(h.calls.filter((c) => c.action === "windows.create").every((c) => c.params.focused === false));
+    assert.equal(h.calls.filter((c) => c.action === "windows.create").length, 0, "pi-chrome never creates a window");
+    assert.ok(!h.calls.some((c) => c.action === "tabs.create" && c.params.windowId === undefined), "no tab was created without an explicit window");
+    const userTabsAfter = [...h.tabs.values()].filter((t) => t.windowId === 1).map((t) => t.id).sort();
+    assert.ok(userTabsAfter.includes(1) && userTabsAfter.includes(2), "the user's tabs are still there");
+    assert.equal(userTabsAfter.length, userTabsBefore.length + 1, "the chosen window gained exactly Pi's guest tab");
   }
   {
-    // With no window API the implicit path is a hard failure now: the old fallback created a tab
-    // with no windowId, which Chrome places in the focused (user) window.
+    // With no saved default and no assignment the implicit path is a hard failure naming the fix:
+    // the old automatic behaviour is exactly what this feature removed.
     const h = workerHarness({ withWindows: false });
     await assert.rejects(
       h.w.dispatch("page.navigate", { url: "https://fixture.test", waitUntilLoad: false, background: true, foreground: true, sessionKey: "alpha" }),
       /\/chrome window/,
     );
     assertNoFocus(h);
-    // Explicitly opted in, the shared-tab fallback must still never activate the tab or a window.
-    const tab = await h.w.createIsolatedWindowTarget("alpha", { allowSharedTabFallback: true });
-    assert.notEqual(tab.id, 1);
-    assert.equal(tab.active, false);
-    assertNoFocus(h);
+    assert.ok(!h.calls.some((c) => c.action === "tabs.create"), "no tab was created for an implicit action with no choice");
   }
 });
 
