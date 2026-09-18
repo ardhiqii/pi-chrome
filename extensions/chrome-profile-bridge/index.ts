@@ -491,6 +491,16 @@ class ChromeProfileBridge {
 		return [...this.clients.values()].filter((client) => client.lastSeenAt >= cutoff);
 	}
 
+	// Drop connectors that stopped polling, so the map never accumulates entries for browsers that are
+	// long gone. Callers must not treat a pruned connector as reason to forget the saved preference —
+	// see the call site for why.
+	private pruneStaleClients(): void {
+		const cutoff = this.lastSeenAt - 5 * 60_000;
+		for (const [key, client] of this.clients) {
+			if (client.lastSeenAt < cutoff) this.clients.delete(key);
+		}
+	}
+
 	private describeClientList(clients: BridgeClient[]): string {
 		return clients.length
 			? clients.map((client) => `${client.key} (${this.describeClient(client)})`).join(", ")
@@ -882,15 +892,14 @@ class ChromeProfileBridge {
 				name: this.clientName,
 				lastSeenAt: this.lastSeenAt,
 			});
-			// Forget connectors that stopped polling so the list never accumulates stale entries, and drop
-			// an explicit selection that is no longer present rather than failing every command against it.
-			const clientCutoff = this.lastSeenAt - 5 * 60_000;
-			for (const [key, client] of this.clients) {
-				if (client.lastSeenAt < clientCutoff) this.clients.delete(key);
-			}
-			if (this.selectedClient !== undefined && !this.clients.has(this.selectedClient)) {
-				this.selectedClient = undefined;
-			}
+			// Forget connectors that stopped polling so the list never accumulates stale entries. This
+			// deliberately leaves the saved preference alone: it is durable user intent, and discarding it
+			// because a browser was briefly closed is how "prefer Edge" silently becomes "use whatever is
+			// there" — which is the coin-flip the preference exists to prevent. If the chosen connector is
+			// genuinely gone, commands say so and name what IS connected, and /chrome connector auto clears
+			// it. (This used to drop the selection when it was not a key in the map, which wiped a
+			// browser-name preference on the next poll, seconds after it was set.)
+			this.pruneStaleClients();
 			let aborted = false;
 			let activeWaiter: ((command: BridgeCommand | undefined) => void) | undefined;
 			const dropWaiter = (waiter: (command: BridgeCommand | undefined) => void) => {

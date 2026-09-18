@@ -465,3 +465,23 @@ test("the preference is re-read from disk, so another session's change takes eff
   assert.equal(bridge.status().selectedClient, "edge");
   assert.equal(bridge.status().selectedKey, EDGE);
 });
+
+test("pruning a connector that stopped polling must not discard the saved preference", () => {
+  // A browser closed for a few minutes is pruned from the client list. That used to also drop the
+  // selection whenever it was not a key in the map — and a preference may legitimately be a bare
+  // browser name ("edge") rather than a key ("edge:9d233ecf"), so a preference was wiped on the next
+  // poll, seconds after being set. File intact, memory empty: exactly the contradiction seen live.
+  const bridge = withClients([{ browser: "edge", profileId: "ab12cd34", staleMs: 10 * 60_000 }], "edge");
+  bridge.lastSeenAt = Date.now();
+  bridge.pruneStaleClients();
+  assert.equal(bridge.status().clients.length, 0, "the long-gone connector is forgotten");
+  assert.equal(saved.value, "edge", "but the user's choice survives its absence");
+  assert.equal(bridge.status().selectedClient, "edge");
+
+  // And when a DIFFERENT browser is the one present, the preference still refuses rather than
+  // quietly switching — preferring Edge must never mean driving Chrome.
+  bridge.clients.set("chrome:11223344", {
+    key: "chrome:11223344", browser: "chrome", profileId: "11223344", lastSeenAt: Date.now(),
+  });
+  assert.throws(() => bridge.resolveTargetClient(), /preferred connector \(edge\) is not connected/);
+});
