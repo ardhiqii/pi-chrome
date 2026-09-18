@@ -35,16 +35,24 @@ function loadBridgeClass() {
   assert.notEqual(source, before, "the constructor shim did not apply — update it if the class changed");
 
   const saved = { value: undefined, writes: [] };
+  // Controllable stand-in for the owner's HTTP surface: nothing here opens a socket.
+  const net = { status: undefined, calls: 0, fail: false };
   const sandbox = {
     console, setTimeout, clearTimeout, Date, Math, JSON, Map, Promise, Error, DEFAULT_TIMEOUT_MS: 1000,
+    AbortSignal: { timeout: () => undefined },
+    fetch: async () => {
+      net.calls += 1;
+      if (net.fail) throw new Error("fetch failed");
+      return { ok: true, json: async () => net.status };
+    },
     readPreferredConnector: () => saved.value,
     writePreferredConnector: (value) => { saved.writes.push(value); saved.value = value; },
   };
   vm.runInNewContext(stripTypeScriptTypes(source) + "\n;globalThis.__Bridge = ChromeProfileBridge;", sandbox);
-  return { Bridge: sandbox.__Bridge, saved };
+  return { Bridge: sandbox.__Bridge, saved, net };
 }
 
-const { Bridge, saved } = loadBridgeClass();
+const { Bridge, saved, net } = loadBridgeClass();
 
 // describeConnectorStatus is pure, so it can be loaded and called on its own.
 function loadDescribeConnectorStatus() {
@@ -129,12 +137,16 @@ const CHROME = "chrome:11223344";
 function newBridge(preference) {
   saved.value = preference;
   saved.writes.length = 0;
+  net.status = undefined;
+  net.calls = 0;
+  net.fail = false;
   return new Bridge("127.0.0.1", 17318);
 }
 
 // Register connectors the way a real /next poll does.
 function withClients(specs, preference) {
   const bridge = newBridge(preference);
+  let anyFresh = false;
   for (const spec of specs) {
     const key = bridge.clientKeyOf(spec.browser, spec.profileId, spec.name);
     bridge.clients.set(key, {
@@ -144,7 +156,11 @@ function withClients(specs, preference) {
       name: spec.name,
       lastSeenAt: Date.now() - (spec.staleMs ?? 0),
     });
+    if (!spec.staleMs) anyFresh = true;
   }
+  // A client entry only ever exists because a poll arrived, and a poll stamps the bridge itself. Without
+  // this the harness would look like "clients but never polled", which no real bridge can be.
+  if (anyFresh) bridge.lastSeenAt = Date.now();
   return bridge;
 }
 
@@ -338,4 +354,72 @@ test("delivery: a waiter that times out unregisters and does not block later del
   bridge.enqueue({ id: "after-timeout", action: "tab.list", params: {}, targetClient: EDGE });
   assert.equal(register !== undefined, true);
   assert.equal(bridge.queue.length, 0, "a fresh waiter still receives deliveries");
+});
+
+test("client mode: the connection belongs to the OWNER, not to this empty process", async () => {
+  // A Pi session that does not own port 17318 never receives a poll itself, so its own lastSeenAt and
+  // client map are empty by design. Reading them locally is what reported "waiting for extension" and
+  // "No connector is connected" while commands were routing to a healthy connector through the owner.
+  const bridge = newBridge();
+  bridge.mode = "client";
+  net.status = {
+    url: "http://127.0.0.1:17318",
+    mode: "server",
+    connected: true,
+    clientName: "Pi Chrome Connector gfcbdfcmfejelnocemdajdhmafhdfkln",
+    clientBrowser: "edge",
+    clientProfileId: "9d233ecf",
+    clientLabel: "Edge (profile 9d233ecf)",
+    clients: [{ key: "edge:9d233ecf", browser: "edge", profileId: "9d233ecf", label: "Edge (profile 9d233ecf)" }],
+  };
+
+  // The state that used to be reported to the user, before consulting the owner.
+  assert.equal(bridge.connected, false, "local state knows nothing in client mode");
+  assert.deepEqual([...bridge.status().clients], []);
+  assert.equal(bridge.clientLabel(), undefined);
+
+  const status = await bridge.refreshStatus();
+  assert.equal(net.calls, 1, "the owner's /status is consulted");
+  assert.equal(bridge.connected, true, "the owner's connection is this session's connection");
+  assert.equal(bridge.clientLabel(), "Edge (profile 9d233ecf)", "and it can name the browser it is driving");
+  assert.deepEqual([...status.clients].map((client) => client.key), ["edge:9d233ecf"]);
+
+  // status() must agree afterwards, so a caller that forgot to await refreshStatus is not misled either.
+  assert.equal(bridge.status().connected, true);
+  assert.deepEqual([...bridge.status().clients].map((client) => client.key), ["edge:9d233ecf"]);
+});
+
+test("client mode: an unreachable owner keeps the last known view", async () => {
+  const bridge = newBridge();
+  bridge.mode = "client";
+  net.status = { connected: true, clients: [{ key: "edge:9d233ecf", label: "Edge (profile 9d233ecf)" }] };
+  await bridge.refreshStatus();
+  net.fail = true;
+  const status = await bridge.refreshStatus();
+  // A transient blip must not read as "no connector connected": that is the false alarm that sent a
+  // user to reinstall a working extension.
+  assert.equal(status.connected, true);
+  assert.equal(bridge.connected, true);
+  assert.deepEqual([...bridge.status().clients].map((client) => client.key), ["edge:9d233ecf"]);
+});
+
+test("server mode does not fetch its own status over HTTP", async () => {
+  const bridge = withClients([{ browser: "edge", profileId: "ab12cd34" }]);
+  const status = await bridge.refreshStatus();
+  assert.equal(net.calls, 0, "the owner reads local state directly");
+  assert.deepEqual([...status.clients].map((client) => client.key), [EDGE]);
+  assert.equal(status.connected, true);
+});
+
+test("client mode against an OLDER owner: reported as connected, and the gap is named", async () => {
+  // An owner running an older pi-chrome answers with only connected+clientName, no client list.
+  const bridge = newBridge();
+  bridge.mode = "client";
+  net.status = { connected: true, clientName: "Pi Chrome Connector gfcbdfcmfejelnocemdajdhmafhdfkln" };
+  const status = await bridge.refreshStatus();
+  assert.equal(bridge.connected, true, "a connector IS connected and must be reported as such");
+  const text = describeConnectorStatus(status);
+  assert.doesNotMatch(text, /No connector is connected/);
+  assert.match(text, /Connector connected: Pi Chrome Connector/);
+  assert.match(text, /\/reload in that session/);
 });

@@ -29,7 +29,7 @@ function piHarness({ session = "alpha", send, files, unlinkFails = false, client
   let authorized = true;
   const ctx = { key: `session:${session}`, title: `Pi Session: ${session}`, cwd: "/fixture", ui: { notify: (...args) => notices.push(args) } };
   const bridge = {
-    connected: true, status: () => ({}), clientLabel: () => clientLabel,
+    connected: true, status: () => ({}), refreshStatus: async () => ({}), clientLabel: () => clientLabel,
     async send(action, params, timeout, signal) {
       calls.push({ action, params: clone(params), timeout, signal });
       if (signal?.aborted) throw new Error("Chrome command aborted");

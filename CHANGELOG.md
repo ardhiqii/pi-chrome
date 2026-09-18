@@ -99,7 +99,17 @@ All notable user-facing changes to `pi-chrome`.
   contains a profile id that lives in per-profile extension storage, so clearing it or reinstalling
   the connector would otherwise break the saved preference. A saved preference that is not connected
   **refuses** rather than quietly driving a different browser, and `/chrome connector auto` clears it.
-- **Fixed a version-skew bug in our own status reporting.** The bridge belongs to whichever Pi session
+- **Fixed: a session that does not own the bridge reported "no connector" no matter what.** Only the Pi
+  session that first bound port 17318 ever receives the companion extension's poll; every other session
+  forwards its commands to that owner. Their local `connected`/`clients` state is therefore empty **by
+  design**, and reading it locally — which `chrome_launch`, `/chrome connector`, and `clientLabel()` all
+  did — reported "waiting for extension" and "No connector is connected" while commands were being
+  routed to a perfectly healthy connector through the owner. This is why reloading did not help: the
+  bug was not staleness, any non-owning session said it. The client now fetches the owner's status
+  (`refreshStatus()`), keeps it cached so `connected`/`status()`/`clientLabel()` all agree, and keeps
+  the last known view if the owner briefly goes away rather than falling back to the empty local state.
+  Four cases in `bridge-routing.test.mjs` cover it, including one that fails against the previous code.
+- **Fixed a related skew case:** the fallback for an owner running an older build. The bridge belongs to whichever Pi session
   bound port 17318 first, and an older build answers `/status` with only `connected` + `clientName` —
   no client list. The new `/chrome connector` reporter read `clients` alone, so a session running this
   build against an older bridge reported **"No connector is connected"** while a connector was plainly

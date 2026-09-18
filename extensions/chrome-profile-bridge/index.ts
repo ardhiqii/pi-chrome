@@ -409,21 +409,53 @@ class ChromeProfileBridge {
 		private readonly port: number,
 	) {}
 
+	// In client mode this process owns no connector: the companion extension polls whichever Pi session
+	// owns the port, so this process's own `lastSeenAt` and `clients` are empty by design. Reading them
+	// locally is what made a non-owning session report "waiting for extension" and "No connector is
+	// connected" while its commands were being routed to a perfectly healthy connector through the
+	// owner. Cache the owner's own status and report that instead.
+	private ownerStatus: Record<string, unknown> | undefined;
+
 	get url(): string {
 		return `http://${this.host}:${this.port}`;
 	}
 
 	get connected(): boolean {
+		// Client mode: the connection belongs to the owner, so report what it last told us.
+		if (this.mode === "client") return this.ownerStatus?.connected === true;
 		// MV3 service workers can pause between polls/alarms. Treat a recent poll as
 		// connected without sending a probe command; real chrome_* tool calls are
 		// the authoritative end-to-end health check.
 		return this.lastSeenAt !== undefined && Date.now() - this.lastSeenAt < 5 * 60_000;
 	}
 
+	// Fresh bridge state, taken from the owner when this session is not the owner. Anything that
+	// reports status to the user should await this rather than reading local state, which in client
+	// mode is empty and says the opposite of the truth.
+	async refreshStatus(): Promise<Record<string, unknown>> {
+		if (this.mode !== "client") return this.status();
+		try {
+			const response = await fetch(`${this.url}/status`, { signal: AbortSignal.timeout(1_500) });
+			if (response.ok) {
+				const payload = (await response.json()) as Record<string, unknown>;
+				if (payload && typeof payload === "object") this.ownerStatus = payload;
+			}
+		} catch {
+			// Owner unreachable right now: keep the last known view rather than falling back to empty
+			// local state, which would claim no connector is connected.
+		}
+		return { ...(this.ownerStatus ?? {}), mode: this.mode };
+	}
+
 	// Human-readable "which browser/profile am I talking to". The connector identifies itself on every
 	// poll (it can be installed in several browsers and profiles), so this is reported rather than
 	// guessed — assuming Chrome from the tool names alone is exactly the mistake this prevents.
 	clientLabel(): string | undefined {
+		// In client mode the connector belongs to the owner, which has already formatted the label.
+		if (this.mode === "client") {
+			const label = this.ownerStatus?.clientLabel;
+			return typeof label === "string" && label ? label : undefined;
+		}
 		if (!this.clientBrowser && !this.clientProfileId) return undefined;
 		return this.describeClient({ browser: this.clientBrowser, profileId: this.clientProfileId });
 	}
@@ -505,6 +537,12 @@ class ChromeProfileBridge {
 	}
 
 	status(): Record<string, unknown> {
+		// Client mode: the authoritative state is the owner's. Report the last view we fetched so a caller
+		// that reads status without awaiting refreshStatus still gets something true rather than an empty
+		// local map that reads as "nothing connected".
+		if (this.mode === "client" && this.ownerStatus) {
+			return { ...this.ownerStatus, mode: this.mode };
+		}
 		const live = this.liveClients();
 		return {
 			url: this.url,
@@ -1504,7 +1542,7 @@ Usage rules:
 		const describe = describeConnectorStatus;
 		try {
 			if (!args.trim() || args.trim() === "list" || args.trim() === "status") {
-				ctx.ui.notify(describe(bridge.status() as ConnectorStatus), "info");
+				ctx.ui.notify(describe((await bridge.refreshStatus()) as ConnectorStatus), "info");
 				return;
 			}
 			// Round-trips through the bridge so the selection lives where routing happens, not per session.
@@ -1683,6 +1721,9 @@ Usage rules:
 			// Report the connected browser and profile up front. This is the canonical first call, and the
 			// bridge is not Chrome-specific — it is usually Edge. Naming it here is what stops every later
 			// step from quietly assuming Chrome.
+			// Refresh first: in a session that does not own the bridge, the connection belongs to the owner,
+			// so local state would say "waiting for extension" while the extension is polling fine.
+			await bridge.refreshStatus();
 			const connectedTo = bridge.clientLabel();
 			if (params.url && bridge.connected) {
 				const result = await authorizedBridgeSend("tab.new", { url: params.url }, DEFAULT_TIMEOUT_MS, signal);
