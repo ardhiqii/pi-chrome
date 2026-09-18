@@ -76,6 +76,9 @@ function makeChrome(state, { withWindows = true, withStorage = true, withTabGrou
       },
       get: async (id) => { const t = tabs.get(id); if (!t) throw new Error(`No tab with id ${id}`); return { ...t }; },
       create: async ({ url = "about:blank", active = false, windowId = userWindowId } = {}) => {
+        // Chrome rejects a tab target whose window is gone; modelling that here makes the
+        // chosen-window-closed path fail loudly instead of resurrecting a window id.
+        if (!windows.has(windowId)) throw new Error(`No window with id ${windowId}`);
         const tab = { id: alloc.tab(), windowId, url, active, groupId: -1 };
         tabs.set(tab.id, tab);
         return { ...tab };
@@ -970,6 +973,182 @@ async function run() {
     const tab = await w2.createAutomationTarget("session:beta", "Pi Agent");
     ok(tab.windowId === seed.windowId, "hydrate-direct: reuses the persisted Pi window without a prior resolve");
     ok(state.windows.size === windowsBefore, "hydrate-direct: no new window was created");
+  }
+
+  // ===== The live two-about:blank report resolved by recorded identity: when a selector matches both
+  // Pi's own blank automation target and a blank tab the user opened, the session's recorded target
+  // wins. The selector is a HINT; the setting is the truth. Before this, `tabs.find` picked whichever
+  // blank tab Chrome listed first (the user's), so chrome_navigate and chrome_evaluate could end up on
+  // different pages. =====
+  {
+    const state = makeChromeState();
+    const w = loadWorker(makeChrome(state));
+    const userBlank = { id: state.alloc.tab(), windowId: state.userWindowId, url: "about:blank", active: true, groupId: -1 };
+    state.tabs.set(userBlank.id, userBlank);
+    const piTarget = await w.getOrCreateAutomationTarget(SK);
+    ok(piTarget.windowId !== state.userWindowId, "two-blank: Pi's target is in Pi's own window");
+    ok(piTarget.url === "about:blank#pi-chrome", "two-blank: the automation target is created at the marked url");
+    const nav = await w.dispatch("page.navigate", {
+      urlIncludes: "about:blank", url: "https://pi.test/blank-pick", waitUntilLoad: false, sessionKey: SK,
+    });
+    ok(nav.id === piTarget.id, "two-blank: a urlIncludes hint matching Pi's own target resolves by recorded identity, not first match");
+    ok(state.tabs.get(userBlank.id).url === "about:blank", "two-blank: the user's blank tab was not navigated");
+  }
+
+  // ===== A guest target (the user chose their window) that the user drags into another window must be
+  // retired and rebuilt in the window the setting names — not followed, and not replaced with a
+  // brand-new Pi window. Before the record kept the chosen window, a moved guest tab was not even
+  // detected, so the next action drove it wherever the user dropped it. =====
+  {
+    const state = makeChromeState();
+    const w = loadWorker(makeChrome(state, { withTabGroups: true }));
+    const otherWindowId = state.alloc.window();
+    state.windows.set(otherWindowId, { id: otherWindowId });
+    const otherTab = { id: state.alloc.tab(), windowId: otherWindowId, url: "https://example.com/elsewhere", active: false, groupId: -1 };
+    state.tabs.set(otherTab.id, otherTab);
+
+    const selected = await w.dispatch("window.select", { windowId: state.userWindowId, sessionKey: SK });
+    const guestId = selected.tabId;
+    ok(state.tabs.get(guestId).windowId === state.userWindowId, "guest-moved: the guest target starts in the chosen window");
+    // The user drags Pi's tab into their other window.
+    state.tabs.get(guestId).windowId = otherWindowId;
+
+    const nav = await w.dispatch("page.navigate", { url: "https://pi.test/guest-moved", waitUntilLoad: false, sessionKey: SK });
+    ok(nav.windowId === state.userWindowId, "guest-moved: the replacement target is rebuilt in the window the setting names");
+    ok(nav.id !== guestId, "guest-moved: the moved tab was retired, not followed");
+    ok(!state.tabs.has(guestId), "guest-moved: the moved guest tab is closed");
+    ok(state.tabs.get(nav.id).windowId === state.userWindowId, "guest-moved: the new target is where it claims to be");
+    ok(state.tabs.has(otherTab.id), "guest-moved: the other window's tab is untouched");
+  }
+
+  // ===== A guest tab the user closes (the window stays open) is rebuilt in the same chosen window,
+  // joining that window's same-titled "Pi Agent" group — not the group in a Pi-created window. The
+  // Pi-created group is seeded FIRST so tabGroups.query order favours it: only the recorded setting
+  // may decide. Before, the chosen window was only a runtime hint: the recorded target's window was
+  // forgotten for guest tabs, so the replacement was a brand-new Pi window — the user's choice
+  // silently lost. =====
+  {
+    const state = makeChromeState();
+    const w = loadWorker(makeChrome(state, { withTabGroups: true }));
+    const seed = await w.dispatch("page.navigate", {
+      url: "https://pi.test/seed-group", waitUntilLoad: false, sessionKey: "session:seed",
+      joinSessionGroup: true, sessionGroupTitle: "Pi Agent",
+    });
+    const seedGroupId = seed.groupId;
+    const selected = await w.dispatch("window.select", { windowId: state.userWindowId, sessionKey: SK });
+    const guestId = selected.tabId;
+    const userGroupId = state.tabs.get(guestId).groupId;
+    ok(typeof userGroupId === "number" && userGroupId >= 0 && userGroupId !== seedGroupId, "guest-recreate: the user's window has its own same-titled group");
+    state.tabs.delete(guestId); // the user closes Pi's tab; the window stays open
+    const windowsBefore = state.windows.size;
+    const nav = await w.dispatch("page.navigate", {
+      url: "https://pi.test/guest-recreate", waitUntilLoad: false, sessionKey: SK,
+      joinSessionGroup: true, sessionGroupTitle: "Pi Agent",
+    });
+    ok(nav.windowId === state.userWindowId, "guest-recreate: the replacement target is created in the window the user chose");
+    ok(nav.groupId === userGroupId, "guest-recreate: it joins the group in the chosen window, not the Pi-window group");
+    ok(nav.id !== guestId, "guest-recreate: a fresh tab was created");
+    ok(state.windows.size === windowsBefore, "guest-recreate: no new window was created");
+    ok(state.tabs.get(seed.id).groupId === seedGroupId, "guest-recreate: the Pi-window group was not moved or renamed");
+  }
+
+  // ===== The chosen user window closed: FAIL LOUDLY naming /chrome window, never silently pick another
+  // window. Before, the dead choice was forgotten and Pi opened a fresh window of its own — the user's
+  // choice silently replaced by a different workspace. =====
+  {
+    const state = makeChromeState();
+    const w = loadWorker(makeChrome(state, { withTabGroups: true }));
+    await w.dispatch("window.select", { windowId: state.userWindowId, sessionKey: SK });
+    // The user closes the whole window (Chrome closes its tabs with it).
+    state.windows.delete(state.userWindowId);
+    for (const [tid, t] of [...state.tabs]) if (t.windowId === state.userWindowId) state.tabs.delete(tid);
+    const windowsBefore = state.windows.size;
+    await throwsWith(
+      () => w.dispatch("page.navigate", { url: "https://pi.test/window-gone", waitUntilLoad: false, sessionKey: SK }),
+      /\/chrome window/,
+      "window-gone: fails with an actionable /chrome window message instead of choosing another window",
+    );
+    ok(state.windows.size === windowsBefore, "window-gone: no replacement window was created");
+    ok(state.windows.size === 0, "window-gone: the browser has no windows left");
+    await throwsWith(
+      () => w.dispatch("page.navigate", { url: "https://pi.test/window-gone-2", waitUntilLoad: false, sessionKey: SK }),
+      /\/chrome window/,
+      "window-gone: a retry still refuses",
+    );
+    const recovered = await w.dispatch("window.select", { windowId: null, sessionKey: SK });
+    ok(typeof recovered.windowId === "number" && state.windows.has(recovered.windowId), "window-gone: /chrome window own recovers");
+    const nav = await w.dispatch("page.navigate", { url: "https://pi.test/window-gone-3", waitUntilLoad: false, sessionKey: SK });
+    ok(nav.windowId === recovered.windowId, "window-gone: the recovered window is the workspace");
+  }
+
+  // ===== Two Pi-created windows, each with a same-titled "Pi Agent" group: the session's recorded
+  // window decides, never chrome.tabGroups.query order. Before, a recreated target joined whichever
+  // owned group the query listed first and moved the session into the wrong window. =====
+  {
+    const state = makeChromeState();
+    const w = loadWorker(makeChrome(state, { withTabGroups: true }));
+    const alpha = await w.dispatch("page.navigate", {
+      url: "https://pi.test/alpha", waitUntilLoad: false, sessionKey: "session:alpha",
+      joinSessionGroup: true, sessionGroupTitle: "Pi Agent",
+    });
+    const windowA = alpha.windowId;
+    const groupA = alpha.groupId;
+    const betaSel = await w.dispatch("window.select", { windowId: null, fresh: true, sessionKey: "session:beta", groupTitle: "Pi Agent" });
+    const windowB = betaSel.windowId;
+    const betaTabId = betaSel.tabId;
+    await w.dispatch("tab.group", { targetId: String(betaTabId), groupTitle: "Pi Agent", sessionKey: "session:beta" });
+    const groupB = state.tabs.get(betaTabId).groupId;
+    ok(windowB !== windowA && groupB !== groupA, "multi-pi-window: two Pi windows with same-titled groups exist");
+    ok(state.groups.get(groupA).title === "Pi Agent" && state.groups.get(groupB).title === "Pi Agent", "multi-pi-window: group titles collide");
+
+    // The user closes Pi's tab in the second window; the window itself stays.
+    state.tabs.delete(betaTabId);
+    const nav = await w.dispatch("page.navigate", {
+      url: "https://pi.test/beta-again", waitUntilLoad: false, sessionKey: "session:beta",
+      joinSessionGroup: true, sessionGroupTitle: "Pi Agent",
+    });
+    ok(nav.windowId === windowB, "multi-pi-window: the session's recorded window wins over tabGroups.query order");
+    ok(nav.groupId === groupB, "multi-pi-window: the replacement joins the group in the session's window");
+    ok(nav.windowId !== state.userWindowId, "multi-pi-window: still not the user's window");
+  }
+
+  // ===== Two same-titled groups, one in the user's window and one in Pi's: a fresh session (auto)
+  // must land in Pi's window and join Pi's group; the user's leftover group must never capture it. =====
+  {
+    const state = makeChromeState();
+    const w = loadWorker(makeChrome(state, { withTabGroups: true }));
+    const userGroupId = state.alloc.group();
+    const userLeftover = { id: state.alloc.tab(), windowId: state.userWindowId, url: "https://x.com/home", active: false, groupId: userGroupId };
+    state.tabs.set(userLeftover.id, userLeftover);
+    state.groups.set(userGroupId, { id: userGroupId, title: "Pi Agent", color: "blue", collapsed: false, windowId: state.userWindowId });
+    const seed = await w.dispatch("page.navigate", {
+      url: "https://pi.test/seed", waitUntilLoad: false, sessionKey: "session:seed",
+      joinSessionGroup: true, sessionGroupTitle: "Pi Agent",
+    });
+    const nav = await w.dispatch("page.navigate", {
+      url: "https://pi.test/fresh", waitUntilLoad: false, sessionKey: SK,
+      joinSessionGroup: true, sessionGroupTitle: "Pi Agent",
+    });
+    ok(nav.windowId === seed.windowId, "two-groups: the fresh session landed in Pi's own window");
+    ok(nav.groupId === seed.groupId, "two-groups: it joined Pi's group, not the user's same-titled group");
+    ok(nav.groupId !== userGroupId, "two-groups: the user's group was not chosen");
+    ok(state.tabs.get(userLeftover.id).groupId === userGroupId, "two-groups: the user's group and tab are untouched");
+  }
+
+  // ===== auto / no explicit choice: the first action creates the workspace window, and later actions
+  // stay there even while the user works elsewhere. =====
+  {
+    const state = makeChromeState();
+    const w = loadWorker(makeChrome(state));
+    const first = await w.dispatch("page.navigate", { url: "https://pi.test/auto-1", waitUntilLoad: false, sessionKey: SK });
+    ok(first.windowId !== state.userWindowId, "auto: the first action created Pi's own window");
+    // The user focuses their window and opens another tab there.
+    state.userArticle.active = true;
+    const userNew = { id: state.alloc.tab(), windowId: state.userWindowId, url: "https://example.com/another", active: true, groupId: -1 };
+    state.tabs.set(userNew.id, userNew);
+    const second = await w.dispatch("page.navigate", { url: "https://pi.test/auto-2", waitUntilLoad: false, sessionKey: SK });
+    ok(second.id === first.id && second.windowId === first.windowId, "auto: later actions stay in the workspace Pi created");
+    ok(state.tabs.get(userNew.id).url === "https://example.com/another", "auto: the user's new tab was never adopted");
   }
 
   console.log(`\n${passes} passed, ${failures} failed`);
