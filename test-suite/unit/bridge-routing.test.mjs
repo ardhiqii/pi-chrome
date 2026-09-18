@@ -520,3 +520,53 @@ test("a reload from the SAME root must replace, never skip — skipping breaks /
     "a second copy from another root is refused");
   assert.equal(isDuplicate({ version: "0.1.0", root: "C:/other/pi-chrome" }, ROOT), true, "and so is an old one");
 });
+
+// The picker's label -> key mapping, loaded on its own (pure function).
+function loadConnectorMenuOptions() {
+  const start = indexSource.indexOf("function connectorMenuOptions(");
+  assert.ok(start >= 0, "could not locate connectorMenuOptions");
+  const end = indexSource.indexOf("\n}\n", start);
+  assert.ok(end > start, "could not locate the end of connectorMenuOptions");
+  const sandbox = { console, Map };
+  vm.runInNewContext(
+    stripTypeScriptTypes(indexSource.slice(start, end + 3)) + "\n;globalThis.__m = connectorMenuOptions;",
+    sandbox,
+  );
+  return sandbox.__m;
+}
+
+test("the connector picker maps a clicked label back to the right key", () => {
+  const menu = loadConnectorMenuOptions();
+  const clients = [
+    { key: "edge:ab12cd34", label: "Edge (profile ab12cd34)" },
+    { key: "chrome:11223344", label: "Chrome (profile 11223344)" },
+  ];
+
+  // Nothing chosen: auto is marked, and no connector is.
+  const none = menu(clients, null);
+  assert.match(none.autoLabel, /^✓ /);
+  assert.equal(none.options.length, 3, "auto plus one entry per connector");
+  assert.equal(none.keyByLabel.get("  Edge (profile ab12cd34)"), "edge:ab12cd34");
+  assert.equal(none.keyByLabel.get("  Chrome (profile 11223344)"), "chrome:11223344");
+
+  // Edge chosen: it is marked, auto is not.
+  const edge = menu(clients, "edge:ab12cd34");
+  assert.match(edge.autoLabel, /^ {2}/, "auto is not marked once something is chosen");
+  assert.equal(edge.keyByLabel.get("✓ Edge (profile ab12cd34)"), "edge:ab12cd34");
+  assert.equal(edge.keyByLabel.get("  Chrome (profile 11223344)"), "chrome:11223344");
+});
+
+test("the connector picker never collapses two entries onto one key", () => {
+  // Two profiles of the same browser, or any labels that happen to match, must still be distinct
+  // entries: if a click mapped to the wrong key it would silently drive the wrong browser.
+  const menu = loadConnectorMenuOptions();
+  const clients = [
+    { key: "edge:aaaaaaaa", label: "Edge (profile aaaaaaaa)" },
+    { key: "edge:bbbbbbbb", label: "Edge (profile aaaaaaaa)" },
+  ];
+  const built = menu(clients, null);
+  assert.equal(built.options.length, 3);
+  assert.equal(new Set(built.options).size, 3, "every entry is selectable independently");
+  const keys = [...built.keyByLabel.values()];
+  assert.deepEqual([...keys].sort(), ["edge:aaaaaaaa", "edge:bbbbbbbb"], "both keys are reachable");
+});

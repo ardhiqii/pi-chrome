@@ -99,6 +99,12 @@ All notable user-facing changes to `pi-chrome`.
   contains a profile id that lives in per-profile extension storage, so clearing it or reinstalling
   the connector would otherwise break the saved preference. A saved preference that is not connected
   **refuses** rather than quietly driving a different browser, and `/chrome connector auto` clears it.
+- **Choosing a connector is a menu, not a typed key.** `/chrome connector` with no argument — and the
+  "Choose connector…" entry in the `/chrome` dashboard — opens a picker listing the connected browsers by
+  the same human labels the status output uses, with a tick on the current choice and an option to go
+  back to automatic. The keys (`edge:9d233ecf`) are profile hashes that nobody should have to read or
+  type, so they never appear in the menu. `/chrome connector list` still prints the text form, and
+  `connector` was missing from the command completions entirely.
 - **Fixed: a session that does not own the bridge reported "no connector" no matter what.** Only the Pi
   session that first bound port 17318 ever receives the companion extension's poll; every other session
   forwards its commands to that owner. Their local `connected`/`clients` state is therefore empty **by
@@ -109,6 +115,15 @@ All notable user-facing changes to `pi-chrome`.
   (`refreshStatus()`), keeps it cached so `connected`/`status()`/`clientLabel()` all agree, and keeps
   the last known view if the owner briefly goes away rather than falling back to the empty local state.
   Four cases in `bridge-routing.test.mjs` cover it, including one that fails against the previous code.
+- **Fixed: a `/reload` could silently load nothing at all.** The duplicate-load guard skipped the whole
+  extension whenever its singleton flag carried a token, on the assumption that the previous instance is
+  shut down before the replacement is evaluated. When that order is reversed the replacement skips, the
+  dying instance then declines to clear the flag (its token no longer matches), and every later reload
+  skips as well — leaving the extension loaded by nobody: no `/chrome` command, no `chrome_*` tools, and
+  the only trace a `console.warn` nobody sees. It looked exactly like "reloading does nothing", and
+  recovering needed a full Pi restart. The guard now refuses only a copy from a **different** root, which
+  is the case it exists for (the same extension installed in two places); a flag from this same root is
+  a previous instance of it and is replaced.
 - **Fixed a related skew case:** the fallback for an owner running an older build. The bridge belongs to whichever Pi session
   bound port 17318 first, and an older build answers `/status` with only `connected` + `clientName` —
   no client list. The new `/chrome connector` reporter read `clients` alone, so a session running this

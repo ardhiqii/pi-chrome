@@ -63,12 +63,17 @@ test("command help and root completion omit status; nested background status rem
   assert.doesNotMatch(h.command.description, /\/chrome status\b/);
   assert.match(h.command.description, /\/chrome doctor/);
   assert.deepEqual(Array.from(h.command.getArgumentCompletions(""), (item) => item.value), [
-    "authorize", "revoke", "doctor", "onboard", "background",
+    "authorize", "revoke", "doctor", "onboard", "background", "connector",
   ]);
   assert.equal(h.command.getArgumentCompletions("sta"), null);
   assert.equal(h.command.getArgumentCompletions("doctor")[0].value, "doctor");
   assert.equal(h.command.getArgumentCompletions("background st")[0].value, "background status");
   assert.equal(h.command.getArgumentCompletions("authorize 15")[0].value, "authorize 15m");
+  // Choosing a connector is offered both as an interactive picker (no argument) and as these explicit
+  // forms, so the completions must exist even though the picker is the intended path.
+  assert.deepEqual(Array.from(h.command.getArgumentCompletions("connector "), (item) => item.value), [
+    "connector list", "connector auto",
+  ]);
 });
 
 test("removed status command returns a warning without probing Chrome", async () => {

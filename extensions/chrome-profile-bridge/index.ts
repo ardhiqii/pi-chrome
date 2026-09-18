@@ -100,6 +100,28 @@ function writePreferredConnector(value: string | undefined): void {
 	}
 }
 
+// The entries offered by /chrome connector's picker, and the map from what the user clicks back to the
+// connector it means. Pure so that mapping can be tested directly: the keys are profile hashes
+// ("edge:9d233ecf") that nobody should have to read or type, so the menu shows the same human labels the
+// status output uses — and if two of those labels ever collided, a click would quietly drive the wrong
+// browser, which is the whole thing this feature exists to prevent.
+function connectorMenuOptions(
+	clients: Array<{ key: string; label: string }>,
+	chosenKey: string | null | undefined,
+): { autoLabel: string; options: string[]; keyByLabel: Map<string, string> } {
+	const autoLabel = `${chosenKey ? "  " : "✓ "}Choose automatically (the only connected browser)`;
+	const options: string[] = [autoLabel];
+	const keyByLabel = new Map<string, string>();
+	for (const client of clients) {
+		const base = `${client.key === chosenKey ? "✓ " : "  "}${client.label}`;
+		let label = base;
+		for (let n = 2; keyByLabel.has(label); n++) label = `${base} (${n})`;
+		options.push(label);
+		keyByLabel.set(label, client.key);
+	}
+	return { autoLabel, options, keyByLabel };
+}
+
 type ConnectorStatus = {
 	connected?: boolean;
 	clientName?: string | null;
@@ -1578,13 +1600,38 @@ Usage rules:
 		}
 	};
 
+	const openConnectorMenu = async (ctx: ExtensionContext): Promise<void> => {
+		const status = (await bridge.refreshStatus()) as ConnectorStatus;
+		const clients = status.clients ?? [];
+		if (clients.length === 0) {
+			// Nothing to choose between, so say what is actually wrong rather than offering an empty menu.
+			ctx.ui.notify(describeConnectorStatus(status), "info");
+			return;
+		}
+		const { autoLabel, options, keyByLabel } = connectorMenuOptions(clients, status.selectedKey ?? status.selectedClient);
+		const choice = await ctx.ui.select("Which browser should Pi drive?", options);
+		if (!choice) return;
+		const key = choice === autoLabel ? "auto" : keyByLabel.get(choice);
+		if (!key) return;
+		ctx.ui.notify(
+			describeConnectorStatus((await bridge.send("client.select", { key }, 10_000)) as ConnectorStatus),
+			"info",
+		);
+	};
+
 	// Choose which installed connector receives chrome_* commands. With one connector this is a no-op in
 	// practice; with several it is the difference between driving the browser you meant and driving
 	// whichever one happened to poll first.
 	const connectorHandler = async (ctx: ExtensionContext, args: string): Promise<void> => {
 		const describe = describeConnectorStatus;
 		try {
-			if (!args.trim() || args.trim() === "list" || args.trim() === "status") {
+			// No argument means the interactive picker, so /chrome connector and the "Choose connector…" menu
+			// entry lead somewhere you can click. "list" remains the explicit way to print the text form.
+			if (!args.trim()) {
+				await openConnectorMenu(ctx);
+				return;
+			}
+			if (args.trim() === "list" || args.trim() === "status") {
 				ctx.ui.notify(describe((await bridge.refreshStatus()) as ConnectorStatus), "info");
 				return;
 			}
@@ -1643,6 +1690,7 @@ Usage rules:
 					{ fullValue: "doctor", label: "doctor", description: "Full diagnostics: connection, version, page checks, authorization, and background state." },
 					{ fullValue: "onboard", label: "onboard", description: "Install the Chrome companion extension (first-time setup)." },
 					{ fullValue: "background", label: "background", description: "Enforce hard background or allow foreground/watch mode." },
+					{ fullValue: "connector", label: "connector", description: "Choose which installed connector (browser + profile) receives commands." },
 				];
 			} else if (path[0] === "authorize" && path.length === 1) {
 				candidates = [
@@ -1656,6 +1704,11 @@ Usage rules:
 					{ fullValue: "background off", label: "off", description: "Bring Chrome to the front so you can watch." },
 					{ fullValue: "background toggle", label: "toggle", description: "Flip whichever way it's currently set." },
 					{ fullValue: "background status", label: "status", description: "Show the current setting." },
+				];
+			} else if (path[0] === "connector" && path.length === 1) {
+				candidates = [
+					{ fullValue: "connector list", label: "list", description: "Show the connected connectors and the current selection." },
+					{ fullValue: "connector auto", label: "auto", description: "Stop preferring one browser; use the only connected one." },
 				];
 			}
 			if (candidates.length === 0) return null;
