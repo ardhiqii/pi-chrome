@@ -657,22 +657,20 @@ test("the window picker marks the window Pi is ACTUALLY using, and maps clicks b
   };
   const built = menu(report);
 
-  // A guest in the user's window: Pi's own window is NOT the current choice.
-  assert.match(built.ownLabel, /^ {2}/, "our own window is unmarked while we are a guest elsewhere");
   // Spread into a host-realm array: values from the vm have a different prototype, which strict deepEqual
   // rejects even when the contents match.
   assert.deepEqual([...built.options], [
-    built.ownLabel,
     "  Window 11 — 12 tabs, focused — WhatsApp",
     "✓ Window 22 — 3 tabs — GitHub",
   ]);
   assert.equal(built.windowByLabel.get("  Window 11 — 12 tabs, focused — WhatsApp"), 11);
   assert.equal(built.windowByLabel.get("✓ Window 22 — 3 tabs — GitHub"), 22, "the marked one still maps correctly");
+  assert.equal(built.options.some((label) => /Pi's own/.test(label)), false, "Pi's own window is not an entry");
 });
 
-test("Pi's own window is named once, not listed again as though it were the user's", () => {
-  // It used to appear twice: as "Pi's own window" and again as "Window 720722774", which read as two
-  // different windows. It is one window, so it is one entry.
+test("Pi's own window is not offered at all — only windows that exist right now are", () => {
+  // The entry promised a window that may not exist ("isolated, cleaned up automatically") and choosing it
+  // could drop tabs into the user's own window. It is no longer a choice; it must not appear in the menu.
   const menu = loadWindowMenuOptions();
   const built = menu({
     ownsTargetWindow: true,
@@ -682,28 +680,25 @@ test("Pi's own window is named once, not listed again as though it were the user
       { windowId: 11, tabCount: 12, title: "WhatsApp", focused: true, holdsTargetTab: false },
     ],
   });
-  // Marked from the recorded ownership, which is what decides whether cleanup may close the window.
-  assert.match(built.ownLabel, /^✓ /);
-  assert.match(built.ownLabel, /Window 33 — 1 tab — AI news - Search \/ X/, "names the window it means");
-  assert.equal(built.options[1], built.newLabel, "opening another is offered only when one already exists");
-  assert.equal(built.options[2], "  Window 11 — 12 tabs, focused — WhatsApp");
-  assert.equal(built.options.length, 3, "no second entry for window 33");
+  assert.deepEqual([...built.options], ["  Window 11 — 12 tabs, focused — WhatsApp"],
+    "the owned window is gone; only the user's real window remains");
+  assert.equal(built.options.some((label) => /Pi's own/.test(label)), false, "no Pi's-own-window entry");
+  assert.equal(built.options.some((label) => /(isolated|new window)/i.test(label)), false, "no create-a-window entry either");
   assert.equal(built.windowByLabel.size, 1, "the owned window is not selectable as one of the user's");
   assert.equal(built.windowByLabel.get("  Window 11 — 12 tabs, focused — WhatsApp"), 11);
 });
 
-test("with no window of its own yet, the entry describes what choosing it creates", () => {
+test("with no window of its own yet, the picker still lists only real windows", () => {
   const menu = loadWindowMenuOptions();
   const built = menu({
     ownsTargetWindow: false,
     targetWindowId: null,
     windows: [{ windowId: 11, tabCount: 12, title: "WhatsApp", focused: true, holdsTargetTab: false }],
   });
-  assert.match(built.ownLabel, /^ {2}/);
-  assert.match(built.ownLabel, /\(isolated, cleaned up automatically\)/);
-  // Nothing to reuse, so "open a new one" would be the same action and is not offered.
-  assert.equal(built.options.length, 2, "own window plus the one real window");
-  assert.equal(built.newLabel.startsWith("  "), true, "and it must never look selected");
+  assert.deepEqual([...built.options], ["  Window 11 — 12 tabs, focused — WhatsApp"],
+    "only the real window is offered");
+  assert.equal(built.options.some((label) => /(Pi's own|isolated|new window)/i.test(label)), false,
+    "nothing promises a window that is not open");
 });
 
 test("the window picker never collapses two windows onto one entry, and truncates long titles", () => {
@@ -716,15 +711,41 @@ test("the window picker never collapses two windows onto one entry, and truncate
       { windowId: 2, tabCount: 2, title: long, focused: false, holdsTargetTab: false },
     ],
   });
-  assert.equal(built.options.length, 3, "our own window plus two entries");
-  assert.equal(new Set(built.options).size, 3, "every entry is independently selectable");
+  assert.equal(built.options.length, 2, "one entry per real window");
+  assert.equal(new Set(built.options).size, 2, "every entry is independently selectable");
   assert.deepEqual([...built.windowByLabel.values()].sort(), [1, 2], "both windows stay reachable");
-  for (const label of built.options.slice(1)) assert.ok(label.length < 80, `label not truncated: ${label}`);
+  for (const label of built.options) assert.ok(label.length < 80, `label not truncated: ${label}`);
 });
 
 test("the window picker skips windows without an id instead of inventing one", () => {
   const menu = loadWindowMenuOptions();
   const built = menu({ ownsTargetWindow: false, windows: [{ windowId: null, tabCount: 4, title: "?", focused: false, holdsTargetTab: false }] });
-  assert.equal(built.options.length, 1, "only Pi's own window is offered");
+  assert.equal(built.options.length, 0, "no window has an id, so there is nothing to offer");
   assert.equal(built.windowByLabel.size, 0);
+});
+
+test("the window picker offers exactly the real windows — and nothing when there are none", () => {
+  // The invariant, asserted directly: the menu is a list of windows that exist right now. It never
+  // includes the removed "Pi's own window" entry, in either report shape.
+  const menu = loadWindowMenuOptions();
+  const withWindows = menu({
+    ownsTargetWindow: false,
+    targetWindowId: null,
+    windows: [
+      { windowId: 11, tabCount: 12, title: "WhatsApp", focused: true, holdsTargetTab: true },
+      { windowId: 22, tabCount: 3, title: "GitHub", focused: false, holdsTargetTab: false },
+    ],
+  });
+  assert.deepEqual([...withWindows.options], [
+    "✓ Window 11 — 12 tabs, focused — WhatsApp",
+    "  Window 22 — 3 tabs — GitHub",
+  ], "exactly the real windows, and nothing else");
+  assert.equal(withWindows.options.some((label) => /(Pi's own|isolated|new window)/i.test(label)), false,
+    "no entry for a window that is not open");
+  assert.deepEqual([...withWindows.windowByLabel.values()].sort((a, b) => a - b), [11, 22], "each window maps to its id");
+
+  // Zero windows: the picker offers nothing rather than promising a window it would create.
+  const none = menu({ ownsTargetWindow: true, targetWindowId: null, windows: [] });
+  assert.deepEqual([...none.options], []);
+  assert.equal(none.windowByLabel.size, 0);
 });

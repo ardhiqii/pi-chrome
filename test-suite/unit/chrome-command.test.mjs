@@ -38,8 +38,14 @@ function harness({ until, background = true, mode = "server", choices = [], send
     ui: {
       notify: (...args) => notices.push(args),
       async select(title, items) {
-        menus.push({ title, items: Array.from(items) });
-        return choices[menus.length - 1];
+        const labels = Array.from(items);
+        menus.push({ title, items: labels });
+        const choice = choices[menus.length - 1];
+        // A real host can only return a listed item, so a test that queues anything else would certify an
+        // interaction the user cannot perform. Fail loudly instead.
+        assert.ok(choice === undefined || labels.includes(choice),
+          `queued choice is not in the menu: ${JSON.stringify(choice)}`);
+        return choice;
       },
       async input() { return undefined; },
     },
@@ -286,9 +292,25 @@ test("/chrome window list names the window Pi is actually a guest in", async () 
   assert.match(text, /cleanup closes only Pi's tab/);
 });
 
-test("choosing 'Open a new window' asks for a fresh one; choosing the existing one reuses it", async () => {
-  // Reuse-by-default means the two entries must be distinguishable on the wire, or the user cannot get a
-  // genuinely new window at all.
+test("/chrome window list says so plainly when there is nothing else to list", async () => {
+  // Only Pi's own window is open: the status used to end in a "Windows open:" header with zero entries,
+  // directly under a sentence saying a window is open. Say there is nothing else instead.
+  const h = harness({
+    send: async (action) =>
+      action === "window.list"
+        ? { windows: [{ windowId: 33, tabCount: 1, title: "AI news", focused: true, holdsTargetTab: true, ownedByPi: true }], ownsTargetWindow: true, targetWindowId: 33 }
+        : {},
+  });
+  await h.run("window list");
+  const text = String(h.notices[0][0]);
+  assert.match(text, /working in a window of its own \(window 33\)/);
+  assert.match(text, /No other Chrome windows are open right now\./);
+});
+
+test("the window picker offers only open windows, never Pi's own or a create-new entry", async () => {
+  // The old picker offered "Pi's own window" and "Open a new window of Pi's own". Both are gone: the first
+  // could route work into the user's own window, and the second promised a window that did not exist yet.
+  // /chrome window own is still the explicit way to get (or reuse) a window of Pi's own.
   const report = {
     windows: [
       { windowId: 33, tabCount: 1, title: "AI news", focused: false, holdsTargetTab: true, ownedByPi: true },
@@ -297,15 +319,30 @@ test("choosing 'Open a new window' asks for a fresh one; choosing the existing o
     ownsTargetWindow: true,
     targetWindowId: 33,
   };
-  const send = async (action) => (action === "window.list" ? report : { windowId: 33, reused: false, fresh: true });
+  const send = async (action) => (action === "window.list" ? report : { windowId: 11, reused: false });
 
-  const freshRun = harness({ send, choices: ["  Open a new window of Pi's own"] });
-  await freshRun.run("window");
-  assert.equal(freshRun.calls[1].params.windowId, null);
-  assert.equal(freshRun.calls[1].params.fresh, true, "an explicit new-window request carries fresh");
+  const h = harness({ send, choices: ["  Window 11 — 5 tabs, focused — Terrarium"] });
+  await h.run("window");
+  assert.deepEqual(h.menus[0].items, ["  Window 11 — 5 tabs, focused — Terrarium"],
+    "the owned window and the create-new entry are not offered");
+  assert.equal(h.calls[1].action, "window.select");
+  assert.equal(h.calls[1].params.windowId, 11);
+  assert.equal(h.calls[1].params.fresh, undefined, "the picker has no fresh-window request to send");
+});
 
-  const reuseRun = harness({ send, choices: ["✓ Pi's own window (Window 33 — 1 tab — AI news)"] });
-  await reuseRun.run("window");
-  assert.equal(reuseRun.calls[1].params.windowId, null);
-  assert.equal(reuseRun.calls[1].params.fresh, undefined, "reusing the existing one must NOT ask for a fresh window");
+test("an empty window picker explains how to proceed instead of showing a dead-end dialog", async () => {
+  // The realistic state: Pi's dedicated window is the only one open. A zero-item select cannot be confirmed
+  // (Enter does nothing; only Esc exits), so the handler must say what to do instead of showing it.
+  const report = {
+    windows: [{ windowId: 33, tabCount: 1, title: "AI news", focused: true, holdsTargetTab: true, ownedByPi: true }],
+    ownsTargetWindow: true,
+    targetWindowId: 33,
+  };
+  const h = harness({ send: async (action) => (action === "window.list" ? report : {}) });
+  await h.run("window");
+  assert.equal(h.menus.length, 0, "no empty menu is shown");
+  assert.equal(h.calls.length, 1, "no window.select is attempted");
+  const text = String(h.notices.at(-1)[0]);
+  assert.match(text, /Open a window in Chrome/);
+  assert.match(text, /\/chrome window own/, "names the route that still works");
 });

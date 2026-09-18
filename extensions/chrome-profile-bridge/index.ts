@@ -224,27 +224,18 @@ function truncateTitle(title: string, max = 40): string {
 // state rather than from the labels, because "our own window" and "a guest tab in theirs" look alike
 // otherwise — and that difference decides whether cleanup may close a whole window.
 function windowMenuOptions(report: WindowReport): {
-	ownLabel: string;
-	newLabel: string;
 	options: string[];
 	windowByLabel: Map<string, number>;
 } {
 	const ownsOwn = report.ownsTargetWindow === true;
-	const owned = (report.windows ?? []).find((win) => win.ownedByPi === true);
-	// Name the window Pi already owns, so the entry says which window it means instead of promising a
-	// vague "isolated" one. Without an owned window it describes what choosing it will create.
-	const ownText = owned
-		? `Window ${owned.windowId} — ${owned.tabCount} tab${owned.tabCount === 1 ? "" : "s"} — ${truncateTitle(owned.title)}`
-		: "isolated, cleaned up automatically";
-	const ownLabel = `${ownsOwn ? "✓ " : "  "}Pi's own window (${ownText})`;
-	// Opening another one is only a distinct choice when Pi already has a window to reuse; otherwise the
-	// entry above would do exactly the same thing.
-	const newLabel = "  Open a new window of Pi's own";
-	const options: string[] = owned ? [ownLabel, newLabel] : [ownLabel];
+	// The menu lists only windows that exist right now. Pi's own window is not a choice: an entry for it could
+	// put Pi's work into the user's window, and it duplicated a window that is already listed when it exists.
+	// /chrome window own remains the explicit way to ask for a window of Pi's own.
+	const options: string[] = [];
 	const windowByLabel = new Map<string, number>();
 	for (const win of report.windows ?? []) {
 		if (typeof win.windowId !== "number") continue;
-		// Pi's own window is represented by the entry above, not listed again as one of the user's.
+		// Pi's own window is reached with /chrome window own, not from this list.
 		if (win.ownedByPi === true) continue;
 		const mark = !ownsOwn && win.holdsTargetTab ? "✓ " : "  ";
 		const count = `${win.tabCount} tab${win.tabCount === 1 ? "" : "s"}`;
@@ -254,11 +245,11 @@ function windowMenuOptions(report: WindowReport): {
 		options.push(label);
 		windowByLabel.set(label, win.windowId);
 	}
-	return { ownLabel, newLabel, options, windowByLabel };
+	return { options, windowByLabel };
 }
 
 function describeWindows(report: WindowReport): string {
-	const { ownLabel, options } = windowMenuOptions(report);
+	const { options } = windowMenuOptions(report);
 	// targetWindowId is only set for a window Pi created, so a guest tab has none — naming the window that
 	// actually holds our tab is the whole point of this list.
 	const holder = (report.windows ?? []).find((win) => win.holdsTargetTab);
@@ -267,7 +258,12 @@ function describeWindows(report: WindowReport): string {
 		: holder
 			? `window ${holder.windowId} — yours; cleanup closes only Pi's tab in it`
 			: "no window yet";
-	return [`This session is working in ${where}.`, "Windows open:", ...options].join("\n");
+	// A bare "Windows open:" header with nothing under it would contradict the sentence above when the only
+	// window is Pi's own, so say plainly that there is nothing else to list.
+	const lines = [`This session is working in ${where}.`];
+	if (options.length > 0) lines.push("Windows open:", ...options);
+	else lines.push("No other Chrome windows are open right now.");
+	return lines.join("\n");
 }
 
 type ClientSummary = { key: string; label: string };
@@ -1880,21 +1876,27 @@ Usage rules:
 	// user can see it.
 	const openWindowMenu = async (ctx: ExtensionContext): Promise<void> => {
 		const report = (await bridge.send("window.list", windowParams(ctx), 15_000)) as WindowReport;
-		const { ownLabel, newLabel, options, windowByLabel } = windowMenuOptions(report);
+		const { options, windowByLabel } = windowMenuOptions(report);
+		if (options.length === 0) {
+			// A zero-item select is a dead end in the TUI: Enter does nothing and only Esc exits. Pi's own window
+			// is deliberately not offered here, so when it is the only one open, point at what still works.
+			ctx.ui.notify(
+				"No Chrome windows are open to choose from. Open a window in Chrome and run /chrome window again — or run /chrome window own to use a window of Pi's own.",
+				"info",
+			);
+			return;
+		}
 		const choice = await ctx.ui.select("Which window should Pi use?", options);
 		if (!choice) return;
-		const fresh = choice === newLabel;
-		const windowId = choice === ownLabel || fresh ? null : windowByLabel.get(choice);
+		const windowId = windowByLabel.get(choice);
 		if (windowId === undefined) return;
 		const result = (await bridge.send(
 			"window.select",
-			{ ...windowParams(ctx), windowId, ...(fresh ? { fresh: true } : {}) },
+			{ ...windowParams(ctx), windowId },
 			20_000,
 		)) as { windowId?: number | null; reused?: boolean };
 		ctx.ui.notify(
-			windowId === null
-				? `Pi will use a window of its own${result.windowId ? ` (window ${result.windowId})` : ""}${result.reused ? " — the one it already has" : ""}.`
-				: `Pi will work in window ${result.windowId ?? windowId}${result.reused ? " (already there)" : ""}.`,
+			`Pi will work in window ${result.windowId ?? windowId}${result.reused ? " (already there)" : ""}.`,
 			"info",
 		);
 	};
