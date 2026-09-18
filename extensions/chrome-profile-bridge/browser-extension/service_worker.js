@@ -288,10 +288,15 @@ async function createIsolatedWindowTarget(sessionKey, { allowSharedTabFallback =
       const created = win && Array.isArray(win.tabs) ? win.tabs[0] : undefined;
       if (created && typeof created.id === "number") {
         if (typeof win.id === "number") piCreatedWindowIds.add(win.id);
-        automationTargets.set(sessionKey, { windowId: typeof win.id === "number" ? win.id : undefined, tabId: created.id, piWindow: true });
+        // The window id is authoritative; the returned tab's windowId is not guaranteed. Edge has been
+        // observed to answer windows.create with a Window whose `tabs` entries omit it, and a caller
+        // gating on `target.windowId` (tab.new) then created its tab with no window — the focused one,
+        // the user's. Fill it in from the window we just made.
+        const windowId = typeof created.windowId === "number" ? created.windowId : win.id;
+        automationTargets.set(sessionKey, { windowId, tabId: created.id, piWindow: true });
         await persistAutomationTargets();
         await persistPiCreatedWindows();
-        return created;
+        return typeof windowId === "number" ? { ...created, windowId } : created;
       }
       // Chrome answered with a window but no usable first tab. Leaving it behind would strand an
       // untracked, unowned window; close it before deciding on the fallback below.
@@ -345,6 +350,16 @@ async function createAutomationTarget(sessionKey, groupTitle, { allowSharedTabFa
   const settingWindowId = record && typeof record.windowId === "number" ? record.windowId : null;
   if (settingWindowId !== null) {
     const piWindow = record.piWindow === true || isPiOwnedWindow(settingWindowId);
+    // A recorded Pi window whose own tab is gone may still hold an unowned marker from a wiped
+    // record; adopt it instead of adding yet another marker to the shared window.
+    if (piWindow) {
+      const reusable = await findReusableOrphanAutomationTab(settingWindowId);
+      if (reusable) {
+        automationTargets.set(sessionKey, { windowId: settingWindowId, tabId: reusable.id, piWindow: true });
+        await persistAutomationTargets();
+        return reusable;
+      }
+    }
     // Creating the tab is also the existence check: Chrome rejects a windowId whose window is gone.
     const created = await chrome.tabs.create({ url: BLANK_AUTOMATION_URL, active: false, windowId: settingWindowId }).catch((error) => error);
     if (created && typeof created.id === "number") {
@@ -364,6 +379,15 @@ async function createAutomationTarget(sessionKey, groupTitle, { allowSharedTabFa
   }
   const dedicatedWindowId = await findDedicatedPiWindow();
   if (dedicatedWindowId !== null) {
+    // The shared window may already hold an unowned automation marker (an extension reload wipes the
+    // session records but not the tabs). Adopt it so one marker serves the window instead of one per
+    // session that ever ran. A marker a live record names is owned and skipped by the helper.
+    const reusable = await findReusableOrphanAutomationTab(dedicatedWindowId);
+    if (reusable) {
+      automationTargets.set(sessionKey, { windowId: dedicatedWindowId, tabId: reusable.id, piWindow: true });
+      await persistAutomationTargets();
+      return reusable;
+    }
     const created = await chrome.tabs.create({ url: BLANK_AUTOMATION_URL, active: false, windowId: dedicatedWindowId }).catch(() => null);
     if (created && typeof created.id === "number") {
       automationTargets.set(sessionKey, { windowId: dedicatedWindowId, tabId: created.id, piWindow: true });
@@ -437,6 +461,23 @@ async function findDedicatedPiWindow() {
   return candidates.sort((a, b) => a - b)[0];
 }
 
+// An #pi-chrome marker tab that no session record names is an orphan: what an extension reload (which
+// wipes chrome.storage.session) leaves behind while the browser keeps the window. Adopting it for a new
+// session keeps ONE automation marker per shared window instead of one per session that ever ran, and
+// it is safe precisely because no live session owns it. A tab a live record names is never touched, so
+// two sessions can never end up driving the same tab.
+async function findReusableOrphanAutomationTab(windowId) {
+  if (typeof windowId !== "number" || typeof chrome.tabs.query !== "function") return null;
+  await hydrateAutomationTargets();
+  const tabs = await chrome.tabs.query({ windowId }).catch(() => []);
+  for (const tab of tabs || []) {
+    if (typeof tab.id !== "number" || !isPiMarkerTab(tab)) continue;
+    if (isPiChromeOwnedTarget(tab.id)) continue;
+    return tab;
+  }
+  return null;
+}
+
 // Return the session's owned automation target if it still exists, else null. Robust to the user
 // (or Chrome) having closed it: the dead tab id is forgotten but the recorded window is kept — it
 // is the session's setting, so the caller rebuilds there (or fails naming it) instead of drifting.
@@ -497,12 +538,24 @@ async function movedAutomationTargetError(tab, sessionKey) {
   );
 }
 
+// A resolved automation target must name the window it lives in: every caller that creates or groups a
+// tab needs it, and a missing windowId must never degrade to "whichever window Chrome picks" (the
+// focused one, usually the user's). A creation API is not a reliable source for the property — Edge's
+// windows.create has been observed to answer with a Window whose tab omits it — so re-read the live tab
+// when the property is absent. A tab that no longer exists is returned unchanged and handled by callers.
+async function withResolvedWindowId(tab) {
+  if (!tab || typeof tab.id !== "number" || typeof tab.windowId === "number") return tab;
+  const live = await chrome.tabs.get(tab.id).catch(() => null);
+  return live && typeof live.windowId === "number" ? { ...tab, windowId: live.windowId } : tab;
+}
+
 // Return the session's dedicated automation target, creating it on first use (or after the user
 // closed it). Used by page/navigation actions that need a live surface to drive. Creation is strict by
 // default: an implicit action must never end up in a window Chrome picks for us (see
 // createAutomationTarget).
 async function getOrCreateAutomationTarget(sessionKey, groupTitle, { allowSharedTabFallback = false } = {}) {
-  return (await resolveOwnedAutomationTarget(sessionKey)) || createAutomationTarget(sessionKey, groupTitle, { allowSharedTabFallback });
+  const target = (await resolveOwnedAutomationTarget(sessionKey)) || await createAutomationTarget(sessionKey, groupTitle, { allowSharedTabFallback });
+  return withResolvedWindowId(target);
 }
 
 // Close only the session's pi-chrome-owned window/tab, and only if it still exists. Never touches
@@ -1651,7 +1704,17 @@ async function dispatch(action, params) {
       // This CREATES the session's automation window if it does not exist yet, which is the point: the
       // first tab Pi opens must not land among the user's.
       const targetTab = await getOrCreateAutomationTarget(sessionKeyOf(params), params.groupTitle);
-      if (targetTab && typeof targetTab.windowId === "number") createParams.windowId = targetTab.windowId;
+      // A tab must never be created without a window: chrome.tabs.create defaults to the FOCUSED window
+      // — the user's — and that is exactly how the live Edge run left tab.new's tab and its new group
+      // among the user's tabs while the automation marker sat in Pi's window. The helper resolves the
+      // window from the live tab; if even that fails, fail closed instead of guessing.
+      if (!targetTab || typeof targetTab.windowId !== "number") {
+        throw new Error(
+          "pi-chrome could not determine which window this session's automation target lives in, so it " +
+            "will not create tab.new's tab in whichever window happens to be focused. Retry, or run /chrome window to choose a window on purpose.",
+        );
+      }
+      createParams.windowId = targetTab.windowId;
       const tab = await chrome.tabs.create(createParams);
       await trackSessionTab(sessionKeyOf(params), tab.id, true);
       try {

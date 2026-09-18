@@ -338,6 +338,86 @@ async function run() {
     ok(opened.tab.windowId !== state.userWindowId, "tab-new-shared: still not the user's window");
   }
 
+  // ===== LIVE (Edge): windows.create answered with a Window whose `tabs` entry omitted `windowId`.
+  // getOrCreateAutomationTarget resolved a target in Pi's brand-new window, but tab.new's
+  // `typeof targetTab.windowId === "number"` gate was false, so it called chrome.tabs.create WITHOUT
+  // a windowId — and chrome.tabs.create defaults to the FOCUSED window, the user's. The requested tab
+  // and its new group landed among the user's tabs while the automation marker sat correctly in Pi's
+  // window. tab.new's own tab must always live in the window the resolver actually put the target in. =====
+  {
+    const state = makeChromeState();
+    const chrome = makeChrome(state, { withTabGroups: true });
+    const realWindowsCreate = chrome.windows.create;
+    let piWindowId = null;
+    chrome.windows.create = async ({ url, focused } = {}) => {
+      const win = await realWindowsCreate({ url, focused });
+      piWindowId = win.id;
+      // The observed Edge shape: the window id is present, the returned tab object is not fully
+      // populated. Chrome puts a windowId-less create in whichever window is focused.
+      const [{ windowId, ...tabWithoutWindowId }] = win.tabs;
+      return { ...win, tabs: [tabWithoutWindowId] };
+    };
+    const w = loadWorker(chrome);
+    const userTabsBefore = [...state.tabs.values()].filter((t) => t.windowId === state.userWindowId).length;
+
+    const opened = await w.dispatch("tab.new", { url: "https://pi.test/live-quirk", groupTitle: "Pi Agent", sessionKey: "session:fresh" });
+    ok(piWindowId !== null, "tab-new-live-quirk: the resolver created Pi's dedicated window");
+    ok(opened.tab.windowId === piWindowId,
+      "tab-new-live-quirk: tab.new's own tab is in the SAME window as the automation target it just resolved");
+    ok(opened.tab.windowId !== state.userWindowId,
+      "tab-new-live-quirk: tab.new's own tab is never created in the user's window");
+    const userTabsAfter = [...state.tabs.values()].filter((t) => t.windowId === state.userWindowId).length;
+    ok(userTabsAfter === userTabsBefore, "tab-new-live-quirk: the user's window gained no tab");
+    ok(opened.group.windowId === piWindowId,
+      "tab-new-live-quirk: the new group was created in Pi's window, not the user's");
+  }
+
+  // ===== Fail closed: when neither the resolved target nor a re-read of its tab yields a window,
+  // tab.new must NOT fall back to a windowId-less chrome.tabs.create (Chrome puts that in the FOCUSED
+  // window — the user's). It refuses instead, and the user's window is left untouched. =====
+  {
+    const state = makeChromeState();
+    const chrome = makeChrome(state, { withTabGroups: true });
+    const w = loadWorker(chrome);
+    const creates = [];
+    const realTabsCreate = chrome.tabs.create;
+    chrome.tabs.create = async (props = {}) => { creates.push({ ...props }); return realTabsCreate(props); };
+    // A resolved target that carries an id but no usable windowId, and that chrome.tabs.get cannot
+    // re-read (as when the tab is closed between resolve and create).
+    w.getOrCreateAutomationTarget = async () => ({ id: 999999, url: "about:blank#pi-chrome", active: false, groupId: -1 });
+    const userTabsBefore = [...state.tabs.values()].filter((t) => t.windowId === state.userWindowId).length;
+
+    await throwsWith(
+      () => w.dispatch("tab.new", { url: "https://pi.test/no-window-id", sessionKey: "session:orphan" }),
+      /window/i,
+      "tab-new-guard: refuses when the target's window cannot be resolved",
+    );
+    ok(creates.every((props) => typeof props.windowId === "number"),
+      "tab-new-guard: never calls chrome.tabs.create without an explicit window");
+    const userTabsAfter = [...state.tabs.values()].filter((t) => t.windowId === state.userWindowId).length;
+    ok(userTabsAfter === userTabsBefore, "tab-new-guard: the user's window gained no tab");
+  }
+
+  // ===== Papercut: after an extension reload wipes the registry, the shared Pi window still holds the
+  // old session's #pi-chrome marker. A new session must ADOPT that unowned automation target instead of
+  // adding another marker, or one orphan marker accumulates per reloaded session. =====
+  {
+    const state = makeChromeState();
+    const w1 = loadWorker(makeChrome(state));
+    const seed = await w1.getOrCreateAutomationTarget("session:alpha");
+    ok(seed.url === "about:blank#pi-chrome", "orphan-marker: seed target is a marker tab");
+    for (const key of Object.keys(state.storage)) delete state.storage[key]; // extension reload
+    const tabsBefore = state.tabs.size;
+
+    const w2 = loadWorker(makeChrome(state));
+    const nav = await w2.dispatch("page.navigate", { url: "https://pi.test/orphan-reuse", waitUntilLoad: false, sessionKey: "session:beta" });
+    const orphanMarkers = [...state.tabs.values()].filter((t) => t.windowId === seed.windowId && (t.url || "").includes("#pi-chrome")).length;
+    ok(nav.id === seed.id, "orphan-marker: the unowned marker tab was adopted, not duplicated");
+    ok(state.tabs.size === tabsBefore, "orphan-marker: no extra marker tab was left in the shared window");
+    ok(orphanMarkers === 0, "orphan-marker: the adopted marker navigated away, leaving no orphan marker");
+    ok(nav.windowId === seed.windowId, "orphan-marker: adoption happened in the shared Pi window");
+  }
+
   // ===== Rule 4, plainly: a user window with no #pi-chrome marker and no "Pi Agent" group is
   // never adopted. Pi creates its own window and the user's window is left with exactly its tabs. =====
   {
