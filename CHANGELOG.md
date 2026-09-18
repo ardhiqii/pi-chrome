@@ -107,6 +107,13 @@ All notable user-facing changes to `pi-chrome`.
   `connector` was missing from the command completions entirely. The picker loops, so Esc steps back
   one level — cancelling the name prompt returns to the picker rather than abandoning the flow — and a
   name can be removed again, falling back to the profile id.
+- **Choosing which browser window Pi works in.** Each Pi session normally gets a window of its own, so
+  its tabs never land among yours unnoticed. `/chrome window` — and "Choose window…" in the dashboard —
+  lists the open windows and lets Pi's tab go into one of them instead; the window is identified by the
+  title of the tab you can actually see in it. The tab is created inactive and the window is never
+  focused, and since that window is yours, cleanup closes only Pi's tab in it and never the window
+  itself. `/chrome window own` goes back to a window of Pi's own. Window choice is per session, like the
+  automation target it configures — unlike the connector preference, which is machine-wide.
 - **Fixed: a session that does not own the bridge reported "no connector" no matter what.** Only the Pi
   session that first bound port 17318 ever receives the companion extension's poll; every other session
   forwards its commands to that owner. Their local `connected`/`clients` state is therefore empty **by

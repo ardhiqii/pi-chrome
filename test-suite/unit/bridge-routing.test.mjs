@@ -631,3 +631,81 @@ test("a name this session knows is applied even when the OWNER does not know it"
     });
   });
 });
+
+// The window picker's label -> windowId mapping, loaded on its own (pure functions).
+function loadWindowMenuOptions() {
+  const start = indexSource.indexOf("function truncateTitle(");
+  const end = indexSource.indexOf("\nfunction describeWindows(", start);
+  assert.ok(start >= 0 && end > start, "could not locate the window menu helpers");
+  const sandbox = { console, Map };
+  vm.runInNewContext(
+    stripTypeScriptTypes(indexSource.slice(start, end)) + "\n;globalThis.__w = windowMenuOptions;",
+    sandbox,
+  );
+  return sandbox.__w;
+}
+
+test("the window picker marks the window Pi is ACTUALLY using, and maps clicks back to it", () => {
+  const menu = loadWindowMenuOptions();
+  const report = {
+    ownsTargetWindow: false,
+    targetWindowId: null,
+    windows: [
+      { windowId: 11, tabCount: 12, title: "WhatsApp", focused: true, holdsTargetTab: false },
+      { windowId: 22, tabCount: 3, title: "GitHub", focused: false, holdsTargetTab: true },
+    ],
+  };
+  const built = menu(report);
+
+  // A guest in the user's window: Pi's own window is NOT the current choice.
+  assert.match(built.ownLabel, /^ {2}/, "our own window is unmarked while we are a guest elsewhere");
+  // Spread into a host-realm array: values from the vm have a different prototype, which strict deepEqual
+  // rejects even when the contents match.
+  assert.deepEqual([...built.options], [
+    built.ownLabel,
+    "  Window 11 — 12 tabs, focused — WhatsApp",
+    "✓ Window 22 — 3 tabs — GitHub",
+  ]);
+  assert.equal(built.windowByLabel.get("  Window 11 — 12 tabs, focused — WhatsApp"), 11);
+  assert.equal(built.windowByLabel.get("✓ Window 22 — 3 tabs — GitHub"), 22, "the marked one still maps correctly");
+});
+
+test("the window picker marks Pi's own window when that is what it is using", () => {
+  const menu = loadWindowMenuOptions();
+  const built = menu({
+    ownsTargetWindow: true,
+    targetWindowId: 33,
+    windows: [
+      { windowId: 33, tabCount: 1, title: "(empty window)", focused: false, holdsTargetTab: true },
+      { windowId: 11, tabCount: 12, title: "WhatsApp", focused: true, holdsTargetTab: false },
+    ],
+  });
+  // ours is marked even though a window also "holds the tab" — the recorded ownership is what decides,
+  // because that is what governs whether cleanup may close the whole window.
+  assert.match(built.ownLabel, /^✓ /);
+  assert.equal(built.options[1], "  Window 33 — 1 tab — (empty window)");
+  assert.equal(built.options[2], "  Window 11 — 12 tabs, focused — WhatsApp");
+});
+
+test("the window picker never collapses two windows onto one entry, and truncates long titles", () => {
+  const menu = loadWindowMenuOptions();
+  const long = "x".repeat(90);
+  const built = menu({
+    ownsTargetWindow: false,
+    windows: [
+      { windowId: 1, tabCount: 2, title: long, focused: false, holdsTargetTab: false },
+      { windowId: 2, tabCount: 2, title: long, focused: false, holdsTargetTab: false },
+    ],
+  });
+  assert.equal(built.options.length, 3, "our own window plus two entries");
+  assert.equal(new Set(built.options).size, 3, "every entry is independently selectable");
+  assert.deepEqual([...built.windowByLabel.values()].sort(), [1, 2], "both windows stay reachable");
+  for (const label of built.options.slice(1)) assert.ok(label.length < 80, `label not truncated: ${label}`);
+});
+
+test("the window picker skips windows without an id instead of inventing one", () => {
+  const menu = loadWindowMenuOptions();
+  const built = menu({ ownsTargetWindow: false, windows: [{ windowId: null, tabCount: 4, title: "?", focused: false, holdsTargetTab: false }] });
+  assert.equal(built.options.length, 1, "only Pi's own window is offered");
+  assert.equal(built.windowByLabel.size, 0);
+});

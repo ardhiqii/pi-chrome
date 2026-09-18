@@ -53,6 +53,9 @@ function harness({ until, background = true, mode = "server", choices = [], send
     readConnectorNames: () => connectorNames,
     writeConnectorName: (key, name) => namesWritten.push([key, name]),
     suggestBrowserProfileNames: () => profileSuggestions,
+    // The real one derives the key from the session context; the command section reads it as a free
+    // variable, so the harness supplies a fixed one and asserts it reaches the wire.
+    sessionKeyFor: () => "session:test",
     bridge: {
       status: () => ({ mode }),
       refreshStatus: async () => ({ mode, clients: connectors }),
@@ -73,7 +76,7 @@ test("command help and root completion omit status; nested background status rem
   assert.doesNotMatch(h.command.description, /\/chrome status\b/);
   assert.match(h.command.description, /\/chrome doctor/);
   assert.deepEqual(Array.from(h.command.getArgumentCompletions(""), (item) => item.value), [
-    "authorize", "revoke", "doctor", "onboard", "background", "connector",
+    "authorize", "revoke", "doctor", "onboard", "background", "connector", "window",
   ]);
   assert.equal(h.command.getArgumentCompletions("sta"), null);
   assert.equal(h.command.getArgumentCompletions("doctor")[0].value, "doctor");
@@ -83,6 +86,9 @@ test("command help and root completion omit status; nested background status rem
   // forms, so the completions must exist even though the picker is the intended path.
   assert.deepEqual(Array.from(h.command.getArgumentCompletions("connector "), (item) => item.value), [
     "connector list", "connector auto",
+  ]);
+  assert.deepEqual(Array.from(h.command.getArgumentCompletions("window "), (item) => item.value), [
+    "window list", "window own",
   ]);
 });
 
@@ -232,4 +238,50 @@ test("a name can be removed, falling back to the profile id", async () => {
   });
   await h.run("connector");
   assert.deepEqual(h.namesWritten, [["edge:9d233ecf", undefined]], "the name is cleared");
+});
+
+test("/chrome window is routed AND carries this session's key", async () => {
+  // Both of these were review findings. The subcommand was missing from the /chrome switch entirely, and
+  // the wire calls omitted sessionKey — so the extension fell back to its default bucket and the feature
+  // silently configured a DIFFERENT session's target. Neither is visible without asserting on what was
+  // actually dispatched, which is why the earlier completion-only test passed while the feature was dead.
+  const windowResponse = (action) =>
+    action === "window.list"
+      ? { windows: [{ windowId: 11, tabCount: 2, title: "T", focused: false, holdsTargetTab: true }], ownsTargetWindow: false, targetWindowId: null }
+      : { windowId: 11, reused: false };
+  const h = harness({ send: windowResponse });
+
+  await h.run("window list");
+  assert.equal(h.calls[0].action, "window.list", "window must be a real subcommand, not an unknown one");
+  assert.doesNotMatch(String(h.notices[0][0]), /Unknown subcommand/);
+  assert.equal(h.calls[0].params.sessionKey, "session:test", "the read is scoped to this session");
+
+  await h.run("window own");
+  assert.equal(h.calls[1].action, "window.select");
+  assert.equal(h.calls[1].params.sessionKey, "session:test", "and so is the write");
+  assert.equal(h.calls[1].params.windowId, null, "own means null, not an id");
+
+  // Picking a specific window sends that window's id, with the same session scope. The label carries the
+  // tick because that window holds Pi's tab, so it IS the current choice.
+  const picked = harness({ send: windowResponse, choices: ["✓ Window 11 — 2 tabs — T"] });
+  await picked.run("window");
+  assert.equal(picked.calls[0].action, "window.list");
+  assert.equal(picked.calls[1].action, "window.select");
+  assert.equal(picked.calls[1].params.windowId, 11);
+  assert.equal(picked.calls[1].params.sessionKey, "session:test");
+});
+
+test("/chrome window list names the window Pi is actually a guest in", async () => {
+  // targetWindowId is null for a guest tab by design, so this used to print "window ?" in the common case.
+  const h = harness({
+    send: async (action) =>
+      action === "window.list"
+        ? { windows: [{ windowId: 42, tabCount: 5, title: "WhatsApp", focused: false, holdsTargetTab: true }], ownsTargetWindow: false, targetWindowId: null }
+        : { windowId: 42 },
+  });
+  await h.run("window list");
+  const text = String(h.notices[0][0]);
+  assert.match(text, /working in window 42/, "names the window holding Pi's tab");
+  assert.doesNotMatch(text, /window \?/);
+  assert.match(text, /cleanup closes only Pi's tab/);
 });

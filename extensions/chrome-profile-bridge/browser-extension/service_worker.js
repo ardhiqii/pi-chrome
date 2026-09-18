@@ -1575,6 +1575,70 @@ async function dispatch(action, params) {
       const timeoutMs = cdpCallTimeoutMs(params);
       return await cdp(tab.id, method, params.params ?? {}, { timeoutMs });
     }
+    case "window.list": {
+      // Enumerate the browser's windows with something recognisable to pick from — the title of the tab
+      // the user can actually see in each one. Also report where this session's automation tab lives, so
+      // the caller can mark the current choice without re-deriving it.
+      const windows = await chrome.windows.getAll({ populate: true });
+      await hydrateAutomationTargets();
+      const target = automationTargets.get(sessionKeyOf(params));
+      return {
+        windows: windows.map((win) => {
+          const tabs = Array.isArray(win.tabs) ? win.tabs : [];
+          const activeTab = tabs.find((tab) => tab.active) ?? tabs[0];
+          return {
+            windowId: typeof win.id === "number" ? win.id : null,
+            tabCount: tabs.length,
+            title: (activeTab && (activeTab.title || activeTab.url)) || "(empty window)",
+            focused: win.focused === true,
+            holdsTargetTab: typeof target?.tabId === "number" && tabs.some((tab) => tab.id === target.tabId),
+          };
+        }),
+        // windowId is only recorded when WE created that window. Otherwise the tab is a guest in a
+        // window the user owns, and cleanup must close only the tab.
+        targetWindowId: typeof target?.windowId === "number" ? target.windowId : null,
+        ownsTargetWindow: typeof target?.windowId === "number",
+      };
+    }
+    case "window.select": {
+      const wanted = params.windowId;
+      if (wanted !== null && !Number.isInteger(wanted)) {
+        throw new Error('window.select needs "windowId" as an integer, or null for a window of our own.');
+      }
+      const sessionKey = sessionKeyOf(params);
+      const groupTitle = params.groupTitle || PI_GROUP_NAME;
+      await hydrateAutomationTargets();
+      const current = automationTargets.get(sessionKey);
+      const retireCurrent = async (keepTabId) => {
+        if (current && typeof current.tabId === "number" && current.tabId !== keepTabId) {
+          await chrome.tabs.remove(current.tabId).catch(() => {});
+        }
+      };
+      if (wanted === null) {
+        // Back to a window of our own: exactly the path a fresh session takes.
+        const tab = await createAutomationTarget(sessionKey, groupTitle);
+        await retireCurrent(tab.id);
+        return { windowId: tab.windowId ?? null, tabId: tab.id ?? null, reused: false };
+      }
+      const win = await chrome.windows.get(wanted).catch(() => null);
+      if (!win) throw new Error(`No browser window with id ${wanted}.`);
+      // Already working in that window: keep the tab we have instead of churning a new one.
+      if (typeof current?.tabId === "number") {
+        const existing = await chrome.tabs.get(current.tabId).catch(() => null);
+        if (existing && existing.windowId === wanted) {
+          return { windowId: wanted, tabId: current.tabId, reused: true };
+        }
+      }
+      // Created inactive, and the window is never focused: choosing a window must not bring that window,
+      // or this tab, to the front.
+      const tab = await chrome.tabs.create({ url: "about:blank", active: false, windowId: wanted });
+      // Record windowId as unset: this window belongs to the user, so cleanup closes only our tab.
+      automationTargets.set(sessionKey, { windowId: undefined, tabId: tab.id });
+      await persistAutomationTargets();
+      await retireCurrent(tab.id);
+      await groupTab(tab, groupTitle, params.groupColor).catch(() => {});
+      return { windowId: tab.windowId ?? null, tabId: tab.id ?? null, reused: false };
+    }
     case "automation.status": {
       // Report this session's owned automation target (ids only). Used for diagnostics/tests.
       await hydrateAutomationTargets();

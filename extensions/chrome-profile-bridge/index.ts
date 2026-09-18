@@ -198,6 +198,65 @@ function connectorMenuOptions(
 	return { autoLabel, options, keyByLabel };
 }
 
+type WindowSummary = {
+	windowId: number | null;
+	tabCount: number;
+	title: string;
+	focused: boolean;
+	holdsTargetTab: boolean;
+};
+
+type WindowReport = {
+	windows?: WindowSummary[];
+	targetWindowId?: number | null;
+	ownsTargetWindow?: boolean;
+};
+
+function truncateTitle(title: string, max = 40): string {
+	const text = title.trim() || "(untitled)";
+	return text.length <= max ? text : `${text.slice(0, max - 1)}…`;
+}
+
+// The entries offered by /chrome window's picker, and the map from a clicked label back to the window it
+// means. Pure so the mapping can be tested directly: a click that resolved to the wrong window would put
+// Pi's work somewhere the user is not looking. The current choice is marked from the target's recorded
+// state rather than from the labels, because "our own window" and "a guest tab in theirs" look alike
+// otherwise — and that difference decides whether cleanup may close a whole window.
+function windowMenuOptions(report: WindowReport): {
+	ownLabel: string;
+	options: string[];
+	windowByLabel: Map<string, number>;
+} {
+	const ownsOwn = report.ownsTargetWindow === true;
+	const ownLabel = `${ownsOwn ? "✓ " : "  "}Pi's own window (isolated, cleaned up automatically)`;
+	const options: string[] = [ownLabel];
+	const windowByLabel = new Map<string, number>();
+	for (const win of report.windows ?? []) {
+		if (typeof win.windowId !== "number") continue;
+		const mark = !ownsOwn && win.holdsTargetTab ? "✓ " : "  ";
+		const count = `${win.tabCount} tab${win.tabCount === 1 ? "" : "s"}`;
+		const base = `${mark}Window ${win.windowId} — ${count}${win.focused ? ", focused" : ""} — ${truncateTitle(win.title)}`;
+		let label = base;
+		for (let n = 2; windowByLabel.has(label); n++) label = `${base} (${n})`;
+		options.push(label);
+		windowByLabel.set(label, win.windowId);
+	}
+	return { ownLabel, options, windowByLabel };
+}
+
+function describeWindows(report: WindowReport): string {
+	const { ownLabel, options } = windowMenuOptions(report);
+	// targetWindowId is only set for a window Pi created, so a guest tab has none — naming the window that
+	// actually holds our tab is the whole point of this list.
+	const holder = (report.windows ?? []).find((win) => win.holdsTargetTab);
+	const where = report.ownsTargetWindow
+		? `a window of its own${typeof report.targetWindowId === "number" ? ` (window ${report.targetWindowId})` : ""}`
+		: holder
+			? `window ${holder.windowId} — yours; cleanup closes only Pi's tab in it`
+			: "no window yet";
+	return [`This session is working in ${where}.`, "Windows open:", ...options].join("\n");
+}
+
 type ClientSummary = { key: string; label: string };
 
 type ConnectorStatus = {
@@ -1794,6 +1853,58 @@ Usage rules:
 		}
 	};
 
+	// Window actions are addressed to THIS session's automation target, so they must carry the same session
+	// key the tools use. Without it the extension falls back to its default bucket and the feature silently
+	// configures a different session — see authorizedBridgeSend for the injection it performs.
+	const windowParams = (ctx: ExtensionContext): Record<string, unknown> => {
+		const key = sessionKeyFor(ctx);
+		return key === undefined ? {} : { sessionKey: key };
+	};
+
+	// Where Pi's tabs and default-targeted actions live. By default each session gets a window of its own,
+	// so nothing lands among the user's tabs unnoticed. Choosing an existing window instead puts Pi's tab
+	// there — created inactive, and the window is never focused — for when the work should happen where the
+	// user can see it.
+	const openWindowMenu = async (ctx: ExtensionContext): Promise<void> => {
+		const report = (await bridge.send("window.list", windowParams(ctx), 15_000)) as WindowReport;
+		const { ownLabel, options, windowByLabel } = windowMenuOptions(report);
+		const choice = await ctx.ui.select("Which window should Pi use?", options);
+		if (!choice) return;
+		const windowId = choice === ownLabel ? null : windowByLabel.get(choice);
+		if (windowId === undefined) return;
+		const result = (await bridge.send("window.select", { ...windowParams(ctx), windowId }, 20_000)) as {
+			windowId?: number | null;
+			reused?: boolean;
+		};
+		ctx.ui.notify(
+			windowId === null
+				? `Pi will use a window of its own${result.windowId ? ` (window ${result.windowId})` : ""}.`
+				: `Pi will work in window ${result.windowId ?? windowId}${result.reused ? " (already there)" : ""}.`,
+			"info",
+		);
+	};
+
+	const windowHandler = async (ctx: ExtensionContext, args: string): Promise<void> => {
+		const arg = args.trim().toLowerCase();
+		try {
+			if (arg === "list" || arg === "status") {
+				ctx.ui.notify(describeWindows((await bridge.send("window.list", windowParams(ctx), 15_000)) as WindowReport), "info");
+				return;
+			}
+			if (arg === "own" || arg === "auto") {
+				const result = (await bridge.send("window.select", { ...windowParams(ctx), windowId: null }, 20_000)) as {
+					windowId?: number | null;
+				};
+				ctx.ui.notify(`Pi will use a window of its own${result.windowId ? ` (window ${result.windowId})` : ""}.`, "info");
+				return;
+			}
+			await openWindowMenu(ctx);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			ctx.ui.notify(`Window selection failed: ${message}`, "warning");
+		}
+	};
+
 	const openCommandMenu = async (ctx: ExtensionContext): Promise<void> => {
 		while (true) {
 			ctx.ui.notify("Checking Chrome connection…", "info");
@@ -1803,6 +1914,7 @@ Usage rules:
 				"Doctor / troubleshoot",
 				"Background / watch mode…",
 				"Choose connector…",
+				"Choose window…",
 				"Install / onboard extension",
 			]);
 			if (!choice) return;
@@ -1812,6 +1924,7 @@ Usage rules:
 				case "Doctor / troubleshoot": return doctorHandler(ctx);
 				case "Background / watch mode…": await openBackgroundMenu(ctx); continue;
 				case "Choose connector…": return connectorHandler(ctx, "");
+				case "Choose window…": await windowHandler(ctx, ""); continue;
 				case "Install / onboard extension": return onboardHandler(ctx);
 			}
 		}
@@ -1819,7 +1932,7 @@ Usage rules:
 
 	pi.registerCommand("chrome", {
 		description:
-			"All pi-chrome controls in one place.\n  /chrome authorize [15m|30m|<minutes>|indefinite] — allow this Pi session to use chrome_* tools.\n  /chrome revoke   — lock Chrome control.\n  /chrome doctor   — full health check plus authorization and background state.\n  /chrome onboard  — install the Chrome companion extension.\n  /chrome background [on|off|status|toggle] — enforce no explicit focus/tab activation, or allow foreground/watch mode.\n  /chrome connector [list|<key>|auto] — choose which installed connector (browser + profile) receives commands.\nRun with no arguments for an interactive picker that shows current state.",
+			"All pi-chrome controls in one place.\n  /chrome authorize [15m|30m|<minutes>|indefinite] — allow this Pi session to use chrome_* tools.\n  /chrome revoke   — lock Chrome control.\n  /chrome doctor   — full health check plus authorization and background state.\n  /chrome onboard  — install the Chrome companion extension.\n  /chrome background [on|off|status|toggle] — enforce no explicit focus/tab activation, or allow foreground/watch mode.\n  /chrome connector [list|<key>|auto] — choose which installed connector (browser + profile) receives commands.\n  /chrome window [list|own] — choose which browser window Pi works in.\nRun with no arguments for an interactive picker that shows current state.",
 		getArgumentCompletions: (prefix) => {
 			const raw = prefix;
 			const trimmedRight = raw.replace(/\s+$/, "");
@@ -1842,6 +1955,7 @@ Usage rules:
 					{ fullValue: "onboard", label: "onboard", description: "Install the Chrome companion extension (first-time setup)." },
 					{ fullValue: "background", label: "background", description: "Enforce hard background or allow foreground/watch mode." },
 					{ fullValue: "connector", label: "connector", description: "Choose which installed connector (browser + profile) receives commands." },
+					{ fullValue: "window", label: "window", description: "Choose which browser window Pi works in." },
 				];
 			} else if (path[0] === "authorize" && path.length === 1) {
 				candidates = [
@@ -1860,6 +1974,11 @@ Usage rules:
 				candidates = [
 					{ fullValue: "connector list", label: "list", description: "Show the connected connectors and the current selection." },
 					{ fullValue: "connector auto", label: "auto", description: "Stop preferring one browser; use the only connected one." },
+				];
+			} else if (path[0] === "window" && path.length === 1) {
+				candidates = [
+					{ fullValue: "window list", label: "list", description: "Show the open browser windows and where Pi is working." },
+					{ fullValue: "window own", label: "own", description: "Use a window of Pi's own again (the default)." },
 				];
 			}
 			if (candidates.length === 0) return null;
@@ -1884,6 +2003,8 @@ Usage rules:
 					return backgroundHandler(ctx, subArgs);
 				case "connector":
 					return connectorHandler(ctx, subArgs);
+				case "window":
+					return windowHandler(ctx, subArgs);
 				case "settings": {
 					// Legacy nested form: /chrome settings background ...
 					const [setting, ...settingArgs] = rest;
