@@ -19,7 +19,7 @@ function section(start, end) {
 
 // Load the shipped policy, existing command handler, and actual tool registrations. Only the
 // bridge/Pi UI/typebox/formatting/filesystem boundaries are replaced; no live server is opened.
-function piHarness({ session = "alpha", send, files, unlinkFails = false } = {}) {
+function piHarness({ session = "alpha", send, files, unlinkFails = false, clientLabel } = {}) {
   const calls = [], tools = new Map(), notices = [], writes = [], removed = [];
   // In-memory stand-in for the screenshot folder: name -> mtimeMs. Lets the retention tests drive
   // readdir/stat/unlink without touching the real filesystem.
@@ -29,7 +29,7 @@ function piHarness({ session = "alpha", send, files, unlinkFails = false } = {})
   let authorized = true;
   const ctx = { key: `session:${session}`, title: `Pi Session: ${session}`, cwd: "/fixture", ui: { notify: (...args) => notices.push(args) } };
   const bridge = {
-    connected: true, status: () => ({}),
+    connected: true, status: () => ({}), clientLabel: () => clientLabel,
     async send(action, params, timeout, signal) {
       calls.push({ action, params: clone(params), timeout, signal });
       if (signal?.aborted) throw new Error("Chrome command aborted");
@@ -53,7 +53,7 @@ function piHarness({ session = "alpha", send, files, unlinkFails = false } = {})
     tabActionValues: [], snapshotModeValues: [], waitForValues: [], imageFormatValues: [],
     safeJson: JSON.stringify, truncateText: (s) => s, formatChromeSnapshot: JSON.stringify,
     formatChromeInspect: JSON.stringify, summarizeActionResult: () => "", formatIncludedSnapshotText: (_r, text) => text,
-    workspaceCwd: () => ctx.cwd, tmpdir: () => "/fixture-tmp", ...path,
+    workspaceCwd: () => ctx.cwd, tmpdir: () => "/fixture-tmp", browserExtensionPath: () => "/fixture/browser-extension", ...path,
     mkdir: async () => {}, writeFile: async (...args) => writes.push(args),
     readdir: async () => [...folder.keys()],
     stat: async (p) => {
@@ -236,12 +236,16 @@ function workerHarness({ withWindows = true } = {}) {
     [2, { id: 2, windowId: 1, active: false, groupId: -1, url: "https://target.test/", title: "Target" }],
   ]);
   let focusedWindow = 1, nextTab = 3, nextWindow = 2;
-  const storage = {}, groups = new Map();
+  const storage = {}, localStore = {}, groups = new Map();
   const listener = { addListener() {}, removeListener() {} };
   const chrome = {
     runtime: { id: "test", getManifest: () => ({ version: "0.0.0" }), onInstalled: listener, onStartup: listener },
     alarms: { onAlarm: listener, create() {} }, action: { onClicked: listener }, webNavigation: { onCommitted: listener },
-    storage: { session: { get: async (key) => ({ [key]: storage[key] }), set: async (value) => Object.assign(storage, value) } },
+    storage: {
+      session: { get: async (key) => ({ [key]: storage[key] }), set: async (value) => Object.assign(storage, value) },
+      // `local` is per profile in a real browser, which is exactly what identifies a connector.
+      local: { get: async (key) => ({ [key]: localStore[key] }), set: async (value) => Object.assign(localStore, value) },
+    },
     tabs: {
       onUpdated: listener,
       query: async (query = {}) => [...tabs.values()].filter((t) => (!query.active || t.active) && (query.windowId === undefined || query.windowId === t.windowId)).map(clone),
@@ -543,10 +547,17 @@ assert.ok(bridgeHoldMatch, "could not find the bridge long-poll hold in index.ts
 const bridgeHoldMs = Number(bridgeHoldMatch[1].replace(/_/g, ""));
 
 test("pollLoop aborts a stalled /next long poll and retries instead of parking the worker", async () => {
-  const { h, timers, fetches } = pollHarness();
+  const { h, timers, fetches, flush } = pollHarness();
   const stalled = h.w.pollLoop();
+  await flush(); // the poll reads its profile id before fetching; drain that microtask first
   assert.equal(fetches.length, 1, "pollLoop starts one /next long poll");
-  assert.equal(fetches[0].url, `http://127.0.0.1:17318/next?name=${encodeURIComponent(vm.runInContext("CLIENT_NAME", h.w))}`);
+  const nextUrl = fetches[0].url;
+  assert.ok(
+    nextUrl.startsWith(`http://127.0.0.1:17318/next?name=${encodeURIComponent(vm.runInContext("CLIENT_NAME", h.w))}`),
+    `long poll keeps the client name: ${nextUrl}`,
+  );
+  assert.match(nextUrl, /[?&]browser=[a-z]+/, "the poll identifies the browser family");
+  assert.match(nextUrl, /[?&]profile=/, "the poll identifies the profile");
   assert.equal(fetches[0].options.cache, "no-store", "long poll keeps cache: no-store");
   assert.ok(fetches[0].signal, "long poll is abortable");
   assert.equal(timers.size, 1, "one abort deadline is armed");
@@ -559,6 +570,7 @@ test("pollLoop aborts a stalled /next long poll and retries instead of parking t
   assert.equal(timers.size, 0, "abort timer cleared once the fetch settled");
 
   const retry = h.w.pollLoop();
+  await flush();
   assert.equal(fetches.length, 2, "the next pollLoop run retries /next");
   assert.equal(fetches[1].signal.aborted, false);
   assert.equal(timers.size, 1, "retry armed a fresh deadline");
@@ -571,6 +583,7 @@ test("a healthy /next response is never aborted and polls again with a fresh dea
   const { h, timers, fetches, flush } = pollHarness();
   let jsonCalls = 0;
   const run = h.w.pollLoop();
+  await flush();
   assert.equal(timers.size, 1);
   fetches[0].settle.resolve({
     ok: true,
@@ -589,11 +602,12 @@ test("a healthy /next response is never aborted and polls again with a fresh dea
 });
 
 test("the version-mismatch reload path returns without a dangling abort deadline", async () => {
-  const { h, timers, fetches } = pollHarness();
+  const { h, timers, fetches, flush } = pollHarness();
   let reloads = 0;
   h.chrome.runtime.reload = () => { reloads += 1; };
   let jsonCalls = 0;
   const run = h.w.pollLoop();
+  await flush();
   fetches[0].settle.resolve({
     ok: true,
     status: 200,
@@ -727,5 +741,32 @@ test("an explicit path is honoured instead, resolved against the session cwd", a
   assert.ok(
     norm(h.writes[0][0]).endsWith("shots/keep-me.png"),
     `explicit path should be used, got ${norm(h.writes[0][0])}`,
+  );
+});
+
+// The connector can be installed in more than one browser AND more than one profile, and each install
+// is a separate client to the bridge. It identifies itself so the Pi side can report which one it is
+// actually driving instead of assuming Chrome, which is the browser it is usually NOT.
+test("the connector reports its browser family and a stable per-profile id", async () => {
+  const h = workerHarness();
+  const first = await h.w.dispatch("tab.version", {});
+  assert.match(String(first.browser), /^[a-z]+$/, `browser family should be reported, got ${first.browser}`);
+  assert.ok(first.profileId, "a profile id is reported");
+  const second = await h.w.dispatch("tab.version", {});
+  assert.equal(second.profileId, first.profileId, "the id is stable within one profile");
+
+  // A fresh harness has fresh storage.local, which is what a different profile looks like.
+  const other = workerHarness();
+  const elsewhere = await other.w.dispatch("tab.version", {});
+  assert.ok(elsewhere.profileId, "the other profile also reports an id");
+  assert.notEqual(elsewhere.profileId, first.profileId, "two profiles must not share an id");
+});
+
+test("chrome_launch names the browser and profile it is connected to", async () => {
+  const h = piHarness({ clientLabel: "Edge (profile ab12cd34)" });
+  const out = await h.tool("chrome_launch", {});
+  assert.ok(
+    out.content[0].text.includes("connected to Edge (profile ab12cd34)"),
+    `chrome_launch should name the target, got: ${out.content[0].text}`,
   );
 });

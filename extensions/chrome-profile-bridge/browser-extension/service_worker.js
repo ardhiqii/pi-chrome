@@ -28,6 +28,41 @@ const ATTACH_TIMEOUT_MS = 3_000;
 // Gate for the best-effort focus-emulation command sent on every fresh debugger attach. Set to
 // false to restore the pre-feature attach path (one less CDP round trip per fresh attach).
 const FOCUS_EMULATION_ON_ATTACH = true;
+// This connector can be installed in more than one browser and in more than one profile, and each
+// install is a separate client as far as the bridge is concerned. Identify ourselves on every poll so
+// the Pi side can report *which* browser and profile it is actually driving instead of assuming
+// Chrome. Derived from the user agent because no extension API exposes the browser family.
+const BROWSER_FAMILY = (() => {
+  const ua = navigator.userAgent;
+  if (/Edg\//.test(ua)) return "edge";
+  if (/OPR\//.test(ua)) return "opera";
+  if (/Brave\//.test(ua)) return "brave";
+  if (/Vivaldi\//.test(ua)) return "vivaldi";
+  if (/Chrome\//.test(ua)) return "chrome";
+  return "unknown";
+})();
+// `chrome.storage.local` is per profile, so a generated id is stable within a profile and differs
+// between two profiles of the same browser — which is exactly what distinguishes them to the bridge.
+// Cached after the first read so a poll never costs an extra storage round trip.
+let profileIdPromise;
+function getProfileId() {
+  profileIdPromise ??= (async () => {
+    try {
+      const stored = await chrome.storage.local.get("piProfileId");
+      const existing = stored && stored.piProfileId;
+      if (typeof existing === "string" && existing) return existing;
+      const id = typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+        ? crypto.randomUUID().slice(0, 8)
+        : Math.random().toString(36).slice(2, 10);
+      await chrome.storage.local.set({ piProfileId: id });
+      return id;
+    } catch {
+      // Storage unavailable: report no id rather than failing the poll.
+      return "";
+    }
+  })();
+  return profileIdPromise;
+}
 let polling = false;
 let lastAbortWarnAt = 0;
 
@@ -1218,7 +1253,8 @@ async function pollLoop() {
       const abortTimer = setTimeout(() => abortController.abort(), POLL_ABORT_MS);
       let response;
       try {
-        response = await fetch(`${BRIDGE_URL}/next?name=${encodeURIComponent(CLIENT_NAME)}`, {
+        const profileId = await getProfileId();
+        response = await fetch(`${BRIDGE_URL}/next?name=${encodeURIComponent(CLIENT_NAME)}&browser=${encodeURIComponent(BROWSER_FAMILY)}&profile=${encodeURIComponent(profileId)}`, {
           cache: "no-store",
           signal: abortController.signal,
         });
@@ -1358,6 +1394,8 @@ async function dispatch(action, params) {
         extensionVersion: chrome.runtime.getManifest().version,
         bridgeUrl: BRIDGE_URL,
         userAgent: navigator.userAgent,
+        browser: BROWSER_FAMILY,
+        profileId: await getProfileId(),
         capabilities: { hardBackground: true },
       };
     case "tab.list": {

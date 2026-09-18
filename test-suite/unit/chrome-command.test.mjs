@@ -28,7 +28,7 @@ function healthyResponse(action) {
   }
 }
 
-function harness({ until, background = true, mode = "server", choices = [], send = healthyResponse } = {}) {
+function harness({ until, background = true, mode = "server", choices = [], send = healthyResponse, clientLabel } = {}) {
   const calls = [], notices = [], menus = [];
   let command;
   const ctx = {
@@ -46,6 +46,7 @@ function harness({ until, background = true, mode = "server", choices = [], send
     hostnameOf: (url) => new URL(url).hostname,
     bridge: {
       status: () => ({ mode }),
+      clientLabel: () => clientLabel,
       async send(action, params, timeout) {
         calls.push({ action, params: JSON.parse(JSON.stringify(params)), timeout });
         return send(action, params, timeout);
@@ -124,7 +125,7 @@ test("Doctor includes locked, timed, indefinite, and expired authorization plus 
       assert.ok(report.includes(`pi-chrome v${version}`));
       assert.ok(report.includes(`Authorization: ${expected}`));
       assert.ok(report.includes(`Background: ${background ? "on (hard)" : "off"}`));
-      assert.match(report, /Chrome is connected/);
+      assert.match(report, /Connected/);
       assert.match(report, /can run code/);
       assert.match(report, /fixture\.test/);
       assert.deepEqual(h.calls.map(({ action, timeout }) => [action, timeout]), [
@@ -160,4 +161,14 @@ test("choosing Doctor explicitly from the dashboard runs full diagnostics", asyn
   assert.deepEqual(h.calls.map((call) => call.action), ["tab.version", "tab.version", "page.evaluate", "page.probe"]);
   assert.match(h.notices.at(-1)[0], /Authorization: locked/);
   assert.match(h.notices.at(-1)[0], /Background: on \(hard\)/);
+});
+
+test("doctor names the browser and profile the bridge is talking to", async () => {
+  const h = harness({ until: now + 15 * 60_000, clientLabel: "Edge (profile ab12cd34)" });
+  await h.run("doctor");
+  const report = h.notices.at(-1)[0];
+  assert.ok(
+    report.includes("Connected to Edge (profile ab12cd34)"),
+    `doctor should name the target, got:\n${report}`,
+  );
 });

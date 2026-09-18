@@ -305,6 +305,8 @@ class ChromeProfileBridge {
 	private waiters: Array<(command: BridgeCommand | undefined) => void> = [];
 	private lastSeenAt: number | undefined;
 	private clientName: string | undefined;
+	private clientBrowser: string | undefined;
+	private clientProfileId: string | undefined;
 	private mode: "server" | "client" | undefined;
 
 	constructor(
@@ -323,6 +325,17 @@ class ChromeProfileBridge {
 		return this.lastSeenAt !== undefined && Date.now() - this.lastSeenAt < 5 * 60_000;
 	}
 
+	// Human-readable "which browser/profile am I talking to". The connector identifies itself on every
+	// poll (it can be installed in several browsers and profiles), so this is reported rather than
+	// guessed — assuming Chrome from the tool names alone is exactly the mistake this prevents.
+	clientLabel(): string | undefined {
+		if (!this.clientBrowser && !this.clientProfileId) return undefined;
+		const browser = this.clientBrowser
+			? this.clientBrowser[0].toUpperCase() + this.clientBrowser.slice(1)
+			: "Unknown browser";
+		return this.clientProfileId ? `${browser} (profile ${this.clientProfileId})` : browser;
+	}
+
 	status(): Record<string, unknown> {
 		return {
 			url: this.url,
@@ -330,6 +343,9 @@ class ChromeProfileBridge {
 			connected: this.connected,
 			lastSeenAt: this.lastSeenAt,
 			clientName: this.clientName,
+			clientBrowser: this.clientBrowser,
+			clientProfileId: this.clientProfileId,
+			clientLabel: this.clientLabel(),
 			queuedCommands: this.queue.length,
 			pendingCommands: this.pending.size,
 		};
@@ -559,6 +575,8 @@ class ChromeProfileBridge {
 			}
 			this.lastSeenAt = Date.now();
 			this.clientName = url.searchParams.get("name") ?? undefined;
+			this.clientBrowser = url.searchParams.get("browser") ?? undefined;
+			this.clientProfileId = url.searchParams.get("profile") ?? undefined;
 			let aborted = false;
 			let activeWaiter: ((command: BridgeCommand | undefined) => void) | undefined;
 			request.once("close", () => {
@@ -1022,7 +1040,8 @@ Usage rules:
 						`  (After this one-time fix, future updates reload automatically.)`,
 					);
 				} else {
-					lines.push(`✓ Chrome is connected (companion extension v${version.extensionVersion ?? "?"}, responded in ${latencyMs}ms).`);
+					const target = bridge.clientLabel();
+					lines.push(`✓ Connected${target ? ` to ${target}` : ""} (companion extension v${version.extensionVersion ?? "?"}, responded in ${latencyMs}ms).`);
 				}
 			} catch (error) {
 				const message = (error as Error).message;
@@ -1363,9 +1382,16 @@ Usage rules:
 			headless: Type.Optional(Type.Boolean({ description: "Ignored." })),
 		}),
 		async execute(_id, params, signal, _onUpdate, ctx): Promise<ToolTextResult> {
+			// Report the connected browser and profile up front. This is the canonical first call, and the
+			// bridge is not Chrome-specific — it is usually Edge. Naming it here is what stops every later
+			// step from quietly assuming Chrome.
+			const connectedTo = bridge.clientLabel();
 			if (params.url && bridge.connected) {
 				const result = await authorizedBridgeSend("tab.new", { url: params.url }, DEFAULT_TIMEOUT_MS, signal);
-				return { content: [{ type: "text", text: `Chrome bridge connected; opened ${params.url}` }], details: { status: bridge.status(), result } };
+				return {
+					content: [{ type: "text", text: `Bridge connected${connectedTo ? ` to ${connectedTo}` : ""}; opened ${params.url}` }],
+					details: { status: bridge.status(), result },
+				};
 			}
 			return {
 				content: [
@@ -1373,12 +1399,12 @@ Usage rules:
 						type: "text",
 						text:
 							`Chrome profile bridge is listening at ${bridge.url}.\n\n` +
-							`To connect your existing Chrome profile:\n` +
-							`1. Open chrome://extensions in the Chrome profile you normally use.\n` +
+							`To connect the browser profile you normally use:\n` +
+							`1. Open chrome://extensions in Chrome, or edge://extensions in Edge.\n` +
 							`2. Enable Developer mode.\n` +
 							`3. Click “Load unpacked”.\n` +
 							`4. Select: ${browserExtensionPath()}\n\n` +
-							`Status: ${bridge.connected ? "connected" : "waiting for extension"}.`,
+							`Status: ${bridge.connected ? `connected${connectedTo ? ` to ${connectedTo}` : ""}` : "waiting for extension"}.`,
 					},
 				],
 				details: { status: bridge.status(), extensionPath: browserExtensionPath() },

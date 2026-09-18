@@ -79,6 +79,18 @@ All notable user-facing changes to `pi-chrome`.
   This fork instead uses one stable name for every Pi-created group, so all of Pi's tabs live
   together in a single group per window and are instantly recognisable as Pi's rather than the
   user's.
+- **The connector identifies itself: browser and profile.** pi-chrome could not previously say which
+  browser it was driving — the bridge saw only `Pi Chrome Connector <extension id>`, and the browser
+  was not reported anywhere except buried in a `userAgent` string — so anything reading the tool
+  names reasonably assumed Chrome, even when the connector was installed in Edge. The connector now
+  reports its browser family (`edge`/`chrome`/`opera`/`brave`/`vivaldi`/`unknown`) and a per-profile
+  id on every poll: the family comes from `navigator.userAgent`, and the id is a UUID kept in
+  `chrome.storage.local`, which is per profile — so two profiles of the same browser get different
+  ids. `tab.version` now carries `browser` and `profileId`; the bridge tracks them and exposes
+  `clientBrowser`, `clientProfileId` and a ready-made `clientLabel`; and both `chrome_launch` and
+  `/chrome doctor` now name the target ("Connected to Edge (profile ab12cd34)") rather than saying
+  "Chrome". This is also the groundwork for selecting between several installed connectors — today
+  it makes the single connector honest about what it is.
 - **Screenshots default to the OS temp, and the folder prunes itself.** `chrome_screenshot` used to
   write every capture into `<cwd>/.pi/chrome-screenshots/` and never remove any, so the user's own
   project accumulated files that existed only for the agent's benefit. Captures now default to
@@ -151,6 +163,12 @@ All notable user-facing changes to `pi-chrome`.
   honoured). Six of the seven fail against the pre-retention `index.ts`. The seventh — explicit
   `path:` — passes against it too, because the old code already honoured explicit paths: it is a
   guard on that contract, not new behaviour, and is labelled as such rather than counted as proof.
+- `background-policy.test.mjs` also gained two identity tests: the connector reports a browser
+  family and a profile id that is stable within one profile but differs between two, and
+  `chrome_launch` names the browser/profile it is connected to. `chrome-command.test.mjs` gained one
+  asserting `/chrome doctor` names it too. All three fail against the pre-identity build — the last
+  one only when that suite is run on its own, because `npm test` chains the suites with `&&` and so
+  stops at the first failing suite.
 
 ## 0.15.51 — 2026-09-10
 
