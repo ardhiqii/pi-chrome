@@ -106,12 +106,21 @@ if [ -n "$dest_sw_sha" ] && { [ "$dest_sw_sha" = "$BASE_SW_SHA256" ] || [ "$dest
   dest_sw_is_known_base=1
 fi
 if [ "$FORCE" -ne 1 ]; then
-  if [ -n "$dest_version" ] && [ "$dest_version" != "$BASE_VERSION" ] && [ "$dest_version" != "$BASE_VERSION_UPSTREAM" ]; then
-    echo "ERROR: live install is version $dest_version, but this build is $BASE_VERSION" >&2
-    echo "       (based on $BASE_VERSION_UPSTREAM). Deploying would mix versions of the extension" >&2
-    echo "       service worker and its manifests. Re-run with --force only if you deliberately" >&2
-    echo "       want to keep this local build on top of that release." >&2
-    exit 1
+  # Refuse only a live install from a DIFFERENT upstream base. Any 0.15.51.* is a previous build of this
+  # same fork and is exactly what a version bump is supposed to overwrite — accepting only the current
+  # exact version meant every bump refused its own predecessor and needed --force, which trains the
+  # operator to bypass the guard that also protects against the case it exists for.
+  if [ -n "$dest_version" ]; then
+    case "$dest_version" in
+      "$BASE_VERSION"|"$BASE_VERSION_UPSTREAM"|"$BASE_VERSION_UPSTREAM".*) ;;
+      *)
+        echo "ERROR: live install is version $dest_version, but this build is $BASE_VERSION" >&2
+        echo "       (based on $BASE_VERSION_UPSTREAM). Deploying would mix versions of the extension" >&2
+        echo "       service worker and its manifests. Re-run with --force only if you deliberately" >&2
+        echo "       want to keep this local build on top of that release." >&2
+        exit 1
+        ;;
+    esac
   fi
   if [ -n "$dest_sw_sha" ] && [ "$dest_sw_is_known_base" -ne 1 ] && [ "$dest_sw_is_fork_build" -ne 1 ] && ! cmp -s "$src_sw" "$dest_sw"; then
     echo "ERROR: $dest_sw" >&2
