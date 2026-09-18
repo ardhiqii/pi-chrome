@@ -27,7 +27,11 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 #     (b801936), the file the earlier review verified.
 # A clean reinstall ships the pristine file, so accepting only the patched hash would refuse it and
 # force the owner to pass --force on a perfectly safe deploy.
-BASE_VERSION="0.15.51.1"
+#
+# BASE_VERSION is read from this build's own package.json rather than hardcoded. A second hardcoded
+# copy drifts silently on the next version bump, and the guard then refuses a perfectly good deploy —
+# which is exactly what happened going from 0.15.51.1 to 0.15.51.2.
+BASE_VERSION="$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$SRC/package.json" | head -n 1)"
 BASE_VERSION_UPSTREAM="0.15.51"
 BASE_SW_SHA256="ac1e346d88aaa684d1998b17f899c4b50077d27f01eeb1a3393649013643ee3f"
 PATCHED_BASE_SW_SHA256="a5b2cdd816c357acd3910aa6f24db7ac61ec0684851d12013be5e50664dfc764"
@@ -77,10 +81,8 @@ dest_version=""
 if [ -f "$DEST_ROOT/package.json" ]; then
   dest_version="$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$DEST_ROOT/package.json" | head -n 1)"
 fi
-src_version=""
-if [ -f "$SRC/package.json" ]; then
-  src_version="$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$SRC/package.json" | head -n 1)"
-fi
+src_version="$BASE_VERSION"
+# See the note next to BASE_VERSION: this is read from package.json, not maintained by hand.
 # A version change makes the running extension reload ITSELF on its next poll (it compares the
 # manifest version against the package.json version the bridge advertises), so a manual Reload is
 # only genuinely required when service_worker.js changed WITHOUT a version change.
