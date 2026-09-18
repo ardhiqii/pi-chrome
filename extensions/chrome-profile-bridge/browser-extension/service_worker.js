@@ -407,14 +407,18 @@ function isPiMarkerTab(tab) {
 }
 
 // The candidate set for "this is Pi's dedicated window", from an already-fetched browser snapshot.
-// A window qualifies when any of these holds:
+// A window qualifies when either of these holds:
 //   - `chrome.windows.create` made it for Pi and the registry still remembers it (same browser
-//     session; storage.session outlives service-worker restarts);
-//   - it holds a tab whose url carries the #pi-chrome marker;
-//   - its tabs are ALL Pi tabs (marker tabs or members of a "Pi Agent" group) and at least one
-//     "Pi Agent" group lives in it — covering a Pi window whose automation tab has navigated away.
-// The all-Pi-tabs condition is what keeps a leftover "Pi Agent" group sitting among the user's own
-// tabs from turning THEIR window into a candidate: a dedicated window has no non-Pi tabs.
+//     session; storage.session outlives service-worker restarts); the registry is authority by
+//     construction, so even a user tab later dragged into that window does not revoke it;
+//   - EVERY tab in it is a Pi tab — a #pi-chrome marker tab or a member of a "Pi Agent" group —
+//     and at least one piece of Pi evidence lives in it (a marker tab or a "Pi Agent" group),
+//     covering a Pi window whose automation tab has navigated away.
+// The all-Pi-tabs condition is what keeps a user's window out no matter how much Pi debris
+// (leftover marker tabs or "Pi Agent" groups) it holds: a dedicated window has no non-Pi tabs.
+// Accepting a window because it merely CONTAINED a marker tab was the live bug — a user window with
+// one leftover marker among their own tabs was adopted, and tab.new opened another Pi tab and group
+// there.
 // Split out from `findDedicatedPiWindow` so `window.list` reports the same evidence it acts on.
 function dedicatedPiWindowIds(windows, groups) {
   const ids = new Set();
@@ -433,11 +437,11 @@ function dedicatedPiWindowIds(windows, groups) {
     if (!win || typeof win.id !== "number") continue;
     const tabs = Array.isArray(win.tabs) ? win.tabs : [];
     if (!tabs.length) continue;
-    if (tabs.some(isPiMarkerTab)) { ids.add(win.id); continue; }
-    if (piGroupWindowIds.has(win.id) &&
-        tabs.every((tab) => isPiMarkerTab(tab) || (typeof tab.groupId === "number" && piGroupIds.has(tab.groupId)))) {
-      ids.add(win.id);
-    }
+    // Content-based evidence only qualifies a window when NO tab in it belongs to the user: one
+    // ordinary tab (WhatsApp, Spotify, GitHub, an edge:// page, ...) can never be Pi's window.
+    const everyTabIsPi = tabs.every((tab) => isPiMarkerTab(tab) || (typeof tab.groupId === "number" && piGroupIds.has(tab.groupId)));
+    if (!everyTabIsPi) continue;
+    if (tabs.some(isPiMarkerTab) || piGroupWindowIds.has(win.id)) ids.add(win.id);
   }
   return ids;
 }

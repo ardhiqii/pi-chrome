@@ -452,6 +452,70 @@ async function run() {
     ok(state.tabs.get(leftover.id).groupId === gid, "user-window-guard: the user's grouped tab is untouched");
   }
 
+  // ===== LIVE (Edge 0.15.51.13): the user's own window held LEFTOVER Pi debris from earlier buggy
+  // builds — a "Pi Agent" tab group AND a tab whose url carried the #pi-chrome marker — among their
+  // ordinary tabs, while Pi's genuine dedicated window (the live 720723288) existed alongside it.
+  // Because the user's window had the lower id (the live 720723043), discovery that accepted "merely
+  // contains a #pi-chrome tab" adopted the user's window, so a fresh session's tab.new opened another
+  // Pi tab and group in their window. A window the user owns must NEVER qualify, however much Pi
+  // debris it holds: content evidence only counts when EVERY tab in it is a Pi tab (#pi-chrome marker
+  // or "Pi Agent" group member). The registry of windows Pi itself created stays a qualifying source. =====
+  {
+    const state = makeChromeState();
+    // The genuine dedicated Pi window, created before the debris and therefore at a HIGHER id than
+    // the user's window, exactly like the live 720723288 > 720723043 pair.
+    const w1 = loadWorker(makeChrome(state, { withTabGroups: true }));
+    const seed = await w1.getOrCreateAutomationTarget("session:seed");
+    ok(seed.windowId !== state.userWindowId, "debris-guard: the genuine Pi window is not the user's window");
+    ok(seed.windowId > state.userWindowId, "debris-guard: the genuine Pi window has the higher id (the live 720723288 > 720723043 shape)");
+    await w1.groupTab(seed, "Pi Agent");
+
+    // Leftover debris in the USER's window: an ordinary x.com tab that joined a "Pi Agent" group and a
+    // separate tab still at the marked url, both among the user's own unmarked tabs.
+    const debrisGroupId = state.alloc.group();
+    const groupedDebris = { id: state.alloc.tab(), windowId: state.userWindowId, url: "https://x.com/home", active: false, groupId: debrisGroupId };
+    const markerDebris = { id: state.alloc.tab(), windowId: state.userWindowId, url: "about:blank#pi-chrome", active: false, groupId: -1 };
+    state.tabs.set(groupedDebris.id, groupedDebris);
+    state.tabs.set(markerDebris.id, markerDebris);
+    state.groups.set(debrisGroupId, { id: debrisGroupId, title: "Pi Agent", color: "blue", collapsed: false, windowId: state.userWindowId });
+
+    // Extension reload: the Pi-created-window registry and every session record are gone;
+    // chrome.storage.session is wiped while the browser keeps its windows, tabs, and groups.
+    for (const key of Object.keys(state.storage)) delete state.storage[key];
+    const w2 = loadWorker(makeChrome(state, { withTabGroups: true }));
+
+    const snapshotChrome = makeChrome(state, { withTabGroups: true });
+    const windowsSnapshot = await snapshotChrome.windows.getAll();
+    const groupsSnapshot = await snapshotChrome.tabGroups.query({});
+    const candidates = [...w2.dedicatedPiWindowIds(windowsSnapshot, groupsSnapshot)];
+    ok(!candidates.includes(state.userWindowId),
+      "debris-guard: the user's window (Pi Agent group + #pi-chrome tab among user tabs) is never a candidate");
+    ok(candidates.includes(seed.windowId), "debris-guard: the genuine all-Pi-tab window is still a candidate");
+    const discovered = await w2.findDedicatedPiWindow();
+    ok(discovered === seed.windowId && discovered !== state.userWindowId,
+      "debris-guard: discovery adopts the genuine Pi window, never the user's");
+
+    const userTabIdsBefore = [...state.tabs.values()].filter((t) => t.windowId === state.userWindowId).map((t) => t.id).sort();
+    const userGroupCountBefore = [...state.groups.values()].filter((g) => g.windowId === state.userWindowId).length;
+
+    const opened = await w2.dispatch("tab.new", { url: "https://pi.test/debris-tab", groupTitle: "Pi Agent", sessionKey: "session:fresh" });
+    ok(opened.tab.windowId === seed.windowId, "debris-guard: tab.new lands in the genuine dedicated window, not the user's");
+    ok(opened.group.windowId === seed.windowId, "debris-guard: tab.new's group is created in the genuine window, not the user's");
+
+    const nav = await w2.dispatch("page.navigate", { url: "https://pi.test/debris-nav", waitUntilLoad: false, sessionKey: "session:fresh-nav" });
+    ok(nav.windowId === seed.windowId, "debris-guard: page.navigate lands in the genuine dedicated window, not the user's");
+
+    const listed = (await w2.dispatch("window.list", { sessionKey: "session:fresh" })).windows;
+    const userListed = listed.find((win) => win.windowId === state.userWindowId);
+    ok(userListed && userListed.ownedByPi === false, "debris-guard: window.list never marks the user's window as Pi's");
+
+    const userTabIdsAfter = [...state.tabs.values()].filter((t) => t.windowId === state.userWindowId).map((t) => t.id).sort();
+    const userGroupCountAfter = [...state.groups.values()].filter((g) => g.windowId === state.userWindowId).length;
+    ok(userTabIdsAfter.join(",") === userTabIdsBefore.join(","), "debris-guard: the user's window gains no tab");
+    ok(userGroupCountAfter === userGroupCountBefore, "debris-guard: the user's window gains no group");
+    ok(state.tabs.has(markerDebris.id) && state.tabs.get(markerDebris.id).url === "about:blank#pi-chrome", "debris-guard: the leftover marker tab is left exactly where the user has it");
+  }
+
   // ===== The dedicated window is discovered from the #pi-chrome marker of its fresh automation tab
   // even after an EXTENSION RELOAD wipes chrome.storage.session (the registry). Before this, a
   // wiped registry meant a brand-new window for the next session. =====
