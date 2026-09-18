@@ -441,3 +441,27 @@ test("a preference set while NOTHING is connected waits for a connector instead 
   // And with no preference at all, zero connectors still waits too.
   assert.equal(withClients([]).resolveTargetClient(), undefined);
 });
+
+test("the preference is re-read from disk, so another session's change takes effect at once", () => {
+  // The bridge can change owner at any moment and the preference is machine-wide state that any session
+  // may change. A session holding a stale copy would route by a value the user already replaced.
+  // Observed live: a just-reloaded bridge reported no preference while the file said "edge".
+  const bridge = withClients(
+    [{ browser: "edge", profileId: "ab12cd34" }, { browser: "chrome", profileId: "11223344" }],
+    "edge",
+  );
+  assert.equal(bridge.resolveTargetClient(), EDGE);
+
+  // Another session switches to Chrome. This one was never restarted.
+  saved.value = "chrome";
+  assert.equal(bridge.resolveTargetClient(), CHROME, "the file wins over the in-memory copy");
+
+  // And clearing it elsewhere means auto everywhere — not the stale value.
+  saved.value = undefined;
+  assert.throws(() => bridge.resolveTargetClient(), /2 connectors are connected/, "auto, refusing to guess");
+
+  // status() must agree, so the reported selection is never the stale one either.
+  saved.value = "edge";
+  assert.equal(bridge.status().selectedClient, "edge");
+  assert.equal(bridge.status().selectedKey, EDGE);
+});

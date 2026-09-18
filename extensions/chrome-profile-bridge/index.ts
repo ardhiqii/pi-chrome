@@ -394,10 +394,20 @@ class ChromeProfileBridge {
 	// Every connector seen, keyed by `${browser}:${profileId}`. Used to route commands and to tell the
 	// caller which browsers/profiles are actually available.
 	private clients = new Map<string, BridgeClient>();
-	// Explicit choice of connector, persisted to disk so a NEW SESSION inherits it rather than starting
-	// over in auto and having to be told which browser to use again. Undefined means "auto": the only
-	// connected one, or refuse if there is more than one rather than guessing.
+	// Explicit choice of connector. Undefined means "auto": the only connected one, or refuse if there
+	// is more than one rather than guessing. The file is the source of truth (see currentPreference),
+	// not this field — it is only the last value read.
 	private selectedClient: string | undefined = readPreferredConnector();
+
+	// Re-read the saved preference from disk instead of trusting the value loaded at construction. The
+	// bridge can change owner at any moment, and the preference is machine-wide state that any session
+	// may change — so a session holding a stale copy would route by a value the user has already
+	// replaced. Observed live: a reloaded bridge reported no preference while the file said "edge".
+	private currentPreference(): string | undefined {
+		const stored = readPreferredConnector();
+		if (stored !== this.selectedClient) this.selectedClient = stored;
+		return stored;
+	}
 	private lastSeenAt: number | undefined;
 	private clientName: string | undefined;
 	private clientBrowser: string | undefined;
@@ -494,17 +504,18 @@ class ChromeProfileBridge {
 	// arrives first — the pre-routing behaviour, and what one connector always gets.
 	private resolveTargetClient(): string | undefined {
 		const live = this.liveClients();
+		const wanted = this.currentPreference();
 		// Nothing has polled yet, so there is nothing to address: leave the command unrouted and the first
 		// connector to arrive takes it. This also covers a browser restart or an MV3 service-worker
 		// suspension, which leave zero connectors for a moment — failing here would turn a momentary
 		// absence into an error. It must not depend on whether a preference happens to be set: with one, a
 		// brief absence used to throw while without one it waited, which is a bug.
 		if (live.length === 0) return undefined;
-		if (this.selectedClient !== undefined) {
+		if (wanted !== undefined) {
 			const match = this.resolvePreferred(live);
 			if (!match) {
 				throw new Error(
-					`The preferred connector (${this.selectedClient}) is not connected. ` +
+					`The preferred connector (${wanted}) is not connected. ` +
 						`Connected now: ${this.describeClientList(live)}. ` +
 						`Run /chrome connector <key> to switch, or /chrome connector auto to stop preferring one.`,
 				);
@@ -523,7 +534,7 @@ class ChromeProfileBridge {
 	// bare browser name matches, so "prefer edge" keeps working even if the profile id changes — that id
 	// lives in per-profile extension storage, so clearing it or reinstalling the connector changes it.
 	private resolvePreferred(live: BridgeClient[]): BridgeClient | undefined {
-		const wanted = this.selectedClient;
+		const wanted = this.currentPreference();
 		if (wanted === undefined) return undefined;
 		const exact = live.find((client) => client.key === wanted);
 		if (exact) return exact;
@@ -566,7 +577,7 @@ class ChromeProfileBridge {
 				label: this.describeClient(client),
 				lastSeenAt: client.lastSeenAt,
 			})),
-			selectedClient: this.selectedClient ?? null,
+			selectedClient: this.currentPreference() ?? null,
 			// The live connector the saved preference resolves to, so callers can mark it without
 			// re-implementing key-or-browser matching.
 			selectedKey: this.resolvePreferred(live)?.key ?? null,
