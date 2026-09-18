@@ -99,6 +99,47 @@ function writePreferredConnector(value: string | undefined): void {
 		// Best effort: an unwritable state file must never break connector selection for this session.
 	}
 }
+
+type ConnectorStatus = {
+	connected?: boolean;
+	clientName?: string | null;
+	clients?: Array<{ key: string; label: string }>;
+	selectedClient?: string | null;
+	selectedKey?: string | null;
+};
+
+// Explain the connector situation. Hoisted out of the /chrome connector handler so it can be tested
+// directly as a pure function — the cases that matter are the ones that only occur when something is
+// missing or newer than the bridge answering, and those are exactly the ones that are never exercised
+// by hand.
+function describeConnectorStatus(status: ConnectorStatus): string {
+	const clients = status.clients ?? [];
+	if (clients.length === 0) {
+		// Version skew: the bridge belongs to whichever Pi session bound the port first, and an older
+		// build answers with only connected+clientName, no client list. Reading `clients` on its own
+		// would report that nothing is connected while a connector is plainly polling — and send the
+		// user to /chrome onboard to repair an extension that was never broken.
+		if (status.clients === undefined && status.connected) {
+			return (
+				`Connector connected: ${status.clientName ?? "unnamed"}.\n` +
+				"The Pi session that owns Chrome control is running an older pi-chrome, so it cannot report " +
+				"the connector list or be told which connector to use.\n" +
+				"Run /reload in that session to update it."
+			);
+		}
+		return "No connector is connected. Enable 'Pi Chrome Connector' in the browser profile you want to drive (/chrome onboard).";
+	}
+	const chosen = status.selectedKey ?? status.selectedClient;
+	const selection = status.selectedClient
+		? `${status.selectedClient} — saved, so new sessions use it too`
+		: "auto (the only connected connector; refuses to guess when several are connected)";
+	return (
+		`Connectors connected (${clients.length}):\n` +
+		clients.map((client) => `  ${client.key} — ${client.label}${client.key === chosen ? "   ← selected" : ""}`).join("\n") +
+		`\nSelection: ${selection}\n` +
+		"Use /chrome connector <key>, or /chrome connector edge|chrome, to choose one."
+	);
+}
 const PI_CHROME_GLOBAL_KEY = "__piChromeProfileBridgeLoaded__";
 // Authorization is kept on globalThis (separate from the singleton flag, which is cleared on
 // reload) so a /reload — which tears down and re-evaluates the module — does not silently drop
@@ -1460,29 +1501,7 @@ Usage rules:
 	// practice; with several it is the difference between driving the browser you meant and driving
 	// whichever one happened to poll first.
 	const connectorHandler = async (ctx: ExtensionContext, args: string): Promise<void> => {
-		type ConnectorStatus = {
-			clients?: Array<{ key: string; label: string }>;
-			selectedClient?: string | null;
-			selectedKey?: string | null;
-		};
-		const describe = (status: ConnectorStatus): string => {
-			const clients = status.clients ?? [];
-			if (clients.length === 0) {
-				return "No connector is connected. Enable 'Pi Chrome Connector' in the browser profile you want to drive (/chrome onboard).";
-			}
-			const chosen = status.selectedKey ?? status.selectedClient;
-			const selection = status.selectedClient
-				? `${status.selectedClient} — saved, so new sessions use it too`
-				: "auto (the only connected connector; refuses to guess when several are connected)";
-			return (
-				`Connectors connected (${clients.length}):\n` +
-				clients
-					.map((client) => `  ${client.key} — ${client.label}${client.key === chosen ? "   ← selected" : ""}`)
-					.join("\n") +
-				`\nSelection: ${selection}\n` +
-				`Use /chrome connector <key>, or /chrome connector edge|chrome, to choose one.`
-			);
-		};
+		const describe = describeConnectorStatus;
 		try {
 			if (!args.trim() || args.trim() === "list" || args.trim() === "status") {
 				ctx.ui.notify(describe(bridge.status() as ConnectorStatus), "info");

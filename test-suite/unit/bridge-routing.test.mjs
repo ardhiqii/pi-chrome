@@ -45,6 +45,82 @@ function loadBridgeClass() {
 }
 
 const { Bridge, saved } = loadBridgeClass();
+
+// describeConnectorStatus is pure, so it can be loaded and called on its own.
+function loadDescribeConnectorStatus() {
+  const start = indexSource.indexOf("function describeConnectorStatus(");
+  assert.ok(start >= 0, "could not locate describeConnectorStatus");
+  const end = indexSource.indexOf("\n}\n", start);
+  assert.ok(end > start, "could not locate the end of describeConnectorStatus");
+  const source = indexSource.slice(start, end + 3);
+  const sandbox = { console };
+  vm.runInNewContext(stripTypeScriptTypes(source) + "\n;globalThis.__d = describeConnectorStatus;", sandbox);
+  return sandbox.__d;
+}
+
+const describeConnectorStatus = loadDescribeConnectorStatus();
+
+test("status: an older bridge that reports a connection is NOT reported as having none", () => {
+  // The bridge belongs to whichever Pi session bound the port first. An older build answers with only
+  // connected+clientName and no client list. Reading `clients` alone claimed nothing was connected
+  // while a connector was plainly polling, and sent the user to /chrome onboard to repair a working
+  // extension. This is the exact shape the running bridge returns.
+  const text = describeConnectorStatus({
+    connected: true,
+    clientName: "Pi Chrome Connector gfcbdfcmfejelnocemdajdhmafhdfkln",
+    queuedCommands: 0,
+    pendingCommands: 0,
+  });
+  assert.doesNotMatch(text, /No connector is connected/, "must not deny a connector that is polling");
+  assert.doesNotMatch(text, /\/chrome onboard/, "must not send the user to reinstall a working extension");
+  assert.match(text, /Connector connected: Pi Chrome Connector/);
+  assert.match(text, /\/reload in that session/, "points at the actual fix");
+});
+
+test("status: nothing connected is still reported as nothing connected", () => {
+  assert.match(describeConnectorStatus({ connected: false, clients: [] }), /No connector is connected/);
+  assert.match(describeConnectorStatus({}), /No connector is connected/, "no keys at all means nothing to drive");
+  assert.doesNotMatch(describeConnectorStatus({ connected: false, clients: [] }), /\/reload in that session/);
+});
+
+test("status: several connectors are listed, with the chosen one marked", () => {
+  const text = describeConnectorStatus({
+    connected: true,
+    clients: [
+      { key: "edge:ab12cd34", label: "Edge (profile ab12cd34)" },
+      { key: "chrome:11223344", label: "Chrome (profile 11223344)" },
+    ],
+    selectedClient: "edge",
+    selectedKey: "edge:ab12cd34",
+  });
+  assert.match(text, /Connectors connected \(2\)/);
+  assert.match(text, /edge:ab12cd34 — Edge \(profile ab12cd34\) {3}← selected/);
+  assert.match(text, /chrome:11223344 — Chrome \(profile 11223344\)\n/, "the unchosen one is unmarked");
+  assert.match(text, /edge — saved, so new sessions use it too/);
+});
+
+test("status: with nothing saved, the auto rule is explained rather than left implicit", () => {
+  const text = describeConnectorStatus({
+    connected: true,
+    clients: [{ key: "edge:ab12cd34", label: "Edge (profile ab12cd34)" }],
+    selectedClient: null,
+    selectedKey: null,
+  });
+  assert.match(text, /Selection: auto \(the only connected connector/);
+  assert.doesNotMatch(text, /← selected/, "nothing to mark when nothing is chosen");
+});
+
+test("status: a saved browser name does not need to equal the connector key", () => {
+  // Choosing by browser name saves "edge"; the live key is edge:<profile>. Marking by key equality
+  // alone would show no selection at all.
+  const text = describeConnectorStatus({
+    connected: true,
+    clients: [{ key: "edge:brandnew1", label: "Edge (profile brandnew1)" }],
+    selectedClient: "edge",
+    selectedKey: "edge:brandnew1",
+  });
+  assert.match(text, /edge:brandnew1 — Edge \(profile brandnew1\) {3}← selected/);
+});
 const EDGE = "edge:ab12cd34";
 const OTHER_EDGE = "edge:ff99ee88";
 const CHROME = "chrome:11223344";

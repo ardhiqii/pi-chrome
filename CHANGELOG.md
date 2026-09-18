@@ -99,6 +99,15 @@ All notable user-facing changes to `pi-chrome`.
   contains a profile id that lives in per-profile extension storage, so clearing it or reinstalling
   the connector would otherwise break the saved preference. A saved preference that is not connected
   **refuses** rather than quietly driving a different browser, and `/chrome connector auto` clears it.
+- **Fixed a version-skew bug in our own status reporting.** The bridge belongs to whichever Pi session
+  bound port 17318 first, and an older build answers `/status` with only `connected` + `clientName` —
+  no client list. The new `/chrome connector` reporter read `clients` alone, so a session running this
+  build against an older bridge reported **"No connector is connected"** while a connector was plainly
+  polling, and pointed at `/chrome onboard` — sending the user to repair an extension that was working
+  fine. It now falls back to the legacy fields and names the real fix (`/reload` in the session that
+  owns Chrome control). Four cases in `bridge-routing.test.mjs` cover the status text, including the
+  exact key set the running bridge returns; the pure reporter had to be hoisted out of the handler to
+  be testable at all.
 - **The connector identifies itself: browser and profile.** pi-chrome could not previously say which
   browser it was driving — the bridge saw only `Pi Chrome Connector <extension id>`, and the browser
   was not reported anywhere except buried in a `userAgent` string — so anything reading the tool
