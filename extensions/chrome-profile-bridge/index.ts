@@ -1707,9 +1707,8 @@ Usage rules:
 		}
 	};
 
-	// Give a connector the name the user sees in their browser's profile switcher, so "Edge (profile
-	// 9d233ecf)" becomes "Edge — Clover Agent". Offered as a list of the profile names found on this
-	// machine, with an escape hatch to type any name.
+	// Cancelling at any step here just returns, and the caller re-shows the picker — so Esc steps back one
+	// level instead of abandoning the whole flow, which is how the other /chrome menus already behave.
 	const renameConnector = async (ctx: ExtensionContext, clients: ClientSummary[]): Promise<void> => {
 		let target = clients[0];
 		if (clients.length > 1) {
@@ -1717,12 +1716,22 @@ Usage rules:
 			if (!picked) return;
 			target = clients.find((client) => client.label === picked) ?? clients[0];
 		}
-		const suggestions = suggestBrowserProfileNames();
+		const existing = readConnectorNames()[target.key];
+		const typeOwn = "Type a name…";
+		const clear = "Remove name";
+		// Offer the profile names found on this machine — the ones the user already sees in the browser's
+		// own switcher — rather than making them invent one. With nothing to offer, go straight to typing.
+		const options = [...suggestBrowserProfileNames().filter((name) => name !== existing), typeOwn];
+		if (existing) options.push(clear);
 		let name: string | undefined;
-		if (suggestions.length > 0) {
-			const typeOwn = "Type a name…";
-			const choice = await ctx.ui.select(`What should “${target.label}” be called?`, [...suggestions, typeOwn]);
+		if (options.length > 1) {
+			const choice = await ctx.ui.select(`What should “${target.label}” be called?`, options);
 			if (!choice) return;
+			if (choice === clear) {
+				writeConnectorName(target.key, undefined);
+				ctx.ui.notify(`${target.label} will be shown by its profile id again.`, "info");
+				return;
+			}
 			name = choice === typeOwn ? ((await ctx.ui.input("Name this browser", "")) ?? undefined) : choice;
 		} else {
 			name = (await ctx.ui.input("Name this browser", "")) ?? undefined;
@@ -1732,28 +1741,33 @@ Usage rules:
 		ctx.ui.notify(`This browser will be shown as “${name.trim()}”.`, "info");
 	};
 
+	// The picker loops so a cancelled sub-step returns here; Esc at the picker itself is what closes it.
 	const openConnectorMenu = async (ctx: ExtensionContext): Promise<void> => {
-		const status = (await bridge.refreshStatus()) as ConnectorStatus;
-		const clients = status.clients ?? [];
-		if (clients.length === 0) {
-			// Nothing to choose between, so say what is actually wrong rather than offering an empty menu.
-			ctx.ui.notify(describeConnectorStatus(status), "info");
+		while (true) {
+			const status = (await bridge.refreshStatus()) as ConnectorStatus;
+			const clients = status.clients ?? [];
+			if (clients.length === 0) {
+				// Nothing to choose between, so say what is actually wrong rather than offering an empty menu.
+				ctx.ui.notify(describeConnectorStatus(status), "info");
+				return;
+			}
+			const { autoLabel, options, keyByLabel } = connectorMenuOptions(clients, status.selectedKey ?? status.selectedClient);
+			options.push(RENAME_CONNECTOR_ENTRY);
+			const choice = await ctx.ui.select("Which browser should Pi drive?", options);
+			if (!choice) return;
+			if (choice === RENAME_CONNECTOR_ENTRY) {
+				await renameConnector(ctx, clients);
+				// Re-show the picker so the new name is visible, and Esc from here is still one step back.
+				continue;
+			}
+			const key = choice === autoLabel ? "auto" : keyByLabel.get(choice);
+			if (!key) return;
+			ctx.ui.notify(
+				describeConnectorStatus((await bridge.send("client.select", { key }, 10_000)) as ConnectorStatus),
+				"info",
+			);
 			return;
 		}
-		const { autoLabel, options, keyByLabel } = connectorMenuOptions(clients, status.selectedKey ?? status.selectedClient);
-		options.push(RENAME_CONNECTOR_ENTRY);
-		const choice = await ctx.ui.select("Which browser should Pi drive?", options);
-		if (!choice) return;
-		if (choice === RENAME_CONNECTOR_ENTRY) {
-			await renameConnector(ctx, clients);
-			return;
-		}
-		const key = choice === autoLabel ? "auto" : keyByLabel.get(choice);
-		if (!key) return;
-		ctx.ui.notify(
-			describeConnectorStatus((await bridge.send("client.select", { key }, 10_000)) as ConnectorStatus),
-			"info",
-		);
 	};
 
 	// Choose which installed connector receives chrome_* commands. With one connector this is a no-op in

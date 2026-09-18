@@ -104,7 +104,9 @@ All notable user-facing changes to `pi-chrome`.
   the same human labels the status output uses, with a tick on the current choice and an option to go
   back to automatic. The keys (`edge:9d233ecf`) are profile hashes that nobody should have to read or
   type, so they never appear in the menu. `/chrome connector list` still prints the text form, and
-  `connector` was missing from the command completions entirely.
+  `connector` was missing from the command completions entirely. The picker loops, so Esc steps back
+  one level — cancelling the name prompt returns to the picker rather than abandoning the flow — and a
+  name can be removed again, falling back to the profile id.
 - **Fixed: a session that does not own the bridge reported "no connector" no matter what.** Only the Pi
   session that first bound port 17318 ever receives the companion extension's poll; every other session
   forwards its commands to that owner. Their local `connected`/`clients` state is therefore empty **by

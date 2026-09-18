@@ -16,6 +16,9 @@ function section(start, end) {
 }
 const commandSource = stripTypeScriptTypes([
   section("const authSummary =", "\n\tconst chromeControlAuthorized ="),
+  // The connector menu's own helpers: the picker entry constant, the label->key mapping, and the status
+  // reporter the connector handler calls.
+  section("const RENAME_CONNECTOR_ENTRY =", "\nconst PI_CHROME_GLOBAL_KEY"),
   section("// Shared handlers,", "\n\tfunction registerChromeTools("),
 ].join("\n"));
 
@@ -28,8 +31,8 @@ function healthyResponse(action) {
   }
 }
 
-function harness({ until, background = true, mode = "server", choices = [], send = healthyResponse, clientLabel } = {}) {
-  const calls = [], notices = [], menus = [];
+function harness({ until, background = true, mode = "server", choices = [], send = healthyResponse, clientLabel, connectors, connectorNames = {}, profileSuggestions = [] } = {}) {
+  const calls = [], notices = [], menus = [], namesWritten = [];
   let command;
   const ctx = {
     ui: {
@@ -38,14 +41,21 @@ function harness({ until, background = true, mode = "server", choices = [], send
         menus.push({ title, items: Array.from(items) });
         return choices[menus.length - 1];
       },
+      async input() { return undefined; },
     },
   };
   const sandbox = {
     Date: { now: () => now }, PI_CHROME_VERSION: version,
     chromeAuthorizedUntil: until, backgroundEnabled: background,
     hostnameOf: (url) => new URL(url).hostname,
+    // The connector menu's collaborators: the real ones read the user's state file and the browser's
+    // profile folders, which a test must neither touch nor depend on.
+    readConnectorNames: () => connectorNames,
+    writeConnectorName: (key, name) => namesWritten.push([key, name]),
+    suggestBrowserProfileNames: () => profileSuggestions,
     bridge: {
       status: () => ({ mode }),
+      refreshStatus: async () => ({ mode, clients: connectors }),
       clientLabel: () => clientLabel,
       async send(action, params, timeout) {
         calls.push({ action, params: JSON.parse(JSON.stringify(params)), timeout });
@@ -55,7 +65,7 @@ function harness({ until, background = true, mode = "server", choices = [], send
     pi: { registerCommand(name, definition) { assert.equal(name, "chrome"); command = definition; } },
   };
   vm.runInNewContext(commandSource, sandbox);
-  return { command, calls, notices, menus, sandbox, run: (args = "") => command.handler(args, ctx) };
+  return { command, calls, notices, menus, namesWritten, sandbox, run: (args = "") => command.handler(args, ctx) };
 }
 
 test("command help and root completion omit status; nested background status remains available", () => {
@@ -176,4 +186,50 @@ test("doctor names the browser and profile the bridge is talking to", async () =
     report.includes("Connected to Edge (profile ab12cd34)"),
     `doctor should name the target, got:\n${report}`,
   );
+});
+
+const NAMED = [{ key: "edge:9d233ecf", browser: "edge", profileId: "9d233ecf", label: "Edge — Profile 1" }];
+
+test("Esc in the connector menu steps back one level instead of closing the whole flow", async () => {
+  // The picker loops so a cancelled sub-step returns to it. It used to return from every depth, so
+  // pressing Esc while choosing a name abandoned the flow entirely.
+  const h = harness({
+    connectors: NAMED,
+    profileSuggestions: ["Profile 1", "Clover Agent"],
+    // rename -> the name prompt is cancelled -> back to the picker -> Esc there closes it.
+    choices: ["Rename a browser…", undefined, undefined],
+  });
+  await h.run("connector");
+  const titles = h.menus.map((menu) => menu.title);
+  assert.equal(titles[0], "Which browser should Pi drive?");
+  assert.equal(titles[1], "What should “Edge — Profile 1” be called?", "the name prompt was reached");
+  assert.equal(titles[2], "Which browser should Pi drive?", "Esc returned to the picker");
+  assert.equal(titles.length, 3, "and the next Esc closed it — not an endless loop");
+  assert.deepEqual(h.namesWritten, [], "cancelling writes nothing");
+});
+
+test("naming a connector stores it and returns to the picker with the new name", async () => {
+  const h = harness({
+    connectors: NAMED,
+    // Already named, so the suggestions exclude the current name and "Remove name" is offered.
+    connectorNames: { "edge:9d233ecf": "Profile 1" },
+    profileSuggestions: ["Profile 1", "Clover Agent"],
+    choices: ["Rename a browser…", "Clover Agent", undefined],
+  });
+  await h.run("connector");
+  assert.deepEqual(h.namesWritten, [["edge:9d233ecf", "Clover Agent"]]);
+  const namePrompt = h.menus.find((menu) => menu.title.includes("be called?"));
+  assert.deepEqual(namePrompt.items, ["Clover Agent", "Type a name…", "Remove name"]);
+  assert.equal(h.menus.at(-1).title, "Which browser should Pi drive?", "the picker returns so the new name is visible");
+});
+
+test("a name can be removed, falling back to the profile id", async () => {
+  const h = harness({
+    connectors: NAMED,
+    connectorNames: { "edge:9d233ecf": "Profile 1" },
+    profileSuggestions: [],
+    choices: ["Rename a browser…", "Remove name", undefined],
+  });
+  await h.run("connector");
+  assert.deepEqual(h.namesWritten, [["edge:9d233ecf", undefined]], "the name is cleared");
 });
