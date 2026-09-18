@@ -528,6 +528,24 @@ async function run() {
       "generic-group: the leftover grouped tab was left exactly as it was");
   }
 
+  // ===== An explicit "a window of Pi's own" must NEVER fall back to a tab in the user's window. =====
+  // Reported live: the user chose Pi's own window, the window creation was refused, the shared-tab
+  // fallback silently ran instead, and Pi ended up working in their browser — the opposite of the choice
+  // they had just made, with nothing said. The fallback stays for the implicit case (tested above); it is
+  // forbidden when the user asked for an isolated window.
+  {
+    const state = makeChromeState();
+    const w = loadWorker(makeChrome(state, { withWindows: false }));
+    const tabsBefore = state.tabs.size;
+    await throwsWith(
+      () => w.dispatch("window.select", { windowId: null, sessionKey: SK }),
+      /will not put its tab in one of yours/,
+      "own-window-strict: refuses instead of quietly using the user's window",
+    );
+    ok(state.tabs.size === tabsBefore, "own-window-strict: no tab was created anywhere");
+    ok(state.tabs.has(state.userArticle.id) && state.tabs.has(state.userGmail.id), "own-window-strict: user tabs untouched");
+  }
+
   console.log(`\n${passes} passed, ${failures} failed`);
   if (failures) process.exit(1);
 }

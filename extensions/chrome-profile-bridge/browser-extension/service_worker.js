@@ -225,7 +225,7 @@ function isPiChromeOwnedTarget(tabId, sessionKey) {
 // close. An explicit "a window of Pi's own" must come here rather than reuse wherever an existing
 // "Pi Agent" group happens to live — otherwise a user who picks it after having picked one of their own
 // windows silently lands back in their window, with no way to get an isolated one again.
-async function createIsolatedWindowTarget(sessionKey) {
+async function createIsolatedWindowTarget(sessionKey, { allowSharedTabFallback = true } = {}) {
   if (chrome.windows && typeof chrome.windows.create === "function") {
     try {
       const win = await chrome.windows.create({ url: "about:blank", focused: false });
@@ -239,8 +239,19 @@ async function createIsolatedWindowTarget(sessionKey) {
       // Window creation can fail (policy, headless, etc.); fall back to a dedicated tab below.
     }
   }
-  // Tab fallback: the tab lives in a pre-existing (user/shared) window we did NOT create, so we must
-  // leave windowId unset — cleanup then closes only our tab, never the user's window.
+  // A dedicated tab in a pre-existing (user/shared) window we did NOT create. windowId is left unset so
+  // cleanup closes only our tab, never the user's window — this is the tested contract when a window
+  // cannot be created at all.
+  //
+  // It is NOT allowed when the user explicitly asked for a window of Pi's own. Silence there means Pi
+  // works in the user's browser right after they asked it not to, which is exactly what happened and what
+  // they reported. An error they can act on beats doing the opposite of what they chose.
+  if (!allowSharedTabFallback) {
+    throw new Error(
+      "Chrome refused to open a window for Pi, and pi-chrome will not put its tab in one of yours uninvited. " +
+        "Run /chrome window to choose one of your windows, or close a window and retry.",
+    );
+  }
   const tab = await chrome.tabs.create({ url: "about:blank", active: false });
   automationTargets.set(sessionKey, { windowId: undefined, tabId: typeof tab.id === "number" ? tab.id : undefined });
   await persistAutomationTargets();
@@ -1653,7 +1664,7 @@ async function dispatch(action, params) {
             return { windowId: current.windowId, tabId: current.tabId, reused: true, fresh: false };
           }
         }
-        const tab = await createIsolatedWindowTarget(sessionKey);
+        const tab = await createIsolatedWindowTarget(sessionKey, { allowSharedTabFallback: false });
         await retireCurrent(tab.id);
         return { windowId: tab.windowId ?? null, tabId: tab.id ?? null, reused: false, fresh: true };
       }
