@@ -602,3 +602,32 @@ test("a connector given a name shows that name instead of its profile hash", () 
   names.value = {};
   assert.equal(bridge.clientLabel(), "Edge (profile ab12cd34)");
 });
+
+test("a name this session knows is applied even when the OWNER does not know it", () => {
+  // The bridge is owned by a different Pi session, which may predate connector naming or simply not have
+  // been reloaded. The label it sends is formatted by IT, so a name the user gave would never appear.
+  const bridge = newBridge();
+  bridge.mode = "client";
+  names.value = { "edge:9d233ecf": "Clover Agent" };
+  net.status = {
+    connected: true,
+    clientBrowser: "edge",
+    clientProfileId: "9d233ecf",
+    clientLabel: "Edge (profile 9d233ecf)",        // what the old owner says
+    clients: [{ key: "edge:9d233ecf", browser: "edge", profileId: "9d233ecf", label: "Edge (profile 9d233ecf)" }],
+  };
+
+  return bridge.refreshStatus().then((status) => {
+    assert.deepEqual([...status.clients].map((c) => c.label), ["Edge — Clover Agent"], "the list uses the name");
+    assert.equal(status.clientLabel, "Edge — Clover Agent", "and so does the single-connector label");
+    assert.equal(bridge.clientLabel(), "Edge — Clover Agent", "chrome_launch agrees");
+    // status() reads the cache, and must agree too rather than reverting to the owner's text.
+    assert.deepEqual([...bridge.status().clients].map((c) => c.label), ["Edge — Clover Agent"]);
+
+    // Connectors this session has no name for are left exactly as the owner reported them.
+    names.value = {};
+    return bridge.refreshStatus().then((again) => {
+      assert.deepEqual([...again.clients].map((c) => c.label), ["Edge (profile 9d233ecf)"]);
+    });
+  });
+});

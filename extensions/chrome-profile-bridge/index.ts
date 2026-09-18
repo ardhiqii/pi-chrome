@@ -554,17 +554,39 @@ class ChromeProfileBridge {
 			// Owner unreachable right now: keep the last known view rather than falling back to empty
 			// local state, which would claim no connector is connected.
 		}
-		return { ...(this.ownerStatus ?? {}), mode: this.mode };
+		return this.withLocalNames({ ...(this.ownerStatus ?? {}), mode: this.mode });
 	}
 
 	// Human-readable "which browser/profile am I talking to". The connector identifies itself on every
 	// poll (it can be installed in several browsers and profiles), so this is reported rather than
 	// guessed — assuming Chrome from the tool names alone is exactly the mistake this prevents.
+	// The owner formats the labels it sends, but the owner is a DIFFERENT Pi session and may predate the
+	// connector-naming feature — or simply not have been reloaded. Re-derive labels from the raw
+	// browser/profile fields whenever this session knows a name for that connector, so a name the user
+	// gave shows up regardless of what the owner was built with.
+	private withLocalNames(status: Record<string, unknown>): Record<string, unknown> {
+		const names = readConnectorNames();
+		if (Object.keys(names).length === 0) return status;
+		const browser = typeof status.clientBrowser === "string" ? status.clientBrowser : undefined;
+		const profileId = typeof status.clientProfileId === "string" ? status.clientProfileId : undefined;
+		const name = typeof status.clientName === "string" ? status.clientName : undefined;
+		type Row = { key?: string; browser?: string; profileId?: string; label?: string };
+		const clients = Array.isArray(status.clients)
+			? (status.clients as Row[]).map((client) => {
+					if (!client?.key || !names[client.key]) return client;
+					return { ...client, label: this.describeClient({ browser: client.browser, profileId: client.profileId, key: client.key }) };
+				})
+			: status.clients;
+		const ownKey = this.clientKeyOf(browser, profileId, name);
+		const clientLabel = names[ownKey] ? this.describeClient({ browser, profileId, key: ownKey }) : status.clientLabel;
+		return { ...status, clients, clientLabel };
+	}
+
 	clientLabel(): string | undefined {
-		// In client mode the connector belongs to the owner, which has already formatted the label.
+		// In client mode the connector belongs to the owner, which has already formatted the label — unless
+		// this session knows a name for it, which the owner may never have heard of.
 		if (this.mode === "client") {
-			const label = this.ownerStatus?.clientLabel;
-			return typeof label === "string" && label ? label : undefined;
+			return this.withLocalNames({ ...(this.ownerStatus ?? {}) }).clientLabel as string | undefined;
 		}
 		if (!this.clientBrowser && !this.clientProfileId) return undefined;
 		return this.describeClient({
@@ -675,7 +697,7 @@ class ChromeProfileBridge {
 		// that reads status without awaiting refreshStatus still gets something true rather than an empty
 		// local map that reads as "nothing connected".
 		if (this.mode === "client" && this.ownerStatus) {
-			return { ...this.ownerStatus, mode: this.mode };
+			return this.withLocalNames({ ...this.ownerStatus, mode: this.mode });
 		}
 		const live = this.liveClients();
 		return {
