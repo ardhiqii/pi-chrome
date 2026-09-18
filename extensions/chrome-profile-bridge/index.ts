@@ -1,9 +1,9 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { mkdir, readdir, stat, unlink, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
 /**
@@ -67,6 +67,38 @@ function readPiChromeVersion(): string {
 	return "0.0.0-dev";
 }
 const PI_CHROME_VERSION = readPiChromeVersion();
+// User-level pi-chrome preferences. A file of its own rather than Pi's settings.json: this is
+// pi-chrome state, not agent configuration, and it must survive across sessions and projects — so a
+// newly started session already knows which connector to drive instead of having to be told again.
+const PI_CHROME_STATE_PATH = join(homedir(), ".pi", "agent", "pi-chrome.json");
+
+function readPreferredConnector(): string | undefined {
+	try {
+		const raw = JSON.parse(readFileSync(PI_CHROME_STATE_PATH, "utf8")) as { preferredConnector?: unknown };
+		return typeof raw.preferredConnector === "string" && raw.preferredConnector.trim()
+			? raw.preferredConnector.trim()
+			: undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+function writePreferredConnector(value: string | undefined): void {
+	try {
+		mkdirSync(dirname(PI_CHROME_STATE_PATH), { recursive: true });
+		let existing: Record<string, unknown> = {};
+		try {
+			const parsed = JSON.parse(readFileSync(PI_CHROME_STATE_PATH, "utf8")) as Record<string, unknown>;
+			if (parsed && typeof parsed === "object") existing = parsed;
+		} catch {
+			// No readable file yet; start a fresh one.
+		}
+		const next = { ...existing, preferredConnector: value ?? null };
+		writeFileSync(PI_CHROME_STATE_PATH, `${JSON.stringify(next, null, 2)}\n`);
+	} catch {
+		// Best effort: an unwritable state file must never break connector selection for this session.
+	}
+}
 const PI_CHROME_GLOBAL_KEY = "__piChromeProfileBridgeLoaded__";
 // Authorization is kept on globalThis (separate from the singleton flag, which is cleared on
 // reload) so a /reload — which tears down and re-evaluates the module — does not silently drop
@@ -321,9 +353,10 @@ class ChromeProfileBridge {
 	// Every connector seen, keyed by `${browser}:${profileId}`. Used to route commands and to tell the
 	// caller which browsers/profiles are actually available.
 	private clients = new Map<string, BridgeClient>();
-	// Explicit choice of connector. Undefined means "auto": the only connected one, or refuse if
-	// there is more than one rather than guessing.
-	private selectedClient: string | undefined;
+	// Explicit choice of connector, persisted to disk so a NEW SESSION inherits it rather than starting
+	// over in auto and having to be told which browser to use again. Undefined means "auto": the only
+	// connected one, or refuse if there is more than one rather than guessing.
+	private selectedClient: string | undefined = readPreferredConnector();
 	private lastSeenAt: number | undefined;
 	private clientName: string | undefined;
 	private clientBrowser: string | undefined;
@@ -389,12 +422,12 @@ class ChromeProfileBridge {
 	private resolveTargetClient(): string | undefined {
 		const live = this.liveClients();
 		if (this.selectedClient !== undefined) {
-			const match = live.find((client) => client.key === this.selectedClient);
+			const match = this.resolvePreferred(live);
 			if (!match) {
 				throw new Error(
-					`The selected connector (${this.selectedClient}) is not connected. ` +
+					`The preferred connector (${this.selectedClient}) is not connected. ` +
 						`Connected now: ${this.describeClientList(live)}. ` +
-						`Run /chrome connector auto to fall back to the only connected one.`,
+						`Run /chrome connector <key> to switch, or /chrome connector auto to stop preferring one.`,
 				);
 			}
 			return match.key;
@@ -402,8 +435,21 @@ class ChromeProfileBridge {
 		if (live.length <= 1) return live[0]?.key;
 		throw new Error(
 			`${live.length} connectors are connected: ${this.describeClientList(live)}. ` +
-				`Refusing to guess which one to drive. Pick one with /chrome connector <key>, or /chrome connector auto.`,
+				`Refusing to guess which one to drive. Pick one with /chrome connector <key> (the choice is saved for ` +
+				`future sessions), or /chrome connector auto.`,
 		);
+	}
+
+	// The saved preference resolved against what is actually connected. An exact key wins; otherwise a
+	// bare browser name matches, so "prefer edge" keeps working even if the profile id changes — that id
+	// lives in per-profile extension storage, so clearing it or reinstalling the connector changes it.
+	private resolvePreferred(live: BridgeClient[]): BridgeClient | undefined {
+		const wanted = this.selectedClient;
+		if (wanted === undefined) return undefined;
+		const exact = live.find((client) => client.key === wanted);
+		if (exact) return exact;
+		const byBrowser = live.filter((client) => (client.browser ?? "").toLowerCase() === wanted.toLowerCase());
+		return byBrowser.length === 1 ? byBrowser[0] : undefined;
 	}
 
 	private takeQueuedForClient(key: string): BridgeCommand | undefined {
@@ -436,6 +482,9 @@ class ChromeProfileBridge {
 				lastSeenAt: client.lastSeenAt,
 			})),
 			selectedClient: this.selectedClient ?? null,
+			// The live connector the saved preference resolves to, so callers can mark it without
+			// re-implementing key-or-browser matching.
+			selectedKey: this.resolvePreferred(live)?.key ?? null,
 			queuedCommands: this.queue.length,
 			pendingCommands: this.pending.size,
 		};
@@ -568,17 +617,21 @@ class ChromeProfileBridge {
 		const wanted = requested.trim();
 		if (wanted === "" || wanted.toLowerCase() === "auto") {
 			this.selectedClient = undefined;
+			writePreferredConnector(undefined);
 			return;
 		}
 		const live = this.liveClients();
 		const exact = live.find((client) => client.key === wanted);
 		if (exact) {
 			this.selectedClient = exact.key;
+			writePreferredConnector(this.selectedClient);
 			return;
 		}
 		const byBrowser = live.filter((client) => (client.browser ?? "").toLowerCase() === wanted.toLowerCase());
 		if (byBrowser.length === 1) {
-			this.selectedClient = byBrowser[0].key;
+			// Persist the browser NAME rather than the key: it survives the profile id changing.
+			this.selectedClient = wanted.toLowerCase();
+			writePreferredConnector(this.selectedClient);
 			return;
 		}
 		if (byBrowser.length > 1) {
@@ -1407,19 +1460,27 @@ Usage rules:
 	// practice; with several it is the difference between driving the browser you meant and driving
 	// whichever one happened to poll first.
 	const connectorHandler = async (ctx: ExtensionContext, args: string): Promise<void> => {
-		type ConnectorStatus = { clients?: Array<{ key: string; label: string }>; selectedClient?: string | null };
+		type ConnectorStatus = {
+			clients?: Array<{ key: string; label: string }>;
+			selectedClient?: string | null;
+			selectedKey?: string | null;
+		};
 		const describe = (status: ConnectorStatus): string => {
 			const clients = status.clients ?? [];
 			if (clients.length === 0) {
 				return "No connector is connected. Enable 'Pi Chrome Connector' in the browser profile you want to drive (/chrome onboard).";
 			}
+			const chosen = status.selectedKey ?? status.selectedClient;
+			const selection = status.selectedClient
+				? `${status.selectedClient} — saved, so new sessions use it too`
+				: "auto (the only connected connector; refuses to guess when several are connected)";
 			return (
 				`Connectors connected (${clients.length}):\n` +
 				clients
-					.map((client) => `  ${client.key} — ${client.label}${client.key === status.selectedClient ? "   ← selected" : ""}`)
+					.map((client) => `  ${client.key} — ${client.label}${client.key === chosen ? "   ← selected" : ""}`)
 					.join("\n") +
-				`\nSelection: ${status.selectedClient ?? "auto (the only connected connector; refuses to guess when several are connected)"}\n` +
-				`Use /chrome connector <key> to choose one.`
+				`\nSelection: ${selection}\n` +
+				`Use /chrome connector <key>, or /chrome connector edge|chrome, to choose one.`
 			);
 		};
 		try {

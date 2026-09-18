@@ -6,9 +6,13 @@
 // constructor signature into plain assignments is the whole shim — the routing logic under test is
 // the shipped code.
 //
-// What this covers: which connector a command is addressed to, and the refusal to guess when more
-// than one is connected. That is the behaviour that decides whether a command reaches the browser the
-// caller meant, so it should not ship unverified.
+// What this covers: which connector a command is addressed to, the refusal to guess when more than one
+// is connected, and — the reason the choice is persisted at all — that a NEW session inherits the
+// saved preference instead of starting over in auto. That decides which browser every chrome_* tool
+// drives, so it should not ship unverified.
+//
+// readPreferredConnector / writePreferredConnector are stubbed in the sandbox: the real ones write to
+// ~/.pi/agent/pi-chrome.json, and a test must never touch the user's actual preference file.
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import vm from "node:vm";
@@ -30,19 +34,31 @@ function loadBridgeClass() {
   );
   assert.notEqual(source, before, "the constructor shim did not apply — update it if the class changed");
 
-  const sandbox = { console, setTimeout, clearTimeout, Date, Math, JSON, Map, Promise, Error, DEFAULT_TIMEOUT_MS: 1000 };
+  const saved = { value: undefined, writes: [] };
+  const sandbox = {
+    console, setTimeout, clearTimeout, Date, Math, JSON, Map, Promise, Error, DEFAULT_TIMEOUT_MS: 1000,
+    readPreferredConnector: () => saved.value,
+    writePreferredConnector: (value) => { saved.writes.push(value); saved.value = value; },
+  };
   vm.runInNewContext(stripTypeScriptTypes(source) + "\n;globalThis.__Bridge = ChromeProfileBridge;", sandbox);
-  return sandbox.__Bridge;
+  return { Bridge: sandbox.__Bridge, saved };
 }
 
-const Bridge = loadBridgeClass();
+const { Bridge, saved } = loadBridgeClass();
 const EDGE = "edge:ab12cd34";
 const OTHER_EDGE = "edge:ff99ee88";
 const CHROME = "chrome:11223344";
 
-// Register a connector the way a real /next poll does: the same code path the handler uses.
-function withClients(specs) {
-  const bridge = new Bridge("127.0.0.1", 17318);
+// Construct a bridge the way a fresh Pi session does. `preference` is what is already on disk.
+function newBridge(preference) {
+  saved.value = preference;
+  saved.writes.length = 0;
+  return new Bridge("127.0.0.1", 17318);
+}
+
+// Register connectors the way a real /next poll does.
+function withClients(specs, preference) {
+  const bridge = newBridge(preference);
   for (const spec of specs) {
     const key = bridge.clientKeyOf(spec.browser, spec.profileId, spec.name);
     bridge.clients.set(key, {
@@ -57,7 +73,7 @@ function withClients(specs) {
 }
 
 test("clientKeyOf keys on browser+profile, not the client name", () => {
-  const bridge = new Bridge("127.0.0.1", 17318);
+  const bridge = newBridge();
   // The extension id is the same in every installed copy, so the name cannot distinguish them.
   assert.equal(bridge.clientKeyOf("edge", "ab12cd34", "Pi Chrome Connector same-id"), EDGE);
   assert.equal(
@@ -81,6 +97,7 @@ test("status lists live connectors with labels and the current selection", () =>
   assert.deepEqual(keys, [EDGE, CHROME]);
   assert.deepEqual(labels, ["Edge (profile ab12cd34)", "Chrome (profile 11223344)"]);
   assert.equal(status.selectedClient, null, "auto is reported as null, not a key");
+  assert.equal(status.selectedKey, null);
 });
 
 test("a stale connector is not live and is not offered", () => {
@@ -110,8 +127,7 @@ test("routing: one connector is unambiguous, several refuse to be guessed", () =
 });
 
 test("routing: an explicit selection wins, and a vanished selection fails loudly", () => {
-  const bridge = withClients([{ browser: "edge", profileId: "ab12cd34" }, { browser: "chrome", profileId: "11223344" }]);
-  bridge.selectedClient = CHROME;
+  const bridge = withClients([{ browser: "edge", profileId: "ab12cd34" }, { browser: "chrome", profileId: "11223344" }], CHROME);
   assert.equal(bridge.resolveTargetClient(), CHROME, "the selected connector is used even when several are live");
 
   // The chosen one goes away: report it rather than silently driving the other browser.
@@ -119,7 +135,7 @@ test("routing: an explicit selection wins, and a vanished selection fails loudly
   assert.throws(
     () => bridge.resolveTargetClient(),
     (error) => {
-      assert.match(error.message, /selected connector \(chrome:11223344\) is not connected/);
+      assert.match(error.message, /preferred connector \(chrome:11223344\) is not connected/);
       return true;
     },
   );
@@ -130,9 +146,11 @@ test("selectClient accepts auto, a key, and a unique browser name — and reject
 
   bridge.selectClient(EDGE);
   assert.equal(bridge.selectedClient, EDGE, "an exact key selects");
+  assert.equal(bridge.resolveTargetClient(), EDGE);
 
   bridge.selectClient("chrome");
-  assert.equal(bridge.selectedClient, CHROME, "a browser name selects when it is unambiguous");
+  assert.equal(bridge.selectedClient, "chrome", "a browser name is saved as the NAME, not the key");
+  assert.equal(bridge.resolveTargetClient(), CHROME, "...and still resolves to the right connector");
 
   bridge.selectClient("auto");
   assert.equal(bridge.selectedClient, undefined, "auto clears the selection");
@@ -148,11 +166,51 @@ test("selectClient accepts auto, a key, and a unique browser name — and reject
   assert.equal(twoEdges.selectedClient, OTHER_EDGE);
 });
 
+test("the choice is PERSISTED, so a new session inherits it instead of asking again", () => {
+  const first = withClients([{ browser: "edge", profileId: "ab12cd34" }]);
+  first.selectClient("edge");
+  assert.deepEqual([...saved.writes], ["edge"], "selecting writes the preference to disk");
+
+  // A brand-new session: new bridge, nothing told to it, preference read from disk.
+  const nextSession = withClients([{ browser: "edge", profileId: "ab12cd34" }], "edge");
+  assert.equal(nextSession.resolveTargetClient(), EDGE, "the new session already knows which connector to drive");
+
+  // ...and with a second connector also live, it still does not ask.
+  const withBoth = withClients([{ browser: "edge", profileId: "ab12cd34" }, { browser: "chrome", profileId: "11223344" }], "edge");
+  assert.equal(withBoth.resolveTargetClient(), EDGE, "the saved preference beats the refuse-to-guess rule");
+});
+
+test("a saved browser name survives the profile id changing", () => {
+  // The profile id lives in per-profile extension storage, so clearing it or reinstalling the
+  // connector changes it. A saved browser name must keep working anyway.
+  const bridge = withClients([{ browser: "edge", profileId: "brandnew1" }], "edge");
+  assert.equal(bridge.resolveTargetClient(), "edge:brandnew1", "browser name still matches the new profile");
+});
+
+test("a saved preference that is not connected refuses instead of driving another browser", () => {
+  const bridge = withClients([{ browser: "chrome", profileId: "11223344" }], "edge");
+  assert.throws(
+    () => bridge.resolveTargetClient(),
+    (error) => {
+      assert.match(error.message, /preferred connector \(edge\) is not connected/);
+      assert.match(error.message, /chrome:11223344/, "it reports what IS connected");
+      return true;
+    },
+    "preferring Edge must never silently fall through to Chrome",
+  );
+});
+
+test("selecting auto clears the saved preference too", () => {
+  const bridge = withClients([{ browser: "edge", profileId: "ab12cd34" }], "edge");
+  bridge.selectClient("auto");
+  assert.equal(saved.value, undefined, "auto is persisted as no preference");
+  assert.deepEqual([...saved.writes], [undefined]);
+});
+
 test("delivery: a command only reaches the connector it is addressed to", async () => {
   const bridge = withClients([{ browser: "edge", profileId: "ab12cd34" }, { browser: "chrome", profileId: "11223344" }]);
 
   // Both connectors are long-polling.
-  const delivered = [];
   let registerEdge;
   let registerChrome;
   const edgePoll = bridge.waitForCommand(5_000, (waiter) => { registerEdge = waiter; }, EDGE);
@@ -165,14 +223,11 @@ test("delivery: a command only reaches the connector it is addressed to", async 
   assert.equal(bridge.queue.length, 0, "a waiting connector takes it immediately");
   const chromeGot = await chromePoll;
   assert.equal(chromeGot.id, "c1", "Chrome received its own command");
-  assert.equal((await bridge.waitForCommand(1, undefined, CHROME)) === undefined || true, true);
 
   // Now the reverse: Edge is still waiting and must take only its own command.
   bridge.enqueue({ id: "e1", action: "tab.list", params: {}, targetClient: EDGE });
   const edgeGot = await edgePoll;
   assert.equal(edgeGot.id, "e1", "Edge received its own command, not Chrome's");
-  delivered.push(chromeGot.id, edgeGot.id);
-  assert.deepEqual(delivered, ["c1", "e1"]);
 });
 
 test("delivery: a command for a connector that is not polling waits in the queue for it", () => {

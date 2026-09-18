@@ -91,6 +91,14 @@ All notable user-facing changes to `pi-chrome`.
   driving the wrong browser. A selection that disappears is reported rather than silently falling
   through to another browser, and a command queued while nothing was connected is still taken by the
   first connector to arrive — the pre-routing behaviour.
+- **The choice is remembered, so a new session is never asked again.** The selection above lived in the
+  bridge's memory, which meant it was lost the moment a new Pi session started and took over the
+  bridge — that session would begin in `auto` and have to be told which browser to use all over again.
+  It is now persisted to `~/.pi/agent/pi-chrome.json` and read at bridge construction, so a fresh
+  session already knows. Choosing by browser name saves the **name**, not the connector key: the key
+  contains a profile id that lives in per-profile extension storage, so clearing it or reinstalling
+  the connector would otherwise break the saved preference. A saved preference that is not connected
+  **refuses** rather than quietly driving a different browser, and `/chrome connector auto` clears it.
 - **The connector identifies itself: browser and profile.** pi-chrome could not previously say which
   browser it was driving — the bridge saw only `Pi Chrome Connector <extension id>`, and the browser
   was not reported anywhere except buried in a `userAgent` string — so anything reading the tool
@@ -185,6 +193,12 @@ All notable user-facing changes to `pi-chrome`.
   uses TypeScript parameter properties, which Node's strip-only mode rejects, so the suite rewrites
   that single signature into plain assignments and asserts the shim applied. All ten cases fail
   against the pre-routing class, so none is vacuous.
+- `bridge-routing.test.mjs` also covers the saved preference: that selecting writes it to disk, that a
+  brand-new bridge (a new session) inherits it and does not ask again even with two connectors live,
+  that a saved browser name survives the profile id changing, that a saved preference which is not
+  connected refuses instead of driving another browser, and that `auto` clears it. The suite stubs
+  `readPreferredConnector`/`writePreferredConnector` in its sandbox — the real ones write to
+  `~/.pi/agent/pi-chrome.json`, and a test must never touch the user's actual preference file.
 - `background-policy.test.mjs` also gained two identity tests: the connector reports a browser
   family and a profile id that is stable within one profile but differs between two, and
   `chrome_launch` names the browser/profile it is connected to. `chrome-command.test.mjs` gained one
