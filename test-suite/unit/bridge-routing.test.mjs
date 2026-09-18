@@ -423,3 +423,21 @@ test("client mode against an OLDER owner: reported as connected, and the gap is 
   assert.match(text, /Connector connected: Pi Chrome Connector/);
   assert.match(text, /\/reload in that session/);
 });
+
+test("a preference set while NOTHING is connected waits for a connector instead of failing", () => {
+  // A browser restart or an MV3 service-worker suspension leaves zero connectors for a moment. With a
+  // preference set this used to throw immediately, while without one it waited — so the same brief
+  // absence was survivable or fatal depending on an unrelated setting. It must always wait.
+  const bridge = withClients([], "edge");
+  assert.equal(bridge.resolveTargetClient(), undefined, "unrouted, so the first arrival takes it");
+
+  // It must still refuse when a DIFFERENT browser is the only one there: that is the case the
+  // preference exists to protect, and it is not the same as "nothing connected yet".
+  bridge.clients.set("chrome:11223344", {
+    key: "chrome:11223344", browser: "chrome", profileId: "11223344", lastSeenAt: Date.now(),
+  });
+  assert.throws(() => bridge.resolveTargetClient(), /preferred connector \(edge\) is not connected/);
+
+  // And with no preference at all, zero connectors still waits too.
+  assert.equal(withClients([]).resolveTargetClient(), undefined);
+});

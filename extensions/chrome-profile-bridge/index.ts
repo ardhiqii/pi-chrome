@@ -494,6 +494,12 @@ class ChromeProfileBridge {
 	// arrives first — the pre-routing behaviour, and what one connector always gets.
 	private resolveTargetClient(): string | undefined {
 		const live = this.liveClients();
+		// Nothing has polled yet, so there is nothing to address: leave the command unrouted and the first
+		// connector to arrive takes it. This also covers a browser restart or an MV3 service-worker
+		// suspension, which leave zero connectors for a moment — failing here would turn a momentary
+		// absence into an error. It must not depend on whether a preference happens to be set: with one, a
+		// brief absence used to throw while without one it waited, which is a bug.
+		if (live.length === 0) return undefined;
 		if (this.selectedClient !== undefined) {
 			const match = this.resolvePreferred(live);
 			if (!match) {
@@ -505,7 +511,7 @@ class ChromeProfileBridge {
 			}
 			return match.key;
 		}
-		if (live.length <= 1) return live[0]?.key;
+		if (live.length === 1) return live[0].key;
 		throw new Error(
 			`${live.length} connectors are connected: ${this.describeClientList(live)}. ` +
 				`Refusing to guess which one to drive. Pick one with /chrome connector <key> (the choice is saved for ` +
