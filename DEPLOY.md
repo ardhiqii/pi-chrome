@@ -53,6 +53,9 @@ What you get, in plain terms:
   their own files older than 7 days once more than 20 are present, and always keep the newest 20.
   Hand-named files are never eligible. Pass an explicit `path:` for a screenshot the *user* should
   keep. `retentionDays: 0` disables pruning.
+- **Which connector is being driven** — `chrome_launch`, `/chrome doctor` and `tab.version` report the
+  browser family and profile id, so nothing has to assume Chrome. `/chrome connector [list|<key>|auto]`
+  chooses between installed connectors; `auto` refuses to guess when more than one is connected.
 
 Permissions, install path, authorization rules, and background mode are untouched.
 

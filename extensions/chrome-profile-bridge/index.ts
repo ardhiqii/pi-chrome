@@ -29,6 +29,18 @@ type BridgeCommand = {
 	id: string;
 	action: string;
 	params: Record<string, unknown>;
+	// Which connector this command is for, as `${browser}:${profileId}`. Resolved when the command is
+	// created, so a command is never handed to a different browser or profile than the caller meant.
+	// Undefined only when nothing is connected yet, in which case it waits for the first arrival.
+	targetClient?: string;
+};
+
+type BridgeClient = {
+	key: string;
+	browser?: string;
+	profileId?: string;
+	name?: string;
+	lastSeenAt: number;
 };
 
 type PendingCommand = {
@@ -302,7 +314,16 @@ class ChromeProfileBridge {
 	private server: Server | undefined;
 	private pending = new Map<string, PendingCommand>();
 	private queue: BridgeCommand[] = [];
-	private waiters: Array<(command: BridgeCommand | undefined) => void> = [];
+	// One waiter list PER CLIENT. A single shared list would hand a command to whichever connector
+	// happened to poll first, which becomes wrong the moment a second browser or a second profile is
+	// connected — the two would steal each other's commands at random.
+	private waiters = new Map<string, Array<(command: BridgeCommand | undefined) => void>>();
+	// Every connector seen, keyed by `${browser}:${profileId}`. Used to route commands and to tell the
+	// caller which browsers/profiles are actually available.
+	private clients = new Map<string, BridgeClient>();
+	// Explicit choice of connector. Undefined means "auto": the only connected one, or refuse if
+	// there is more than one rather than guessing.
+	private selectedClient: string | undefined;
 	private lastSeenAt: number | undefined;
 	private clientName: string | undefined;
 	private clientBrowser: string | undefined;
@@ -330,13 +351,74 @@ class ChromeProfileBridge {
 	// guessed — assuming Chrome from the tool names alone is exactly the mistake this prevents.
 	clientLabel(): string | undefined {
 		if (!this.clientBrowser && !this.clientProfileId) return undefined;
-		const browser = this.clientBrowser
-			? this.clientBrowser[0].toUpperCase() + this.clientBrowser.slice(1)
+		return this.describeClient({ browser: this.clientBrowser, profileId: this.clientProfileId });
+	}
+
+	private clientKeyOf(browser?: string, profileId?: string, name?: string): string {
+		// Prefer a browser/profile key over the client name: the extension id is identical in every
+		// installed copy, so it cannot tell two connectors apart, while profile storage can.
+		if (browser || profileId) return `${browser ?? "unknown"}:${profileId ?? "unknown"}`;
+		return name ?? "unknown";
+	}
+
+	private describeClient(client: { browser?: string; profileId?: string }): string {
+		const browser = client.browser
+			? client.browser[0].toUpperCase() + client.browser.slice(1)
 			: "Unknown browser";
-		return this.clientProfileId ? `${browser} (profile ${this.clientProfileId})` : browser;
+		return client.profileId ? `${browser} (profile ${client.profileId})` : browser;
+	}
+
+	// A connector counts as live if it polled within the last few minutes. Same window as the
+	// `connected` getter, so "there is a live connector" and "the bridge reports connected" agree.
+	private liveClients(): BridgeClient[] {
+		const cutoff = Date.now() - 5 * 60_000;
+		return [...this.clients.values()].filter((client) => client.lastSeenAt >= cutoff);
+	}
+
+	private describeClientList(clients: BridgeClient[]): string {
+		return clients.length
+			? clients.map((client) => `${client.key} (${this.describeClient(client)})`).join(", ")
+			: "none";
+	}
+
+	// Which connector should receive a command. An explicit selection wins. Otherwise a single live
+	// connector is unambiguous. With two or more, refuse instead of guessing: guessing means driving a
+	// different browser or profile than the caller intended, which is the failure this routing exists
+	// to prevent. `undefined` means nothing is connected yet, so the command waits for whoever
+	// arrives first — the pre-routing behaviour, and what one connector always gets.
+	private resolveTargetClient(): string | undefined {
+		const live = this.liveClients();
+		if (this.selectedClient !== undefined) {
+			const match = live.find((client) => client.key === this.selectedClient);
+			if (!match) {
+				throw new Error(
+					`The selected connector (${this.selectedClient}) is not connected. ` +
+						`Connected now: ${this.describeClientList(live)}. ` +
+						`Run /chrome connector auto to fall back to the only connected one.`,
+				);
+			}
+			return match.key;
+		}
+		if (live.length <= 1) return live[0]?.key;
+		throw new Error(
+			`${live.length} connectors are connected: ${this.describeClientList(live)}. ` +
+				`Refusing to guess which one to drive. Pick one with /chrome connector <key>, or /chrome connector auto.`,
+		);
+	}
+
+	private takeQueuedForClient(key: string): BridgeCommand | undefined {
+		// An unrouted command (queued while nothing was connected) has no target, so the first
+		// connector to poll may take it — that is the pre-routing "wait for the extension" behaviour,
+		// and without it such a command would sit in the queue until it timed out.
+		const index = this.queue.findIndex(
+			(command) => command.targetClient === key || command.targetClient === undefined,
+		);
+		if (index === -1) return undefined;
+		return this.queue.splice(index, 1)[0];
 	}
 
 	status(): Record<string, unknown> {
+		const live = this.liveClients();
 		return {
 			url: this.url,
 			mode: this.mode ?? "starting",
@@ -346,6 +428,14 @@ class ChromeProfileBridge {
 			clientBrowser: this.clientBrowser,
 			clientProfileId: this.clientProfileId,
 			clientLabel: this.clientLabel(),
+			clients: live.map((client) => ({
+				key: client.key,
+				browser: client.browser ?? null,
+				profileId: client.profileId ?? null,
+				label: this.describeClient(client),
+				lastSeenAt: client.lastSeenAt,
+			})),
+			selectedClient: this.selectedClient ?? null,
 			queuedCommands: this.queue.length,
 			pendingCommands: this.pending.size,
 		};
@@ -418,12 +508,31 @@ class ChromeProfileBridge {
 
 	private sendLocal(action: string, params: Record<string, unknown>, timeoutMs = DEFAULT_TIMEOUT_MS, signal?: AbortSignal): Promise<unknown> {
 		const id = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
-		const command = { id, action, params };
 		return new Promise((resolveCommand, rejectCommand) => {
 			if (signal?.aborted) {
 				rejectCommand(new Error("Chrome command aborted"));
 				return;
 			}
+			// A client-selection command acts on the bridge itself, not on any browser: it is never routed
+			// to a connector and never waits behind one.
+			if (action === "client.select") {
+				try {
+					this.selectClient(typeof params.key === "string" ? params.key : "");
+					resolveCommand(this.status());
+				} catch (error) {
+					rejectCommand(error as Error);
+				}
+				return;
+			}
+			let targetClient: string | undefined;
+			try {
+				targetClient = this.resolveTargetClient();
+			} catch (error) {
+				// Fail fast and loudly rather than driving whichever connector happens to poll next.
+				rejectCommand(error as Error);
+				return;
+			}
+			const command: BridgeCommand = { id, action, params, targetClient };
 			const cleanupAbort = () => {
 				if (signal) signal.removeEventListener("abort", onAbort);
 			};
@@ -450,6 +559,35 @@ class ChromeProfileBridge {
 			if (signal) signal.addEventListener("abort", onAbort, { once: true });
 			this.enqueue(command);
 		});
+	}
+
+	// `key` is a client key taken from status(), or "auto", or a browser name for convenience.
+	// Naming a browser is accepted only when exactly one connector of that browser is connected —
+	// otherwise the profile has to be named, because that is the thing that disambiguates it.
+	private selectClient(requested: string): void {
+		const wanted = requested.trim();
+		if (wanted === "" || wanted.toLowerCase() === "auto") {
+			this.selectedClient = undefined;
+			return;
+		}
+		const live = this.liveClients();
+		const exact = live.find((client) => client.key === wanted);
+		if (exact) {
+			this.selectedClient = exact.key;
+			return;
+		}
+		const byBrowser = live.filter((client) => (client.browser ?? "").toLowerCase() === wanted.toLowerCase());
+		if (byBrowser.length === 1) {
+			this.selectedClient = byBrowser[0].key;
+			return;
+		}
+		if (byBrowser.length > 1) {
+			throw new Error(
+				`${byBrowser.length} ${wanted.toLowerCase()} connectors are connected: ${this.describeClientList(byBrowser)}. ` +
+					`Pick the profile explicitly with /chrome connector <key>.`,
+			);
+		}
+		throw new Error(`No connected connector matches '${wanted}'. Connected: ${this.describeClientList(live)}.`);
 	}
 
 	// Classify why a local command timed out so the agent isn't left guessing. The three
@@ -526,9 +664,19 @@ class ChromeProfileBridge {
 	}
 
 	private enqueue(command: BridgeCommand): void {
-		const waiter = this.waiters.shift();
-		if (waiter) waiter(command);
-		else this.queue.push(command);
+		const key = command.targetClient;
+		if (key !== undefined) {
+			const list = this.waiters.get(key);
+			const waiter = list?.shift();
+			if (waiter) {
+				if (list && list.length === 0) this.waiters.delete(key);
+				waiter(command);
+				return;
+			}
+		}
+		// Either unrouted (nothing connected yet, so the first connector to arrive takes it), or this
+		// client is not polling at the moment and the command will be picked up by its next poll.
+		this.queue.push(command);
 	}
 
 	private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
@@ -577,17 +725,43 @@ class ChromeProfileBridge {
 			this.clientName = url.searchParams.get("name") ?? undefined;
 			this.clientBrowser = url.searchParams.get("browser") ?? undefined;
 			this.clientProfileId = url.searchParams.get("profile") ?? undefined;
+			const clientKey = this.clientKeyOf(this.clientBrowser, this.clientProfileId, this.clientName);
+			this.clients.set(clientKey, {
+				key: clientKey,
+				browser: this.clientBrowser,
+				profileId: this.clientProfileId,
+				name: this.clientName,
+				lastSeenAt: this.lastSeenAt,
+			});
+			// Forget connectors that stopped polling so the list never accumulates stale entries, and drop
+			// an explicit selection that is no longer present rather than failing every command against it.
+			const clientCutoff = this.lastSeenAt - 5 * 60_000;
+			for (const [key, client] of this.clients) {
+				if (client.lastSeenAt < clientCutoff) this.clients.delete(key);
+			}
+			if (this.selectedClient !== undefined && !this.clients.has(this.selectedClient)) {
+				this.selectedClient = undefined;
+			}
 			let aborted = false;
 			let activeWaiter: ((command: BridgeCommand | undefined) => void) | undefined;
+			const dropWaiter = (waiter: (command: BridgeCommand | undefined) => void) => {
+				const list = this.waiters.get(clientKey);
+				if (!list) return;
+				const index = list.indexOf(waiter);
+				if (index !== -1) list.splice(index, 1);
+				if (list.length === 0) this.waiters.delete(clientKey);
+			};
 			request.once("close", () => {
 				aborted = true;
-				if (activeWaiter) this.waiters = this.waiters.filter((entry) => entry !== activeWaiter);
+				if (activeWaiter) dropWaiter(activeWaiter);
 			});
-			let command = this.queue.shift();
+			// Only ever hand this connector a command addressed to it. Anything queued for a different
+			// browser or profile stays put for that connector's own next poll.
+			let command = this.takeQueuedForClient(clientKey);
 			if (!command) {
 				command = await this.waitForCommand(25_000, (waiter) => {
 					activeWaiter = waiter;
-				});
+				}, clientKey);
 			}
 			if (aborted) {
 				// Long-poll connection died before we could deliver. Requeue any command we pulled
@@ -638,18 +812,26 @@ class ChromeProfileBridge {
 	private waitForCommand(
 		timeoutMs: number,
 		registerWaiter?: (waiter: (command: BridgeCommand | undefined) => void) => void,
+		clientKey = "unknown",
 	): Promise<BridgeCommand | undefined> {
 		return new Promise((resolveWait) => {
 			let settled = false;
+			const list = this.waiters.get(clientKey) ?? [];
 			const waiter = (command: BridgeCommand | undefined) => {
 				if (settled) return;
 				settled = true;
 				clearTimeout(timer);
-				this.waiters = this.waiters.filter((entry) => entry !== waiter);
+				const current = this.waiters.get(clientKey);
+				if (current) {
+					const index = current.indexOf(waiter);
+					if (index !== -1) current.splice(index, 1);
+					if (current.length === 0) this.waiters.delete(clientKey);
+				}
 				resolveWait(command);
 			};
 			const timer = setTimeout(() => waiter(undefined), timeoutMs);
-			this.waiters.push(waiter);
+			list.push(waiter);
+			this.waiters.set(clientKey, list);
 			registerWaiter?.(waiter);
 		});
 	}
@@ -1221,6 +1403,38 @@ Usage rules:
 		}
 	};
 
+	// Choose which installed connector receives chrome_* commands. With one connector this is a no-op in
+	// practice; with several it is the difference between driving the browser you meant and driving
+	// whichever one happened to poll first.
+	const connectorHandler = async (ctx: ExtensionContext, args: string): Promise<void> => {
+		type ConnectorStatus = { clients?: Array<{ key: string; label: string }>; selectedClient?: string | null };
+		const describe = (status: ConnectorStatus): string => {
+			const clients = status.clients ?? [];
+			if (clients.length === 0) {
+				return "No connector is connected. Enable 'Pi Chrome Connector' in the browser profile you want to drive (/chrome onboard).";
+			}
+			return (
+				`Connectors connected (${clients.length}):\n` +
+				clients
+					.map((client) => `  ${client.key} — ${client.label}${client.key === status.selectedClient ? "   ← selected" : ""}`)
+					.join("\n") +
+				`\nSelection: ${status.selectedClient ?? "auto (the only connected connector; refuses to guess when several are connected)"}\n` +
+				`Use /chrome connector <key> to choose one.`
+			);
+		};
+		try {
+			if (!args.trim() || args.trim() === "list" || args.trim() === "status") {
+				ctx.ui.notify(describe(bridge.status() as ConnectorStatus), "info");
+				return;
+			}
+			// Round-trips through the bridge so the selection lives where routing happens, not per session.
+			ctx.ui.notify(describe((await bridge.send("client.select", { key: args.trim() }, 10_000)) as ConnectorStatus), "info");
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			ctx.ui.notify(`Connector selection failed: ${message}`, "warning");
+		}
+	};
+
 	const openCommandMenu = async (ctx: ExtensionContext): Promise<void> => {
 		while (true) {
 			ctx.ui.notify("Checking Chrome connection…", "info");
@@ -1229,6 +1443,7 @@ Usage rules:
 				"Lock Chrome control",
 				"Doctor / troubleshoot",
 				"Background / watch mode…",
+				"Choose connector…",
 				"Install / onboard extension",
 			]);
 			if (!choice) return;
@@ -1237,6 +1452,7 @@ Usage rules:
 				case "Lock Chrome control": return revokeHandler(ctx);
 				case "Doctor / troubleshoot": return doctorHandler(ctx);
 				case "Background / watch mode…": await openBackgroundMenu(ctx); continue;
+				case "Choose connector…": return connectorHandler(ctx, "");
 				case "Install / onboard extension": return onboardHandler(ctx);
 			}
 		}
@@ -1244,7 +1460,7 @@ Usage rules:
 
 	pi.registerCommand("chrome", {
 		description:
-			"All pi-chrome controls in one place.\n  /chrome authorize [15m|30m|<minutes>|indefinite] — allow this Pi session to use chrome_* tools.\n  /chrome revoke   — lock Chrome control.\n  /chrome doctor   — full health check plus authorization and background state.\n  /chrome onboard  — install the Chrome companion extension.\n  /chrome background [on|off|status|toggle] — enforce no explicit focus/tab activation, or allow foreground/watch mode.\nRun with no arguments for an interactive picker that shows current state.",
+			"All pi-chrome controls in one place.\n  /chrome authorize [15m|30m|<minutes>|indefinite] — allow this Pi session to use chrome_* tools.\n  /chrome revoke   — lock Chrome control.\n  /chrome doctor   — full health check plus authorization and background state.\n  /chrome onboard  — install the Chrome companion extension.\n  /chrome background [on|off|status|toggle] — enforce no explicit focus/tab activation, or allow foreground/watch mode.\n  /chrome connector [list|<key>|auto] — choose which installed connector (browser + profile) receives commands.\nRun with no arguments for an interactive picker that shows current state.",
 		getArgumentCompletions: (prefix) => {
 			const raw = prefix;
 			const trimmedRight = raw.replace(/\s+$/, "");
@@ -1301,6 +1517,8 @@ Usage rules:
 				case "onboard": return onboardHandler(ctx);
 				case "background":
 					return backgroundHandler(ctx, subArgs);
+				case "connector":
+					return connectorHandler(ctx, subArgs);
 				case "settings": {
 					// Legacy nested form: /chrome settings background ...
 					const [setting, ...settingArgs] = rest;
@@ -1309,7 +1527,7 @@ Usage rules:
 					return;
 				}
 				default:
-					ctx.ui.notify(`Unknown subcommand '${head}'. Run /chrome for current state and controls, or try: /chrome authorize | revoke | doctor | onboard | background.`, "warning");
+					ctx.ui.notify(`Unknown subcommand '${head}'. Run /chrome for current state and controls, or try: /chrome authorize | revoke | doctor | onboard | background | connector.`, "warning");
 			}
 		},
 	});

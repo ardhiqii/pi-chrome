@@ -79,6 +79,18 @@ All notable user-facing changes to `pi-chrome`.
   This fork instead uses one stable name for every Pi-created group, so all of Pi's tabs live
   together in a single group per window and are instantly recognisable as Pi's rather than the
   user's.
+- **Several connectors can be connected without stealing each other's commands.** The bridge had one
+  command queue and one waiter list, so if the connector were ever installed in a second browser or a
+  second profile, whichever copy happened to poll first would take the command — at random. That made
+  "support more than one browser" impossible to build on, and would have turned a second install into
+  a live bug rather than a new capability. The bridge now tracks every connector it has seen (keyed
+  by `browser:profileId`, falling back to the client name only for connectors too old to report one),
+  keeps a waiter list per connector, and addresses each command to the connector it is for.
+  `/chrome connector` lists what is connected and chooses between them; `auto` is the default, resolves
+  to the only connected connector, and **refuses to guess when several are connected** rather than
+  driving the wrong browser. A selection that disappears is reported rather than silently falling
+  through to another browser, and a command queued while nothing was connected is still taken by the
+  first connector to arrive — the pre-routing behaviour.
 - **The connector identifies itself: browser and profile.** pi-chrome could not previously say which
   browser it was driving — the bridge saw only `Pi Chrome Connector <extension id>`, and the browser
   was not reported anywhere except buried in a `userAgent` string — so anything reading the tool
@@ -163,6 +175,16 @@ All notable user-facing changes to `pi-chrome`.
   honoured). Six of the seven fail against the pre-retention `index.ts`. The seventh — explicit
   `path:` — passes against it too, because the old code already honoured explicit paths: it is a
   guard on that contract, not new behaviour, and is labelled as such rather than counted as proof.
+- `test-suite/unit/bridge-routing.test.mjs` is new, and is the first suite to test the **real**
+  `ChromeProfileBridge` rather than a stub. It covers how a command is addressed (one connector is
+  unambiguous; several refuse to be guessed; an explicit selection wins; a vanished selection fails
+  loudly), connector selection (`auto`, an exact key, a unique browser name, and rejection of an
+  ambiguous browser name), and delivery (a command only reaches the connector it is for, one queued
+  for a connector that is not polling waits for it, an unrouted command is taken by the first arrival,
+  and a timed-out long poll unregisters cleanly). It needed one loader shim: the class's constructor
+  uses TypeScript parameter properties, which Node's strip-only mode rejects, so the suite rewrites
+  that single signature into plain assignments and asserts the shim applied. All ten cases fail
+  against the pre-routing class, so none is vacuous.
 - `background-policy.test.mjs` also gained two identity tests: the connector reports a browser
   family and a profile id that is stable within one profile but differs between two, and
   `chrome_launch` names the browser/profile it is connected to. `chrome-command.test.mjs` gained one
