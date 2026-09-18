@@ -273,7 +273,17 @@ async function createIsolatedWindowTarget(sessionKey, { allowSharedTabFallback =
 async function createAutomationTarget(sessionKey, groupTitle) {
   const sessionScoped = !!groupTitle && cleanGroupTitle(groupTitle) !== cleanGroupTitle(PI_GROUP_NAME);
   const existingGroup = sessionScoped ? await findGroupRecordByTitle(groupTitle) : null;
-  if (existingGroup && typeof existingGroup.windowId === "number") {
+  // A group's window may only be inherited when PI created that window.
+  //
+  // This is what kept putting Pi's tabs in the user's browser: a stale group left behind in a window the
+  // user owns captured the new target, so a tab appeared among theirs. Pi's own windows are the only ones
+  // recorded with a numeric windowId in the target map, so anything else is someone else's window and must
+  // not be used unless the user pointed at it.
+  const ownsGroupWindow =
+    existingGroup !== null &&
+    typeof existingGroup.windowId === "number" &&
+    [...automationTargets.values()].some((entry) => entry.windowId === existingGroup.windowId);
+  if (ownsGroupWindow) {
     const tab = await chrome.tabs.create({ url: "about:blank", active: false, windowId: existingGroup.windowId });
     automationTargets.set(sessionKey, { windowId: undefined, tabId: typeof tab.id === "number" ? tab.id : undefined });
     await persistAutomationTargets();

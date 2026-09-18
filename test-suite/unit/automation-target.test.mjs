@@ -546,6 +546,35 @@ async function run() {
     ok(state.tabs.has(state.userArticle.id) && state.tabs.has(state.userGmail.id), "own-window-strict: user tabs untouched");
   }
 
+  // ===== a stale session group in the USER's window must not capture a new target. =====
+  // Shipped three times over before this was found. page.navigate adds a session group title, and
+  // createAutomationTarget inherited THAT GROUP'S WINDOW — from any window in the browser. A leftover
+  // group in a window the user owns therefore became the place Pi opened its tab, which is exactly the
+  // "you used my browser again" report. Only a window PI created may be inherited.
+  {
+    const state = makeChromeState();
+    const w = loadWorker(makeChrome(state, { withTabGroups: true }));
+    const gid = state.alloc.group();
+    const leftover = {
+      id: state.alloc.tab(), windowId: state.userWindowId,
+      url: "https://x.com/home", active: false, groupId: gid,
+    };
+    state.tabs.set(leftover.id, leftover);
+    state.groups.set(gid, {
+      id: gid, title: "Pi Session: something-old", color: "blue", collapsed: false, windowId: state.userWindowId,
+    });
+    const userTabsBefore = [...state.tabs.values()].filter((t) => t.windowId === state.userWindowId).length;
+
+    const nav = await w.dispatch("page.navigate", {
+      url: "https://pi.test/after-stale-group", waitUntilLoad: false,
+      sessionKey: SK, sessionGroupTitle: "Pi Session: something-old", joinSessionGroup: true,
+    });
+    const userTabsAfter = [...state.tabs.values()].filter((t) => t.windowId === state.userWindowId).length;
+    ok(nav.windowId !== state.userWindowId, "stale-group: the target was NOT created in the user's window");
+    ok(userTabsAfter === userTabsBefore, "stale-group: the user's window gained no tabs");
+    ok(state.tabs.get(nav.id).windowId === nav.windowId, "stale-group: the automation tab is what moved");
+  }
+
   console.log(`\n${passes} passed, ${failures} failed`);
   if (failures) process.exit(1);
 }
