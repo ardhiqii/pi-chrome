@@ -221,19 +221,11 @@ function isPiChromeOwnedTarget(tabId, sessionKey) {
   return false;
 }
 
-// Create a fresh automation target for `sessionKey`. If this session already has a tab group,
-// create the tab inside that group's window so one Pi session keeps one Chrome tab group (Chrome
-// groups cannot span windows). If no group exists yet, prefer an isolated window; fall back to a
-// tab. When the tab is created in a pre-existing group window, leave windowId unset so cleanup only
-// closes our tab, never that whole window.
-async function createAutomationTarget(sessionKey, groupTitle) {
-  const existingGroup = groupTitle ? await findGroupRecordByTitle(groupTitle) : null;
-  if (existingGroup && typeof existingGroup.windowId === "number") {
-    const tab = await chrome.tabs.create({ url: "about:blank", active: false, windowId: existingGroup.windowId });
-    automationTargets.set(sessionKey, { windowId: undefined, tabId: typeof tab.id === "number" ? tab.id : undefined });
-    await persistAutomationTargets();
-    return tab;
-  }
+// Create the automation target in a window of our OWN: a window we created, and therefore one cleanup may
+// close. An explicit "a window of Pi's own" must come here rather than reuse wherever an existing
+// "Pi Agent" group happens to live — otherwise a user who picks it after having picked one of their own
+// windows silently lands back in their window, with no way to get an isolated one again.
+async function createIsolatedWindowTarget(sessionKey) {
   if (chrome.windows && typeof chrome.windows.create === "function") {
     try {
       const win = await chrome.windows.create({ url: "about:blank", focused: false });
@@ -247,12 +239,28 @@ async function createAutomationTarget(sessionKey, groupTitle) {
       // Window creation can fail (policy, headless, etc.); fall back to a dedicated tab below.
     }
   }
-  // Tab fallback: the tab lives in a pre-existing (user/shared) window we did NOT create, so we
-  // must leave windowId unset — cleanup then closes only our tab, never the user's window.
+  // Tab fallback: the tab lives in a pre-existing (user/shared) window we did NOT create, so we must
+  // leave windowId unset — cleanup then closes only our tab, never the user's window.
   const tab = await chrome.tabs.create({ url: "about:blank", active: false });
   automationTargets.set(sessionKey, { windowId: undefined, tabId: typeof tab.id === "number" ? tab.id : undefined });
   await persistAutomationTargets();
   return tab;
+}
+
+// Create a fresh automation target for `sessionKey`. If this session already has a tab group,
+// create the tab inside that group's window so one Pi session keeps one Chrome tab group (Chrome
+// groups cannot span windows). If no group exists yet, prefer an isolated window; fall back to a
+// tab. When the tab is created in a pre-existing group window, leave windowId unset so cleanup only
+// closes our tab, never that whole window.
+async function createAutomationTarget(sessionKey, groupTitle) {
+  const existingGroup = groupTitle ? await findGroupRecordByTitle(groupTitle) : null;
+  if (existingGroup && typeof existingGroup.windowId === "number") {
+    const tab = await chrome.tabs.create({ url: "about:blank", active: false, windowId: existingGroup.windowId });
+    automationTargets.set(sessionKey, { windowId: undefined, tabId: typeof tab.id === "number" ? tab.id : undefined });
+    await persistAutomationTargets();
+    return tab;
+  }
+  return createIsolatedWindowTarget(sessionKey);
 }
 
 // Return the session's owned automation target if it still exists, else null. Robust to the user
@@ -1615,8 +1623,10 @@ async function dispatch(action, params) {
         }
       };
       if (wanted === null) {
-        // Back to a window of our own: exactly the path a fresh session takes.
-        const tab = await createAutomationTarget(sessionKey, groupTitle);
+        // A window of our own means a window WE created, not the one an existing "Pi Agent" group lives
+        // in — otherwise picking this after picking one of the user's windows would silently put Pi back
+        // in that window and leave no way to get an isolated one again.
+        const tab = await createIsolatedWindowTarget(sessionKey);
         await retireCurrent(tab.id);
         return { windowId: tab.windowId ?? null, tabId: tab.id ?? null, reused: false };
       }
