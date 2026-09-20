@@ -33,7 +33,7 @@ reinstalls it.** Deployment only overwrites the files listed below in that exist
 | --- | --- |
 | `browser-extension/service_worker.js` | Raw CDP passthrough (`cdp.call`), CDP target diagnostics (`cdp.targets`), best-effort focus emulation on attach, stalled long-poll recovery, unified `Pi Agent` tab group |
 | `index.ts` | Pi-side tools `chrome_cdp` and `chrome_cdp_targets`; screenshots default to the OS temp with capture-time retention |
-| `package.json`, `browser-extension/manifest.json` | The fork's version (`0.15.51.23`, tagged `0.15.51-plus.23`), so the build is distinguishable from stock |
+| `package.json`, `browser-extension/manifest.json` | The fork's version (`0.15.51.24`, tagged `0.15.51-plus.24`), so the build is distinguishable from stock |
 
 What you get, in plain terms:
 
@@ -85,7 +85,7 @@ install, so a syntax error can never be deployed.
 
 ### Safety guard: newer installs are refused
 
-This fork is **0.15.51.23**, tagged **0.15.51-plus.23**, based on upstream **0.15.51**. The 4th
+This fork is **0.15.51.24**, tagged **0.15.51-plus.24**, based on upstream **0.15.51**. The 4th
 integer keeps it newer than upstream 0.15.51 while still sorting below a future 0.15.52 — and it is
 what lets the browser, `tab.version` and `/chrome doctor` tell this build apart from a stock
 install.
@@ -100,14 +100,14 @@ permanently ahead of `manifest.json` would make the extension reload on every po
 
 `npm run version` (which runs `scripts/sync-manifest-version.mjs`) re-syncs them, and refuses any
 version Chrome would reject. Chrome only accepts 1–4 dot-separated integers in a manifest
-`version`, so a prerelease-style suffix such as `0.15.51-plus.23` cannot live there; the fork
+`version`, so a prerelease-style suffix such as `0.15.51-plus.24` cannot live there; the fork
 derives `version_name` from the same numeric version as `<major>.<minor>.<patch>-plus.<build>`
-(`0.15.51.23` → `0.15.51-plus.23`). Both fields are written together, so the display tag cannot
+(`0.15.51.24` → `0.15.51-plus.24`). Both fields are written together, so the display tag cannot
 lag the build.
 
 If an update has installed a different `pi-chrome` release, `deploy.sh` refuses to copy:
 overwriting would mix a newer release's files with this fork's. Two live `package.json` versions
-are accepted — this fork's `0.15.51.23`, and a clean upstream reinstall's `0.15.51`. The script also
+are accepted — this fork's `0.15.51.24`, and a clean upstream reinstall's `0.15.51`. The script also
 refuses when the live `service_worker.js` is neither a known-good 0.15.51 base, nor an
 already-deployed fork build, nor already identical to the source. Two 0.15.51 `service_worker.js`
 files are accepted as a known-good base: the pristine release file, and the file carrying the
@@ -153,8 +153,8 @@ If Pi reports that Chrome control is locked, run `/chrome authorize` once, then 
 - `chrome_cdp_targets` should return a list of CDP targets for the tab.
 - `chrome_cdp` with `method: "Runtime.evaluate"`, `params: { expression: "document.title" }`
   should return the tab title.
-- `chrome_tab` with `action: "version"` should report the fork's version (`0.15.51.23`, tagged
-  `0.15.51-plus.23`).
+- `chrome_tab` with `action: "version"` should report the fork's version (`0.15.51.24`, tagged
+  `0.15.51-plus.24`).
 
 ---
 

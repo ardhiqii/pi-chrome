@@ -12,7 +12,7 @@ and how to use it.
 
 Top-level documents:
 
-- [README.md](../README.md) — what pi-chrome is, the PLUS fork's additions, setup, commands, and safety.
+- [README.md](../README.md) — what pi-chrome is, what makes it different from a launched automation browser, the PLUS fork's additions, setup, commands, and safety.
 - [CHANGELOG.md](../CHANGELOG.md) — upstream's changelog, with the fork's additions at the top.
 - [DEPLOY.md](../DEPLOY.md) — how the PLUS fork is deployed onto a local pi-chrome install.
 - [CONTRIBUTING.md](../CONTRIBUTING.md) — non-negotiables, local dev, adding a tool, and filing a bug.

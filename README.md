@@ -30,8 +30,59 @@ Built for the [Pi coding agent](https://pi.dev).
 > The fork's `package.json` is marked `private`, which only prevents publishing it to the npm
 > registry; installing from git or a local path is unaffected.
 >
-> The fork sections immediately below describe what this fork adds; everything from the marker
-> further down to the footer is upstream's own README, unchanged.
+> The fork sections immediately below say what makes this one different and what it adds;
+> everything from the marker further down to the footer is upstream's own README, unchanged.
+
+## What makes it different
+
+pi-chrome is not a browser launcher. It is a connector that lets Pi drive **the Chromium window you
+already have open**, in the profile you are already signed into.
+
+| | A launched automation browser (Playwright, Puppeteer, Selenium) | **pi-chrome** |
+| --- | --- | --- |
+| Which browser | a fresh Chromium the library starts | **a Chromium browser already open on your desktop — Chrome, Edge, Brave, Vivaldi or Opera** |
+| Sign-in state | throwaway profile — log in again, pass MFA again, extensions absent | **your real profile: cookies, extensions, history, device trust** |
+| Reusing your profile | you must quit Chrome first; it will not share `user-data-dir` | **nothing to quit — the connector lives inside the running browser** |
+| Transport | the library's own driver | **`127.0.0.1:17318` only — no debug port, no remote service** |
+| Where it runs | a window you did not open | **the window you pick with `/chrome window`, and it does not steal focus** |
+| What it is | a driver | **a driver for your agent, plus a boundary around what it may touch** |
+
+The difference you actually feel is the login wall. An internal admin tool behind SSO, a dashboard
+behind Okta, a staging app you are signed into, a page that only renders in your own window — the
+other tools ask you to reproduce that state, and pi-chrome starts from it.
+
+**Honest limits.** Browser input goes through `chrome.debugger`, so Chrome shows its automation
+banner while input is attached; this is your real profile, not an invisible one. Incognito is
+invisible to pi-chrome unless you allow the connector there, and native OS dialogs, passkeys,
+CAPTCHA and cross-origin iframe DOM access stay outside the reliable surface — see [Limits](#limits)
+and the [FAQ](./docs/FAQ.md).
+
+**It is primitives, not an agent.** 23 `chrome_*` tools — snapshot with stable uids, find/inspect,
+navigate, click, type, fill, key, hover, drag, tap, scroll, upload, evaluate, screenshots, console
+and network capture, wait-for, tab and window control, and raw CDP passthrough for anything not
+covered. There is no LLM loop: Pi plans, pi-chrome executes, so it can sit under any agent framework
+without making you pay for an opinion you did not ask for. The [comparison page](./docs/COMPARISON.md)
+lays out the three layers of this market — drivers, agent frameworks, cloud browser providers — and
+where pi-chrome deliberately does not compete.
+
+### What this fork changes about that
+
+Upstream [`tianrendong/pi-chrome`](https://github.com/tianrendong/pi-chrome) is the base. This fork
+does not add a different product; it adds strictness, evidence and repair:
+
+- **A boundary that is enforced, not assumed.** Pi may only create, group, move or close tabs in the
+  window you picked with `/chrome window`. Acting on one of your tabs in another window is still
+  allowed — inspecting your own page is the point of the tool — but it is reported, not silently
+  grouped: `⚠ acted on a tab in window <w>, not Pi's window <picked>`.
+- **Results that carry evidence.** `chrome_type` reports `valueBefore`/`valueAfter` and `insertedAt`,
+  so a mid-string splice shows up instead of a silent success; snapshot-returning actions wait for an
+  in-flight navigation and say whether it settled.
+- **Repairs that cannot make things worse.** `/chrome groups repair` previews first, only ever
+  ungroups tabs in a stray group, never touches Pi's window, and never moves, closes or navigates a
+  tab.
+- **Every behaviour change ships a test that fails without it**, run in plain Node with no live
+  browser (`npm test`), plus a guard that refuses to load a build whose `index.ts` is not valid as a
+  Pi extension.
 
 ## What this fork adds
 
@@ -52,6 +103,9 @@ item's full detail, including its limits, is in [`CHANGELOG.md`](./CHANGELOG.md)
 | **Stalled long-poll recovery** | A half-open `/next` socket from a dead Pi process aborts on a deadline and retries by itself instead of parking the service worker. |
 | **Self-maintaining screenshots** | Captures default under the OS temp folder and prune their own files (older than 7 days once more than 20 exist; the newest 20 are always kept). Pass an explicit `path:` to keep a capture. |
 | **The connector is identified** | `chrome_launch` and `/chrome doctor` name the browser family and profile; `/chrome connector` (`list`, a key, or `auto`) chooses between installed connectors. |
+| **`/chrome revoke` deactivates every tool** | Revoking, or authorization expiring, removes every registered `chrome_*` tool from the session's active set; a unit test asserts set equality against every registration so a new tool cannot drift out of it. Calls were always authorization-checked — this fixes the listing, not a bypass. |
+| **Attach keeps focus-gated pages working** | Every fresh debugger attach asks the page to report itself focused (`Emulation.setFocusEmulationEnabled`), best-effort: it never fails or detaches the attach, and it is not a fix for hidden-tab rendering. |
+| **Edge and blank-tab faults fixed** | A fresh automation tab now runs page actions on Edge and on `about:blank`; a session that does not own the bridge names the real reason instead of "no connector"; a `/reload` can no longer silently load nothing. |
 
 ### Versioning
 

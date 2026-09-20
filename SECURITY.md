@@ -10,7 +10,7 @@ working exploit.
 ## Supported versions
 
 This is a single-maintainer personal fork. Only the tip of the default branch — currently the
-`0.15.51-plus.23` build — is supported. There are no backports and no npm release of the fork: the
+`0.15.51-plus.24` build — is supported. There are no backports and no npm release of the fork: the
 `pi-chrome` package on npm is upstream's, and this fork is deployed from a checkout (see
 [`DEPLOY.md`](./DEPLOY.md)). Security fixes land as ordinary commits on top of the current build.
 

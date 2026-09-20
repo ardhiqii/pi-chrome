@@ -5,7 +5,7 @@ All notable user-facing changes to `pi-chrome`.
 ## FORK ADDITIONS — pi-chrome PLUS (not an official upstream release)
 
 > **This section is not part of any official `pi-chrome` release.** It documents the changes this
-> fork (`0.15.51.23`, tagged `0.15.51-plus.23`, based on upstream `0.15.51`) carries on top of the
+> fork (`0.15.51.24`, tagged `0.15.51-plus.24`, based on upstream `0.15.51`) carries on top of the
 > released package. Upstream releases do not contain them, and nothing here is offered upstream or
 > as a pull request. `service_worker.js` here also carries a pre-existing fork fix (explicit page
 > target on attach) that predates this section.
@@ -23,7 +23,17 @@ All notable user-facing changes to `pi-chrome`.
   `npm publish` would otherwise fail with a confusing 403); installing from git or a local path is
   unaffected, and the README now says so, listing `pi install git:github.com/ardhiqii/pi-chrome`,
   a relative path, and an absolute path, plus the note that the `npm:pi-chrome` line in upstream's
-  README below installs upstream rather than this fork.
+  README below installs upstream rather than this fork. The README also gained a **What makes it
+  different** section ahead of the feature table — the attach-not-launch comparison against
+  Playwright/Puppeteer/Selenium, the honest limits (the `chrome.debugger` banner, incognito, native
+  dialogs/passkeys/CAPTCHA), the primitives-not-an-agent framing with the 23-tool surface, and what
+  this fork changes about it — and the feature table gained the three entries it was missing:
+  `/chrome revoke`'s now-complete deactivation set (with the note that calls were always
+  authorization-checked, so that was a listing bug and not a bypass), best-effort focus emulation on
+  attach (stated with what it does not do), and the Edge / `about:blank` / `/reload` fixes. The tag
+  had also been left behind at `0.15.51-plus.23` in this section's own header blockquote, in
+  `DEPLOY.md`, in `SECURITY.md`'s supported-versions line, in two `deploy.sh` comments, and in
+  `package-lock.json` (whose version disagreed with `package.json`); all now name `0.15.51-plus.24`.
 
 - **The fork is presented as "pi-chrome PLUS", and its version tag can no longer lag the build.**
   `package.json` / `manifest.json` move to `0.15.51.23`; the display tag in `version_name` is now

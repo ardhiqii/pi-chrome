@@ -39,7 +39,7 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 # copy drifts silently on the next version bump, and the guard then refuses a perfectly good deploy —
 # which is exactly what happened going from 0.15.51.1 to 0.15.51.2.
 BASE_VERSION="$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$SRC/package.json" | head -n 1)"
-# This build's display tag (`0.15.51-plus.23`), read from the manifest the sync script writes rather
+# This build's display tag (`0.15.51-plus.24`), read from the manifest the sync script writes rather
 # than re-derived here: one implementation of the scheme. Empty when a manifest predates version_name.
 BASE_VERSION_NAME="$(sed -n 's/.*"version_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$SRC/extensions/chrome-profile-bridge/browser-extension/manifest.json" | head -n 1)"
 BASE_VERSION_UPSTREAM="0.15.51"
@@ -82,7 +82,7 @@ sha256_of() {
   fi
 }
 
-# Print "0.15.51.23 (0.15.51-plus.23)" when the fork's display tag is known, otherwise just the
+# Print "0.15.51.24 (0.15.51-plus.24)" when the fork's display tag is known, otherwise just the
 # numeric version: an upstream install (or an older manifest) has no version_name, and inventing a
 # tag for it would misreport what is installed.
 version_with_tag() {
