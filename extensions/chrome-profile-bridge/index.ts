@@ -1769,10 +1769,24 @@ Usage rules:
 	});
 
 	// Shared handlers, dispatched by the unified /chrome command below.
+	//
+	// Display-only version tag: <major>.<minor>.<patch>-plus.<build>. manifest.version must stay
+	// integers-only — Chrome rejects letters, and the extension compares that number against this
+	// package's version to decide whether to reload itself — so the human-readable form is derived
+	// from it (same rule as scripts/sync-manifest-version.mjs for `version_name`). A 3-part upstream
+	// version is returned unchanged, so nothing is relabelled that this fork does not own.
+	const forkVersionLabel = (numeric?: string | null): string => {
+		const value = String(numeric ?? "").trim();
+		const parts = value.split(".");
+		return parts.length === 4 && parts.every((part) => /^\d+$/.test(part))
+			? `${parts[0]}.${parts[1]}.${parts[2]}-plus.${parts[3]}`
+			: value;
+	};
+	const PI_CHROME_VERSION_LABEL = forkVersionLabel(PI_CHROME_VERSION);
 	const doctorHandler = async (ctx: ExtensionContext) => {
 			ctx.ui.notify("Checking pi-chrome…", "info");
 			const lines: string[] = [
-				`pi-chrome v${PI_CHROME_VERSION}`,
+				`pi-chrome v${PI_CHROME_VERSION_LABEL}`,
 				`• Authorization: ${authSummary()}.`,
 				`• Background: ${backgroundEnabled ? "on (hard)" : "off (foreground/watch mode)"}.`,
 			];
@@ -1786,21 +1800,25 @@ Usage rules:
 				const version = (await bridge.send("tab.version", {}, 35_000)) as {
 					extensionId?: string;
 					extensionVersion?: string;
+					extensionVersionName?: string;
 					bridgeUrl?: string;
 				};
 				const latencyMs = Date.now() - started;
+				// The extension reports its display tag (version_name) where it has one; the numeric field
+				// is what the reload comparison must use, so only the LABELS are switched here.
+				const extensionLabel = version.extensionVersionName || forkVersionLabel(version.extensionVersion);
 				extensionAlive = true;
 				if (version.extensionVersion && version.extensionVersion !== PI_CHROME_VERSION) {
 					versionMismatch = true;
 					lines.push(
-						`✗ The Chrome companion extension is on an old version (${version.extensionVersion}); this pi-chrome is ${PI_CHROME_VERSION}.`,
+						`✗ The Chrome companion extension is on an old version (${extensionLabel}); this pi-chrome is ${PI_CHROME_VERSION_LABEL}.`,
 						`  Every Chrome action will run with the old code until you reload the extension.`,
 						`  Fix: open chrome://extensions and click the refresh icon on 'Pi Chrome Connector'.`,
 						`  (After this one-time fix, future updates reload automatically.)`,
 					);
 				} else {
 					const target = bridge.clientLabel();
-					lines.push(`✓ Connected${target ? ` to ${target}` : ""} (companion extension v${version.extensionVersion ?? "?"}, responded in ${latencyMs}ms).`);
+					lines.push(`✓ Connected${target ? ` to ${target}` : ""} (companion extension v${extensionLabel}, responded in ${latencyMs}ms).`);
 				}
 			} catch (error) {
 				const message = (error as Error).message;
@@ -1951,9 +1969,9 @@ Usage rules:
 	const statusSummary = async (): Promise<string> => {
 		const parts: string[] = [];
 		try {
-			const version = (await bridge.send("tab.version", {}, 5_000)) as { extensionVersion?: string };
+			const version = (await bridge.send("tab.version", {}, 5_000)) as { extensionVersion?: string; extensionVersionName?: string };
 			if (version.extensionVersion && version.extensionVersion !== PI_CHROME_VERSION) {
-				parts.push(`⚠ Chrome extension v${version.extensionVersion} (pi-chrome v${PI_CHROME_VERSION}, reload extension)`);
+				parts.push(`⚠ Chrome extension v${version.extensionVersionName || forkVersionLabel(version.extensionVersion)} (pi-chrome v${PI_CHROME_VERSION_LABEL}, reload extension)`);
 			} else {
 				parts.push(`✓ Chrome connected`);
 			}

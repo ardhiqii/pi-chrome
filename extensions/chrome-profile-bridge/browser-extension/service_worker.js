@@ -1132,6 +1132,9 @@ async function inputDebug(params) {
   const requested = params?.targetId ? await describeInputTarget(Number(params.targetId)) : await describeInputTarget(-1);
   return {
     extensionVersion: chrome.runtime.getManifest().version,
+    // version_name is the display-only fork tag; the numeric version above stays the
+    // reload/comparison field, so nothing may compare against this one.
+    extensionVersionName: chrome.runtime.getManifest().version_name || null,
     extensionId: chrome.runtime.id,
     ...requested,
     recentAttachEvents: attachDebugLog.slice(),
@@ -2391,6 +2394,7 @@ async function dispatchAction(action, params) {
       return {
         extensionId: chrome.runtime.id,
         extensionVersion: chrome.runtime.getManifest().version,
+        extensionVersionName: chrome.runtime.getManifest().version_name || null,
         bridgeUrl: BRIDGE_URL,
         userAgent: navigator.userAgent,
         browser: BROWSER_FAMILY,

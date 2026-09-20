@@ -11,6 +11,19 @@ All notable user-facing changes to `pi-chrome`.
 > target on attach) that predates this section.
 
 ### Fork additions on top of 0.15.51
+- **`0.15.51-plus.24`: the `-plus` tag is what you see everywhere, the repo can no longer be
+  published by accident, and the README says how to install this fork.** `manifest.version` has to
+  stay integers-only (Chrome rejects letters, and that number is what the extension compares to
+  decide whether to reload itself), so the label is derived from it: `/chrome doctor` and
+  `tab.version` now name both sides as `0.15.51-plus.24` — the previous report printed the bare
+  `0.15.51.24`, which made this fork look like an upstream build — and `tab.version` carries the
+  extension's own `version_name` so a mismatched build is named as it reported itself. A 3-part
+  upstream version is never relabelled. `package.json` is marked `"private": true`: it only blocks
+  publishing to the npm registry (the name `pi-chrome` belongs to upstream, so an accidental
+  `npm publish` would otherwise fail with a confusing 403); installing from git or a local path is
+  unaffected, and the README now says so, listing `pi install git:github.com/ardhiqii/pi-chrome`,
+  a relative path, and an absolute path, plus the note that the `npm:pi-chrome` line in upstream's
+  README below installs upstream rather than this fork.
 
 - **The fork is presented as "pi-chrome PLUS", and its version tag can no longer lag the build.**
   `package.json` / `manifest.json` move to `0.15.51.23`; the display tag in `version_name` is now

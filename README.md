@@ -12,11 +12,23 @@ Built for the [Pi coding agent](https://pi.dev).
 >
 > This repository is the **pi-chrome PLUS** fork of
 > [`tianrendong/pi-chrome`](https://github.com/tianrendong/pi-chrome). It is **not an official
-> release**, and is not affiliated with or endorsed by upstream. Its version (`0.15.51.23`, tagged
-> `0.15.51-plus.23`) sorts above upstream's `0.15.51` and below a future `0.15.52`.
+> release**, and is not affiliated with or endorsed by upstream. Its version (`0.15.51.24`, tagged
+> `0.15.51-plus.24`) sorts above upstream's `0.15.51` and below a future `0.15.52`.
 >
 > `CHANGELOG.md` lists exactly what this fork changes; `DEPLOY.md` explains how the fork is put
 > onto a local `pi-chrome` install.
+>
+> **Installing this fork** (it is not on npm, so `pi install npm:pi-chrome` — the line in upstream's
+> README further down — installs upstream's package, without these additions):
+>
+> ```
+> pi install git:github.com/ardhiqii/pi-chrome    # straight from this repository
+> pi install ./pi-chrome                          # from a local checkout's parent folder
+> pi install /absolute/path/to/pi-chrome          # from anywhere
+> ```
+>
+> The fork's `package.json` is marked `private`, which only prevents publishing it to the npm
+> registry; installing from git or a local path is unaffected.
 >
 > The fork sections immediately below describe what this fork adds; everything from the marker
 > further down to the footer is upstream's own README, unchanged.

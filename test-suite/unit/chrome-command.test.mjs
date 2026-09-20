@@ -8,6 +8,15 @@ import { test } from "node:test";
 const source = fs.readFileSync(new URL("../../extensions/chrome-profile-bridge/index.ts", import.meta.url), "utf8");
 const { version } = JSON.parse(fs.readFileSync(new URL("../../package.json", import.meta.url), "utf8"));
 const now = 1_000_000;
+// The display tag this fork shows everywhere: <x>.<y>.<z>-plus.<build>. manifest.version has to stay
+// integers-only (Chrome rejects letters), so the label is derived from the numeric version exactly
+// as scripts/sync-manifest-version.mjs derives version_name.
+const plusTag = (numeric) => {
+  const parts = String(numeric).split(".");
+  return parts.length === 4 && parts.every((part) => /^\d+$/.test(part))
+    ? `${parts[0]}.${parts[1]}.${parts[2]}-plus.${parts[3]}`
+    : String(numeric);
+};
 function section(start, end) {
   const from = source.indexOf(start);
   const to = source.indexOf(end, from);
@@ -27,7 +36,7 @@ const commandSource = stripTypeScriptTypes([
 
 function healthyResponse(action) {
   switch (action) {
-    case "tab.version": return { extensionVersion: version };
+    case "tab.version": return { extensionVersion: version, extensionVersionName: plusTag(version) };
     case "page.evaluate": return 2;
     case "page.probe": return { arithmetic: 2, location: "https://fixture.test/", webdriver: false };
     case "window.list": return { windows: [], workingWindowId: null, strayPiGroups: 0 };
@@ -185,7 +194,9 @@ test("Doctor includes locked, timed, indefinite, and expired authorization plus 
       await h.run("doctor");
       assert.equal(h.notices[0][0], "Checking pi-chrome…");
       const report = h.notices.at(-1)[0];
-      assert.ok(report.includes(`pi-chrome v${version}`));
+      assert.ok(report.includes(`pi-chrome v${plusTag(version)}`));
+      assert.doesNotMatch(report, new RegExp(`pi-chrome v${version.replace(/\./g, "\.")}(?![-\w])`),
+        "the bare 4-part machine version must not be the user-facing label");
       assert.ok(report.includes(`Authorization: ${expected}`));
       assert.ok(report.includes(`Background: ${background ? "on (hard)" : "off"}`));
       assert.match(report, /Connected/);
@@ -201,6 +212,34 @@ test("Doctor includes locked, timed, indefinite, and expired authorization plus 
       assert.equal(h.sandbox.backgroundEnabled, background);
     }
   }
+});
+
+test("Doctor shows the fork's plus tag, not the bare machine version", async () => {
+  // manifest.version must stay integers-only, so the extension reports its display tag separately
+  // (version_name). Doctor must label both sides with it: the numeric form is plumbing, and a report
+  // that showed only "0.15.51.24" made the build look like an upstream one.
+  const h = harness({ send: (action) => action === "tab.version"
+    ? { extensionVersion: version, extensionVersionName: plusTag(version) }
+    : healthyResponse(action) });
+  await h.run("doctor");
+  const report = h.notices.at(-1)[0];
+  assert.ok(report.includes(`pi-chrome v${plusTag(version)}`), "pi-chrome is labelled with its plus tag");
+  assert.ok(report.includes(`companion extension v${plusTag(version)}`), "the extension is labelled with the tag it reported");
+  // An extension that reports a tag of its own (an older or newer build) must be named as it reported,
+  // and a version without a tag (upstream install) must stay plain rather than gaining a fake -plus.
+  const stale = harness({ send: () => ({ extensionVersion: "0.0.0", extensionVersionName: "0.0.0-plus.7" }) });
+  await stale.run("doctor");
+  assert.match(stale.notices.at(-1)[0], /old version \(0\.0\.0-plus\.7\)/);
+  const upstream = harness({ send: () => ({ extensionVersion: version.slice(0, version.lastIndexOf(".")) }) });
+  await upstream.run("doctor");
+  const upstreamReport = upstream.notices.at(-1)[0];
+  const upstreamVersion = version.slice(0, version.lastIndexOf("."));
+  // A 3-part upstream extension differs from this build, so doctor reports it as outdated — named as it
+  // reported itself, with no invented -plus tag.
+  assert.ok(upstreamReport.includes(`old version (${upstreamVersion})`),
+    "an extension reporting a 3-part upstream version is named as reported, not with a fake -plus tag");
+  assert.ok(!upstreamReport.includes(`old version (${upstreamVersion}-plus`),
+    "only the extension's own label is checked here: the pi-chrome side legitimately shows its plus tag");
 });
 
 test("Doctor retains local state and repair hints when connection/version checks fail", async () => {
