@@ -76,6 +76,7 @@ sha256_of() {
 # (not copied) would keep reporting the newer version, the extension's own version-skew auto-reload
 # check could not see the mismatch, and the downgraded service_worker.js would silently win.
 src_sw="$SRC/extensions/chrome-profile-bridge/browser-extension/service_worker.js"
+src_index="$SRC/extensions/chrome-profile-bridge/index.ts"
 dest_sw="$DEST_ROOT/extensions/chrome-profile-bridge/browser-extension/service_worker.js"
 dest_version=""
 if [ -f "$DEST_ROOT/package.json" ]; then
@@ -144,6 +145,19 @@ if command -v node >/dev/null 2>&1; then
     echo "ERROR: service_worker.js failed 'node --check'; refusing to touch the live install." >&2
     exit 1
   fi
+  # index.ts is TypeScript, so it cannot be node --check'd directly. Pi loads it as an ES module, where a
+  # duplicate top-level declaration is FATAL and takes /chrome and every chrome_* tool with it (that shipped
+  # once: see test-suite/unit/extension-load.test.mjs). Strip the types and parse it the same way Pi's loader
+  # does, before anything reaches the live install.
+  check_dir="$(mktemp -d)"
+  if node scripts/check-extension-load.mjs "$src_index" "$check_dir/candidate.mjs"; then
+    :
+  else
+    echo "ERROR: index.ts failed the ES-module parse check; refusing to touch the live install." >&2
+    rm -rf "$check_dir"
+    exit 1
+  fi
+  rm -rf "$check_dir"
 else
   echo "note: node not found on PATH; skipping the syntax pre-check."
 fi

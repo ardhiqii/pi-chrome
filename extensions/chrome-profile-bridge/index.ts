@@ -119,18 +119,11 @@ function writePreferredConnector(value: string | undefined): boolean {
 // The browser window the user chose with /chrome window. Machine-wide like preferredConnector: a
 // new session with no assignment of its own inherits it, so the choice is made once. A number or
 // nothing; the extension is the side that resolves it against the windows that actually exist.
-function readPreferredWindow(): number | undefined {
-	const value = readPIChromeState().preferredWindow;
-	return typeof value === "number" && Number.isInteger(value) ? value : undefined;
-}
-
-// WHEN that window was chosen, and in WHICH connector. The extension keeps a per-session assignment too,
-// and it has to know which of the two is newer before it lets either one decide where Pi works: a record
-// the user never picked (created by the implicit resolver, or by an older build) must lose to the
-// machine-wide pick, while a session's own deliberate pick still wins. The connector matters because
-// window ids are per profile — the same number in another browser is a different window — so a pick made
-// in Edge must never move a tab in Chrome. Absent fields mean "an older build saved this": the extension
-// then treats records with no pick time of their own as stale, which is exactly what they are.
+//
+// WHEN it was chosen, and in WHICH connector, matter too (see readPreferredWindowPick): the extension has
+// to know which of two choices is newer, and window ids are per profile, so a pick made in Edge must never
+// move a tab in Chrome. Absent fields mean "an older build saved this" — the extension then treats records
+// with no pick time of their own as stale, which is exactly what they are.
 function readPreferredWindowPick(): { windowId: number; at?: number; key?: string } | undefined {
 	// One read of the state file per call: two independent reads can pair a window with the time of a
 	// DIFFERENT pick when another Pi process rewrites the file in between.
