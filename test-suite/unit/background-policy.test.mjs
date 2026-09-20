@@ -86,6 +86,9 @@ function piHarness({ session = "alpha", send, files, unlinkFails = false, client
     // tested, not stubbed; only the disk read itself is replaced.
     section("const preferredWindowParams =", '\n\tpi.on("session_start",'),
     section("const BACKGROUND_DESC:", "\n\tconst authorizeFor ="),
+    // The real outside-window warning helper: the page tools call it on every result, so an undefined
+    // helper would break the whole registration, and stubbing it would hide the wording.
+    section("function outsideWindowWarning(", "\nconst snapshotModeValues ="),
     registrations,
     "globalThis.send = authorizedBridgeSend; globalThis.background = backgroundHandler;",
   ].join("\n")), sandbox);

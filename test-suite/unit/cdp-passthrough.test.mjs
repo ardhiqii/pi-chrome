@@ -455,19 +455,42 @@ function inputReportingHarness() {
     BACKGROUND_PARAM_DESCRIPTION: "background policy",
     StringEnum: () => ({}),
     tabActionValues: [],
+    snapshotModeValues: [],
+    waitForValues: [],
+    workspaceCwd: () => "/",
+    resolve: (_base, p) => p,
     truncateText: (text) => text,
     safeJson: (value) => JSON.stringify(value, null, 2),
     formatChromeSnapshot: (snapshot) => JSON.stringify(snapshot),
     summarizeActionResult: () => undefined,
     sessionGroupTitle: (c) => c?.title ?? "Pi Agent",
+    // chrome_tab's groups/repair-groups branches address the worker's group actions with this session's
+    // key AND the machine-wide pick, exactly like the real /chrome handlers do.
+    windowParams: (c) => (c?.key ? { sessionKey: c.key } : {}),
+    preferredWindowParams: () => ({ preferredWindow: 11, preferredWindowAt: 1, preferredWindowKey: "edge:unittest" }),
     authorizedBridgeSend: async (action, params) => { sent.push({ action, params: clone(params) }); return respond(action, params); },
     pi: { registerTool: (tool) => registered.set(tool.name, tool) },
   };
   const source = [
     sourceSection("function formatIncludedSnapshotText(", "\n\nfunction formatChromeInspect("),
+    // The real outside-window warning helper: every page tool appends it, so a missing helper would fail
+    // registration-time code paths rather than showing the wording under test.
+    sourceSection("function outsideWindowWarning(", "\nconst snapshotModeValues ="),
+    // The real repair-report renderer: chrome_tab action=repair-groups prints it, and its wording is what
+    // tells the agent that only the grouping changes.
+    sourceSection("function describeGroupRepair(", "\ntype ClientSummary ="),
     registrationSource("chrome_type"),
     registrationSource("chrome_fill"),
     registrationSource("chrome_tab"),
+    registrationSource("chrome_snapshot"),
+    registrationSource("chrome_click"),
+    registrationSource("chrome_evaluate"),
+    registrationSource("chrome_hover"),
+    registrationSource("chrome_drag"),
+    registrationSource("chrome_tap"),
+    registrationSource("chrome_scroll"),
+    registrationSource("chrome_upload_file"),
+    registrationSource("chrome_wait_for"),
   ].join("\n");
   vm.runInNewContext(stripTypeScriptTypes(source), sandbox);
   return {
@@ -561,4 +584,104 @@ test("chrome_tab action=new reports loadStatus=timedOut plainly", async () => {
   h.respond(() => ({ tab: { id: 9, windowId: 1, title: "", url: "https://slow.test/" }, group: { title: "Pi Session: t" }, loadStatus: "timedOut" }));
   const out = await h.tool("chrome_tab", { action: "new" });
   assert.match(out.content[0].text, /created tab 9 in window 1 \(Pi Session: t\) — loadStatus=timedOut/);
+});
+
+// ===== chrome_tab groups / repair-groups: read-only inspection, dry run by default, and Pi's own groups
+// tagged with their window in the list output. =====
+function leakFixture() {
+  return {
+    groupId: 5,
+    windowId: 720723708,
+    title: "Pi Agent",
+    tabs: [{ tabId: 40, title: "Google", url: "https://google.com/search", provenance: "adopted-user", heldBySession: null }],
+  };
+}
+
+test("chrome_tab list tags Pi's own groups with their window, and leaves other groups alone", async () => {
+  const h = inputReportingHarness();
+  h.respond(() => [
+    { id: 4, title: "Pi page", url: "https://pi.test/", active: false, windowId: 11, group: { title: "Pi Agent", windowId: 11, piGroup: true } },
+    { id: 5, title: "User", url: "https://user.test/", active: true, windowId: 11, group: { title: "Work", windowId: 11, piGroup: false } },
+    { id: 6, title: "Loose", url: "https://loose.test/", active: false, windowId: 11, group: null },
+  ]);
+  const out = await h.tool("chrome_tab", { action: "list" });
+  const text = out.content[0].text;
+  assert.match(text, /\[Pi Agent @w11\] Pi page/, "a Pi group prints with its window so the same title in two windows is unambiguous");
+  assert.match(text, /\[Work\] User/, "a user's own group keeps the old plain label");
+  assert.match(text, /\tLoose\t/, "an ungrouped tab has no bracket at all");
+});
+
+test("chrome_tab groups is read-only; repair-groups previews unless apply=true", async () => {
+  const h = inputReportingHarness();
+  h.respond((action, params) =>
+    action === "groups.leaks"
+      ? { pickedWindowId: 11, strayPiGroups: [leakFixture()], pickedWindowGroups: [] }
+      : { dryRun: params.dryRun, pickedWindowId: 11, groups: [{ ...leakFixture(), tabs: [{ ...leakFixture().tabs[0], action: "ungroup" }], groupDisposedAfter: params.dryRun ? null : true }], ungroupedTabs: params.dryRun ? [] : [40], skippedTabs: [] });
+  const listed = await h.tool("chrome_tab", { action: "groups" });
+  assert.equal(h.sent[0].action, "groups.leaks");
+  assert.equal(h.sent[0].params.groupTitle, undefined, "group actions stay out of the forced-groupTitle branch");
+  assert.match(listed.content[0].text, /Pi works in window 11/);
+  assert.match(listed.content[0].text, /Stray Pi tab groups \(1\)/);
+  assert.match(listed.content[0].text, /window 720723708 — "Pi Agent"/);
+  assert.match(listed.content[0].text, /tab 40 — adopted-user/);
+
+  const preview = await h.tool("chrome_tab", { action: "repair-groups" });
+  assert.equal(h.sent[1].action, "groups.repair");
+  assert.equal(h.sent[1].params.dryRun, true, "repair-groups defaults to a dry run");
+  assert.match(preview.content[0].text, /Preview: 1 tab would be ungrouped/);
+
+  const applied = await h.tool("chrome_tab", { action: "repair-groups", apply: true });
+  assert.equal(h.sent[2].params.dryRun, false, "apply=true is the only way to change anything");
+  assert.match(applied.content[0].text, /Repaired 1 tab/);
+});
+
+test("chrome_tab's group actions carry the machine-wide pick like /chrome groups does", async () => {
+  const h = inputReportingHarness();
+  h.respond((action, params) =>
+    action === "groups.leaks"
+      ? { pickedWindowId: 11, strayPiGroups: [], pickedWindowGroups: [] }
+      : { dryRun: params.dryRun, pickedWindowId: 11, groups: [], ungroupedTabs: [], skippedTabs: [] });
+  await h.tool("chrome_tab", { action: "groups" });
+  await h.tool("chrome_tab", { action: "repair-groups" });
+  assert.equal(h.sent.length, 2);
+  for (const call of h.sent) {
+    assert.equal(call.params.preferredWindow, 11, `${call.action} carries preferredWindow`);
+    assert.equal(call.params.preferredWindowKey, "edge:unittest", `${call.action} carries the pick's profile key`);
+  }
+});
+
+// W5: the note wording is exercised through the real tool registrations, not a source-count assertion.
+// Every object-returning page tool whose text is wired must print it for a foreign resolution, and
+// chrome_evaluate must never print it from page data.
+test("outside-window reporting is wired into every object-returning page tool's text", async () => {
+  const h = inputReportingHarness();
+  const resolution = { outsideWorkspace: true, resolvedWindowId: 700, workspaceWindowId: 11 };
+  h.respond(() => resolution);
+  const cases = [
+    ["chrome_snapshot", {}],
+    ["chrome_click", { uid: "#go" }],
+    ["chrome_hover", { uid: "#go" }],
+    ["chrome_drag", { fromUid: "a", toUid: "b" }],
+    ["chrome_tap", { uid: "#go" }],
+    ["chrome_scroll", { deltaY: 100 }],
+    ["chrome_upload_file", { uid: "#file", paths: ["/tmp/a.png"] }],
+    ["chrome_wait_for", { kind: "selector", value: "#go" }],
+  ];
+  for (const [name, params] of cases) {
+    const out = await h.tool(name, params);
+    assert.match(
+      out.content[0].text,
+      /⚠ acted on a tab in window 700, not Pi's window 11 \(nothing was grouped, moved or closed\)/,
+      `${name} must carry the outside-window note`,
+    );
+  }
+});
+
+test("chrome_evaluate never reads its page value for the outside-window warning", async () => {
+  const h = inputReportingHarness();
+  const pageValue = { outsideWorkspace: true, resolvedWindowId: 700, workspaceWindowId: 11, a: 1 };
+  h.respond(() => pageValue);
+  const out = await h.tool("chrome_evaluate", { expression: "({a:1})" });
+  assert.doesNotMatch(out.content[0].text, /acted on a tab in window/, "a page object's own keys must not print a warning");
+  assert.deepEqual(clone(out.details.value), pageValue, "the page's value is preserved verbatim");
 });

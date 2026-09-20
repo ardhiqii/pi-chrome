@@ -111,6 +111,10 @@ let lastAbortWarnAt = 0;
 // using a different one. Group titles, urls and query order are hints; they never decide the
 // workspace.
 const automationTargets = new Map(); // sessionKey -> { tabId?: number, windowId?: number, piWindow?: boolean }
+// How the command's explicit selector resolved, when it named its own target instead of the session's
+// automation tab: { resolvedWindowId, workspaceWindowId, outsideWorkspace }. Reported additively on object
+// results (see dispatch) so the Pi side can say loudly when it acted outside Pi's window. Reset per command.
+let pendingResolution = null;
 // Window ids `chrome.windows.create` made for Pi in an earlier build, independent of any session
 // record. Kept so `window.list` still recognizes legacy Pi windows and the picker never offers one.
 // New builds never add to this set: there is no window-creation path left. Mirrored to
@@ -381,7 +385,10 @@ async function machineWindowPick(params) {
   }
   // A pick is USABLE for the command that carries it either way — that is the one-writer protocol, Pi
   // forwards the file's pick on every command — but only a pick carrying THIS profile's connector key may
-  // become the durable machine-wide pick. The measured hand-built POST /command carries no key: before
+  // become the durable machine-wide pick. A keyless pick is therefore trusted as far as the workspace
+  // boundary and no further: this is a mis-call guard, not authentication (see window.select's
+  // pickSource check), so a hand-built command can still declare a window; containment limits what that
+  // declaration can reach. The measured hand-built POST /command carries no key: before
   // this guard it overwrote the mirror and pinned every later pick-less command to a window the user did
   // not choose. A keyless pick must also not erase a previously keyed mirror, which would silently
   // disable the connector check the key exists for (a pick from another profile's file).
@@ -431,6 +438,39 @@ function supersededByMachinePick(record, pick) {
   return record.windowId !== pick.windowId;
 }
 
+// The one window this Pi session is allowed to work in, as far as this command can tell: the machine-wide
+// pick the command carries (or the remembered one), else the window the session's record names. It NEVER
+// falls back to the focused window and never creates one; null means "no window is known", which callers
+// treat as "refuse", never as "guess". Hydrates first, because a cold worker map would mistake a persisted
+// assignment for "no assignment" and then wrongly report a Pi group as stray.
+async function sessionWorkspaceWindow(sessionKey, params) {
+  await hydrateAutomationTargets();
+  const pick = await machineWindowPick(params);
+  const record = automationTargets.get(sessionKey);
+  const candidate = pick && typeof pick.windowId === "number"
+    ? pick.windowId
+    : record && typeof record.windowId === "number" ? record.windowId : null;
+  if (typeof candidate !== "number") return null;
+  // A pick or record whose window is GONE is not a workspace. window.list already nulls dead windows;
+  // without the same check here, `groups.leaks`/`groups.repair` would call the groups in a live window
+  // "stray" relative to a boundary that no longer exists. Null means "no window is known", which callers
+  // treat as refuse/ungroup-nothing, never as guess.
+  return (await pickWindowIsOpen(candidate)) ? candidate : null;
+}
+
+// True when ANY session recorded this tab as an ADOPTED user tab (created:false). Group membership is not
+// ownership evidence for such a tab: Pi put the user's own page into its "Pi Agent" group, so the group
+// proves only that Pi touched it, never that Pi may move or close it. The record is the missing half of the
+// evidence that used to make a live leak worse — a group Pi created around a user tab then read as "ours".
+async function isTabRecordedAdopted(tabId) {
+  if (!Number.isInteger(tabId)) return false;
+  await hydrateSessionTabs();
+  for (const tabs of sessionTabs.values()) {
+    if (tabs.get(tabId)?.created === false) return true;
+  }
+  return false;
+}
+
 // True when a tab recorded as a session's target is provably Pi's own, so closing it cannot lose user
 // work. Used as a guard: a corrupted or hand-edited record must not turn a pick into "delete that tab id".
 function isPiRemovableTarget(tab) {
@@ -450,12 +490,21 @@ function isPiRemovableTarget(tab) {
 // the picked window and the unprovable tab stays where the user can see and close it.
 async function isPiRelocatableTarget(tab) {
   if (!tab || typeof tab.id !== "number") return false;
+  // The adopted veto comes FIRST, before the absolute-looking evidence below: a tab any session recorded
+  // as adopted (created:false) is never Pi's to move or close, even when it is blank/marker-shaped or lives
+  // in a Pi window. An adopted about:blank tab used to pass the "blank evidence" test and then a stale
+  // record could relocate or close the user's own tab; the record under test cannot be its own proof.
+  if (await isTabRecordedAdopted(tab.id)) return false;
   if (String(tab.url || "") === BLANK_AUTOMATION_URL) return true;
   if (isPiMarkerTab(tab)) return true;
   if (typeof tab.windowId === "number" && isPiOwnedWindow(tab.windowId)) return true;
   if (typeof tab.groupId === "number" && tab.groupId >= 0) {
     const group = await groupRecord(tab.groupId).catch(() => null);
     const title = group && typeof group.title === "string" ? group.title.trim() : "";
+    // Group membership alone is NOT ownership: the live bug adopted the user's own Google tab into the
+    // "Pi Agent" group, and that group then made the tab look like Pi's own target. The adopted veto above
+    // already excluded created:false tabs from every branch, including this one; a Pi group on a tab with
+    // no adopted record is still evidence Pi grouped it.
     if (title && PI_GROUP_RE.test(title)) return true;
   }
   return false;
@@ -471,11 +520,11 @@ async function healMarkerTab(tab) {
 
 // A cross-window move takes a tab out of its group (Chrome groups cannot span windows). Regroup it in the
 // window it landed in, so Pi's tab stays visibly Pi's; cosmetic, so a failure is swallowed.
-async function regroupMovedTarget(tab) {
+async function regroupMovedTarget(tab, allowedWindowId) {
   try {
     const live = await chrome.tabs.get(tab.id).catch(() => null);
     if (!live || typeof live.groupId !== "number" || live.groupId >= 0) return;
-    await groupTab(live, PI_GROUP_NAME, DEFAULT_GROUP_COLOR);
+    await groupTab(live, PI_GROUP_NAME, DEFAULT_GROUP_COLOR, allowedWindowId);
   } catch {
     // Grouping is cosmetic; it must never fail the move.
   }
@@ -500,7 +549,8 @@ async function retargetSupersededRecord(sessionKey, record, pick) {
     const moved = await chrome.tabs.move(tab.id, { windowId: pick.windowId, index: -1 }).catch(() => null);
     if (moved && typeof moved.id === "number") {
       const healed = await healMarkerTab(moved);
-      await regroupMovedTarget(healed);
+      // The move put it in the picked window, so that is the only window it may be regrouped in.
+      await regroupMovedTarget(healed, pick.windowId);
       automationTargets.set(sessionKey, {
         windowId: pick.windowId,
         tabId: healed.id,
@@ -762,6 +812,10 @@ async function resolveOwnedAutomationTarget(sessionKey, pick) {
     // back in a window it was not told to use. Retire the tab and let the caller rebuild in the
     // recorded window.
     if (typeof t.windowId === "number" && existing.windowId !== t.windowId) {
+      // NOTE: unreachable in practice — retargetSupersededRecord re-points or retires a record for a live
+      // pick before this resolver runs, so when a pick exists its window already equals the record's and
+      // this branch's window comparison is false. Kept as a defensive fallback for an interrupted worker
+      // restart; it only re-points a record and never moves or closes a tab.
       // The tab sits in the window the machine-wide pick names: that is a move whose record write was
       // interrupted (worker restart mid-retarget), not a tab the user dragged away. Re-point instead of
       // destroying it — the tab holds the agent's page, and the pick is the reason it moved.
@@ -777,9 +831,18 @@ async function resolveOwnedAutomationTarget(sessionKey, pick) {
       }
       // A recorded target must still be in the window the record names. If the user dragged it
       // elsewhere, the record no longer describes where it lives, and driving it there would put Pi
-      // back in a window it was not told to use. Retire the tab and let the caller rebuild in the
-      // recorded window.
-      await chrome.tabs.remove(existing.id).catch(() => {});
+      // back in a window it was not told to use. The tab is only closed when it is PROVABLY Pi's
+      // (blank/marker/Pi window/own Pi group and not an adopted user tab); a record alone cannot make
+      // a pick close a tab the user owns. Otherwise the tab is left exactly where it is, the record
+      // drops the dead id, and the caller rebuilds in the recorded window.
+      if (await isPiRelocatableTarget(existing)) {
+        await chrome.tabs.remove(existing.id).catch(() => {});
+      } else {
+        console.warn(
+          `[pi-chrome] left tab ${existing.id} where it is: it is recorded in window ${t.windowId} but now sits in ` +
+            `window ${existing.windowId}, and its provenance is not provably Pi's. A fresh target will be built in window ${t.windowId}.`,
+        );
+      }
       automationTargets.set(sessionKey, { windowId: t.windowId, piWindow: t.piWindow, pickedAt: t.pickedAt });
       await persistAutomationTargets();
       return null;
@@ -801,9 +864,10 @@ async function resolveOwnedAutomationTarget(sessionKey, pick) {
 // driven or regrouped where it sits. `resolveOwnedAutomationTarget` enforces that on the implicit
 // path, but explicit targeting (targetId/urlIncludes/titleIncludes) bypasses the resolver by design;
 // this is the check that keeps those selectors from following a Pi tab the user dragged elsewhere.
-// The stale tab is retired (closed) and the recorded window kept, so the next untargeted action
-// rebuilds in the session's setting. Returns an error message, or null when the tab is not a moved
-// Pi-owned target.
+// A tab that is PROVABLY Pi's is retired (closed) and the recorded window kept, so the next untargeted
+// action rebuilds in the session's setting; a tab whose provenance is not provable (an adopted user tab
+// in a Pi group, say) is left where the user can see it and only the record's id is dropped. Returns an
+// error message, or null when the tab is not a moved Pi-owned target.
 async function movedAutomationTargetError(tab, sessionKey) {
   if (!tab || typeof tab.id !== "number" || typeof tab.windowId !== "number") return null;
   await hydrateAutomationTargets();
@@ -813,7 +877,20 @@ async function movedAutomationTargetError(tab, sessionKey) {
   if (ownerKey === null) return null;
   const record = automationTargets.get(ownerKey);
   if (!record || typeof record.windowId !== "number" || record.windowId === tab.windowId) return null;
-  await chrome.tabs.remove(tab.id).catch(() => {});
+  // The record names this tab, but a record is the claim under test, not proof. Only a tab that is
+  // PROVABLY Pi's own (blank/marker/Pi window/own Pi group and not an adopted user tab) may be closed;
+  // otherwise the tab is left exactly where it is and only the record's id is dropped, because a stale or
+  // hand-edited record must not make an explicit target close one of the user's own tabs — the exact
+  // shape of the live leak's adopted user tab.
+  const owned = await isPiRelocatableTarget(tab);
+  if (owned) {
+    await chrome.tabs.remove(tab.id).catch(() => {});
+  } else {
+    console.warn(
+      `[pi-chrome] left tab ${tab.id} where it is: it is recorded as ${ownerKey}'s target but sits in ` +
+        `window ${tab.windowId} while the record names window ${record.windowId}, and its provenance is not provably Pi's.`,
+    );
+  }
   // Keep the recorded window: it is the session's setting, so the next untargeted action rebuilds
   // there (or fails naming a gone user window) instead of drifting to another window. The pick time is
   // part of that setting: rewriting the record must not turn an explicit pick into "nobody picked this".
@@ -822,7 +899,9 @@ async function movedAutomationTargetError(tab, sessionKey) {
   return (
     `Pi's automation tab ${tab.id} was moved out of its own window (it is in window ${tab.windowId}, ` +
     `not window ${record.windowId}); pi-chrome does not drive or regroup a tab in a window it does not own. ` +
-    `The tab has been closed — retry without targetId to get a fresh automation target, or run /chrome window to choose a window on purpose.`
+    (owned
+      ? "The tab has been closed — retry without targetId to get a fresh automation target, or run /chrome window to choose a window on purpose."
+      : "The tab was left where it is — its provenance is not provably Pi's, so pi-chrome will not close it. Retry without targetId to get a fresh automation target, or run /chrome window to choose a window on purpose.")
   );
 }
 
@@ -2123,12 +2202,27 @@ async function findGroupByTitle(windowId, title) {
 
 // Add `tab` to a tab group, then set title/color. If the tab is ungrouped, reuse an
 // existing same-title group in its window when present, otherwise create a new group.
-async function groupTab(tab, title, color) {
+// `allowedWindowId` is the window this Pi session works in, and it is REQUIRED: see above.
+async function groupTab(tab, title, color, allowedWindowId) {
   if (!chrome.tabGroups) throw new Error("chrome.tabGroups API unavailable; reload the extension after granting the tabGroups permission");
   if (!tab || typeof tab.id !== "number") throw new Error("No tab to group");
+  // The window this Pi session works in is REQUIRED, and it is checked before any chrome call. Chrome moves
+  // a tab into the group's window when it joins a group, so grouping a tab that is not in Pi's window is
+  // literally putting Pi's group (and Pi's marker) into a window the user did not choose — the live bug.
+  if (typeof allowedWindowId !== "number") {
+    throw new Error(
+      "Refusing to group a tab without the window this Pi session works in. Run /chrome window to choose a window, then retry.",
+    );
+  }
   // A tab without a window cannot be scoped to a window, and guessing would be how a group in another
   // window captures it (Chrome moves the tab when it joins a foreign group).
   if (typeof tab.windowId !== "number") throw new Error("Cannot group a tab without a window id");
+  if (tab.windowId !== allowedWindowId) {
+    throw new Error(
+      `Refusing to put tab ${tab.id} into Pi's group: it is in window ${tab.windowId}, but this Pi session works in ` +
+        `window ${allowedWindowId}. Nothing was changed. Run /chrome window to change Pi's window, or target a tab in window ${allowedWindowId}.`,
+    );
+  }
   const groupTitle = cleanGroupTitle(title);
   let groupId = tab.groupId;
   if (typeof groupId !== "number" || groupId < 0) {
@@ -2140,6 +2234,113 @@ async function groupTab(tab, title, color) {
   await chrome.tabGroups.update(groupId, { title: groupTitle, color: cleanGroupColor(color), collapsed: false });
   const grouped = await chrome.tabs.get(tab.id);
   return { tab: await formatTab(grouped), group: await groupRecord(groupId) };
+}
+
+// Which live session record names `tabId` as its automation target, if any. Reporting only.
+function sessionHoldingTab(tabId) {
+  if (typeof tabId !== "number") return null;
+  for (const [key, record] of automationTargets) {
+    if (record.tabId === tabId) return key;
+  }
+  return null;
+}
+
+// True when any session recorded this tab as created by Pi (created:true).
+async function isTabRecordedCreated(tabId) {
+  if (!Number.isInteger(tabId)) return false;
+  await hydrateSessionTabs();
+  for (const tabs of sessionTabs.values()) {
+    if (tabs.get(tabId)?.created === true) return true;
+  }
+  return false;
+}
+
+// Classify one member of a Pi-titled group, so a repair can say exactly what it would touch. `pi-target`
+// first (blank/marker/Pi window) because that is absolute provenance; `pi-created`/`adopted-user` come from
+// the session-tab records; `held` is a live automation record naming the tab; everything else is `unknown`.
+async function classifyGroupMemberTab(tab) {
+  const heldBySession = sessionHoldingTab(tab?.id);
+  let provenance = "unknown";
+  if (tab && (String(tab.url || "") === BLANK_AUTOMATION_URL || isPiMarkerTab(tab) || (typeof tab.windowId === "number" && isPiOwnedWindow(tab.windowId)))) {
+    provenance = "pi-target";
+  } else if (await isTabRecordedCreated(tab?.id)) {
+    provenance = "pi-created";
+  } else if (await isTabRecordedAdopted(tab?.id)) {
+    provenance = "adopted-user";
+  } else if (heldBySession !== null) {
+    provenance = "held";
+  }
+  return { provenance, heldBySession };
+}
+
+// Read-only inventory of Pi-titled groups. A group is STRAY when it matches the Pi title and lives in a
+// window other than the one this Pi session works in; groups inside that window are reported separately so
+// nothing there is ever touched. With no chosen window (pickedWindowId null) every group is "in the picked
+// window" by definition: there is no boundary to call stray, and repair must never guess.
+async function findStrayPiGroups(pickedWindowId) {
+  const picked = typeof pickedWindowId === "number" ? pickedWindowId : null;
+  const result = { pickedWindowId: picked, stray: [], pickedWindowGroups: [] };
+  if (!chrome.tabGroups || typeof chrome.tabGroups.query !== "function") return result;
+  await Promise.all([hydrateSessionTabs(), hydrateAutomationTargets()]);
+  const groups = await chrome.tabGroups.query({}).catch(() => []);
+  const allTabs = await chrome.tabs.query({}).catch(() => []);
+  for (const group of groups || []) {
+    if (!group || !PI_GROUP_RE.test(String(group.title || ""))) continue;
+    const tabs = [];
+    for (const tab of (allTabs || []).filter((candidate) => candidate.groupId === group.id)) {
+      const { provenance, heldBySession } = await classifyGroupMemberTab(tab);
+      tabs.push({ tabId: tab.id, title: tab.title || "", url: tab.url || "", provenance, heldBySession });
+    }
+    const entry = { groupId: group.id, windowId: group.windowId, title: String(group.title || ""), tabs };
+    if (picked !== null && group.windowId !== picked) result.stray.push(entry);
+    else result.pickedWindowGroups.push(entry);
+  }
+  return result;
+}
+
+// Repair stray Pi groups: ungroup the members that are neither held by a live record nor absolute Pi
+// targets. DRY RUN by default (`params.dryRun !== false`). When it applies, the ONLY mutation is
+// chrome.tabs.ungroup(tabId) — never a tab removal, group update, move or windows.* call, and never
+// anything in the picked window (findStrayPiGroups excludes it). Pages and tabs are left in place; only the
+// stray grouping goes away. The group is re-read afterwards and `groupDisposedAfter` reports honestly
+// whether Chrome actually disposed it (no group-removal API exists, so an empty group is all we can ask for).
+async function repairStrayGroups(sessionKey, params) {
+  const dryRun = !params || params.dryRun !== false;
+  const pickedWindowId = await sessionWorkspaceWindow(sessionKey, params);
+  const inventory = await findStrayPiGroups(pickedWindowId);
+  const report = { dryRun, pickedWindowId: inventory.pickedWindowId, groups: [], ungroupedTabs: [], skippedTabs: [] };
+  for (const group of inventory.stray) {
+    const members = [];
+    const planned = [];
+    for (const tab of group.tabs) {
+      // A held tab is another live session's workspace and a pi-target is absolute Pi evidence: neither is
+      // ours to ungroup. Everything else (the adopted user tab this repair exists for included) is planned.
+      const skip = tab.heldBySession !== null || tab.provenance === "pi-target";
+      members.push({
+        tabId: tab.tabId,
+        title: tab.title,
+        url: tab.url,
+        provenance: tab.provenance,
+        action: skip ? "skip" : "ungroup",
+        heldBySession: tab.heldBySession,
+      });
+      if (skip) report.skippedTabs.push(tab.tabId);
+      else planned.push(tab.tabId);
+    }
+    let groupDisposedAfter = null;
+    if (!dryRun) {
+      for (const tabId of planned) {
+        // Count only an ungroup that actually happened: a tab closed between preview and apply must not
+        // be reported as "Repaired N tabs" while `groupDisposedAfter` says the group survived.
+        const ungrouped = await chrome.tabs.ungroup(tabId).then(() => true).catch(() => false);
+        if (ungrouped) report.ungroupedTabs.push(tabId);
+      }
+      const after = await chrome.tabGroups.get(group.groupId).catch(() => null);
+      groupDisposedAfter = after === null;
+    }
+    report.groups.push({ groupId: group.groupId, windowId: group.windowId, title: group.title, tabs: members, groupDisposedAfter });
+  }
+  return report;
 }
 
 // Apply one machine-wide pick to every session record it supersedes: each one's guest tab is moved into
@@ -2160,6 +2361,31 @@ async function sweepSupersededTargets(keepKey, wanted, at) {
 }
 
 async function dispatch(action, params) {
+  // Reset per command, so a resolution from an earlier command can never label this one's result.
+  pendingResolution = null;
+  const result = await dispatchAction(action, params);
+  return annotateResolution(action, result);
+}
+
+// An action that resolves a tab to drive may report where it landed. Only page./cdp. actions: for tab.*
+// management the caller already named the tab, and the wording below ("nothing was grouped, moved or
+// closed") would not hold for tab.close. Scalar results and arrays have nowhere to put the fields.
+//
+// page.evaluate is deliberately EXCLUDED: its result IS the page's own value, so spreading these fields
+// into it would corrupt page data — and a page object that happens to carry `outsideWorkspace` /
+// `resolvedWindowId` would then read as a real resolution report on the Pi side, printing a false
+// "acted outside Pi's window" line. Reporting for evaluate is a separate problem and must not be solved
+// by altering the value it returns.
+const RESOLUTION_REPORTED_ACTION_RE = /^(page\.|cdp\.)/;
+function annotateResolution(action, result) {
+  if (!pendingResolution) return result;
+  const name = String(action);
+  if (!RESOLUTION_REPORTED_ACTION_RE.test(name) || name === "page.evaluate") return result;
+  if (!result || typeof result !== "object" || Array.isArray(result)) return result;
+  return { ...result, ...pendingResolution };
+}
+
+async function dispatchAction(action, params) {
   switch (action) {
     case "tab.version":
       return {
@@ -2208,7 +2434,8 @@ async function dispatch(action, params) {
       await trackSessionTab(sessionKeyOf(params), tab.id, true);
       try {
         await bringToFront(tab, params);
-        const grouped = await groupTab(tab, groupTitle, params.groupColor);
+        // The tab was created in the target's window, and that is the only window it may join Pi's group in.
+        const grouped = await groupTab(tab, groupTitle, params.groupColor, targetTab.windowId);
         // chrome.tabs.create returns the t=0 Tab ({url:"", title:"", status:"loading"}); report the
         // settled tab instead so an immediate read does not look like "the URL never loaded".
         const load = await waitForCreatedTabLoad(tab.id, createParams.url, params.timeoutMs);
@@ -2236,7 +2463,10 @@ async function dispatch(action, params) {
     }
     case "tab.group": {
       const tab = await getTabByParams(params, { createOwnedTarget: false });
-      const grouped = await groupTab(tab, params.groupTitle || PI_GROUP_NAME, params.groupColor);
+      // Grouping is allowed only inside the window this Pi session works in. With no chosen window there is
+      // nothing to allow, and groupTab refuses with the /chrome window message rather than guessing.
+      const allowedWindowId = await sessionWorkspaceWindow(sessionKeyOf(params), params);
+      const grouped = await groupTab(tab, params.groupTitle || PI_GROUP_NAME, params.groupColor, allowedWindowId);
       if (!(tab.groupId >= 0)) await trackSessionTab(sessionKeyOf(params), tab.id, false, grouped.group?.id);
       return grouped;
     }
@@ -2417,6 +2647,26 @@ async function dispatch(action, params) {
       // window — and makes a bare Enter pick a window Pi was not working in.
       const liveWindowIds = new Set(windows.map((win) => win.id));
       const workingWindowId = typeof workingCandidate === "number" && liveWindowIds.has(workingCandidate) ? workingCandidate : null;
+      // Pi-titled groups that live outside the window this session works in — the visible footprint of the
+      // live leak. Reporting is additive so an older Pi side keeps working: it ignores both fields.
+      const piGroupEntries = (groups || []).filter((group) => group && PI_GROUP_RE.test(String(group.title || "")));
+      const strayPiGroups = typeof workingWindowId === "number"
+        ? piGroupEntries.filter((group) => group.windowId !== workingWindowId).length
+        : 0;
+      const groupsForWindow = (windowId) => piGroupEntries
+        .filter((group) => group.windowId === windowId)
+        .map((group) => {
+          const members = (Array.isArray(windows.find((win) => win.id === windowId)?.tabs) ? windows.find((win) => win.id === windowId).tabs : [])
+            .filter((tab) => tab.groupId === group.id);
+          return {
+            id: group.id,
+            title: String(group.title || ""),
+            piGroup: true,
+            tabCount: members.length,
+            leak: typeof workingWindowId === "number" && windowId !== workingWindowId,
+            heldBySession: members.map((tab) => sessionHoldingTab(tab.id)).find((key) => key !== null) ?? null,
+          };
+        });
       return {
         windows: windows.map((win) => {
           const tabs = Array.isArray(win.tabs) ? win.tabs : [];
@@ -2432,8 +2682,13 @@ async function dispatch(action, params) {
             // the per-session record: inherited targets and cleaned-up creating sessions must not
             // make a live Pi window look like one of the user's.
             ownedByPi: isPiOwnedWindow(win.id) || dedicatedWindowIds.has(win.id),
+            // Additive: the Pi-titled groups in this window, with the leak flag and the session that (if
+            // any) holds a member tab. Older Pi sides ignore it.
+            groups: groupsForWindow(win.id),
           };
         }),
+        // Additive: how many Pi-titled groups sit outside the window this session works in.
+        strayPiGroups,
         // Report the window the tab is really in, and only when it is a dedicated Pi window. A record
         // naming a Pi window the tab has left (or a tab that no longer exists) is reported as owning
         // no window: the picker then marks the window that actually holds the tab, and cleanup never
@@ -2480,9 +2735,10 @@ async function dispatch(action, params) {
       const retireCurrent = async (keepTabId) => {
         if (current && typeof current.tabId === "number" && current.tabId !== keepTabId) {
           // Only a tab we can prove is Pi's is closed; a corrupted record naming a user tab must not turn a
-          // new pick into "close that tab".
+          // new pick into "close that tab". The adopted veto inside isPiRelocatableTarget also keeps a
+          // created:false user tab (blank or not) alive here.
           const previous = await chrome.tabs.get(current.tabId).catch(() => null);
-          if (previous && isPiRemovableTarget(previous)) await chrome.tabs.remove(current.tabId).catch(() => {});
+          if (previous && (await isPiRelocatableTarget(previous))) await chrome.tabs.remove(current.tabId).catch(() => {});
         }
       };
       if (wanted === null) {
@@ -2533,8 +2789,10 @@ async function dispatch(action, params) {
       if (typeof current?.tabId === "number") {
         const existing = await chrome.tabs.get(current.tabId).catch(() => null);
         // Moving a tab is only safe for a tab we can prove is Pi's: a corrupted record naming one of the
-        // user's tabs must not relocate it to a window they did not put it in.
-        if (existing && typeof existing.id === "number" && isPiRemovableTarget(existing)) {
+        // user's tabs must not relocate it to a window they did not put it in. The adopted veto inside
+        // isPiRelocatableTarget keeps the user's own tab (created:false) exactly where they put it, even
+        // when it is blank or grouped.
+        if (existing && typeof existing.id === "number" && (await isPiRelocatableTarget(existing))) {
           const relocated = await chrome.tabs.move(existing.id, { windowId: wanted, index: -1 }).catch(() => null);
           if (relocated && typeof relocated.id === "number") {
             tab = await healMarkerTab(relocated);
@@ -2551,7 +2809,7 @@ async function dispatch(action, params) {
       // window, so cleanup closes the tab (and only the tab) in one of the user's windows.
       automationTargets.set(sessionKey, { windowId: wanted, tabId: tab.id, piWindow: isPiOwnedWindow(wanted), pickedAt });
       await persistAutomationTargets();
-      if (moved) await regroupMovedTarget(tab);
+      if (moved) await regroupMovedTarget(tab, wanted);
       else await retireCurrent(tab.id);
       // A pick is machine-wide intent, so it is applied to every OTHER record still sitting in a window
       // nobody picked for it — on this action, not on some later one. This is what makes the user's window
@@ -2563,9 +2821,22 @@ async function dispatch(action, params) {
       // another window), the record's windowId no longer matches where the tab lives, and the next
       // implicit action's resolveOwnedAutomationTarget retires and recreates it. Re-read the tab's
       // windowId after groupTab and update the record (or record after grouping).
-      await groupTab(tab, groupTitle, params.groupColor).catch(() => {});
+      // The pick is the only window Pi may group in now, and the tab was just created/moved into it.
+      await groupTab(tab, groupTitle, params.groupColor, wanted).catch(() => {});
       return { windowId: tab.windowId ?? null, tabId: tab.id ?? null, reused: false, moved, pickedAt, swept };
     }
+    case "groups.leaks": {
+      // Read-only: where the Pi groups are, and what each member tab is. Never mutates anything.
+      const pickedWindowId = await sessionWorkspaceWindow(sessionKeyOf(params), params);
+      const inventory = await findStrayPiGroups(pickedWindowId);
+      return {
+        pickedWindowId: inventory.pickedWindowId,
+        strayPiGroups: inventory.stray,
+        pickedWindowGroups: inventory.pickedWindowGroups,
+      };
+    }
+    case "groups.repair":
+      return repairStrayGroups(sessionKeyOf(params), params);
     case "automation.status": {
       // Report this session's owned automation target (ids only). Used for diagnostics/tests.
       await hydrateAutomationTargets();
@@ -2618,6 +2889,9 @@ async function formatTab(tab) {
 //     the user's active tab the way it used to, and never spawns a throwaway tab just to close it.
 async function getTabByParams(params, { createOwnedTarget = true } = {}) {
   const tabs = await chrome.tabs.query({});
+  // The window this session is allowed to work in, resolved once: the selector search prefers it, an
+  // explicit cross-window resolution reports it, and joinSessionGroup refuses to group outside it.
+  const workspaceWindowId = await sessionWorkspaceWindow(sessionKeyOf(params), params);
   let tab;
   if (params.targetId !== undefined) {
     const id = Number(params.targetId);
@@ -2685,7 +2959,13 @@ async function getTabByParams(params, { createOwnedTarget = true } = {}) {
         if (ownTab && matches(ownTab)) tab = ownTab;
       }
     }
-    if (!tab) tab = candidates.find((candidate) => matches(candidate) && !isPiChromeOwnedTarget(candidate.id));
+    if (!tab) {
+      const matched = candidates.filter((candidate) => matches(candidate) && !isPiChromeOwnedTarget(candidate.id));
+      // An explicit selector may match tabs in several windows. Prefer one in the window this Pi session
+      // works in, keeping the browser's own ordering inside that group: driving the user's copy in another
+      // window is exactly the live mis-target (urlIncludes matched the user's Google tab, not Pi's).
+      tab = (typeof workspaceWindowId === "number" ? matched.find((candidate) => candidate.windowId === workspaceWindowId) : undefined) ?? matched[0];
+    }
   } else {
     // No explicit target: use this session's dedicated automation target instead of hijacking the
     // user's active tab. This keeps human browsing and Pi automation separated — navigating here
@@ -2713,22 +2993,48 @@ async function getTabByParams(params, { createOwnedTarget = true } = {}) {
   if (url.startsWith("chrome://") || url.startsWith("chrome-extension://") || url.startsWith("devtools://")) {
     throw new Error(`Chrome blocks extension automation on protected URL: tab=${tab.id} url=${url}`);
   }
+  // Only an EXPLICIT selector can resolve outside the workspace (the implicit path builds its target
+  // there), and the caller deserves to know where it landed. Object results get these fields additively.
+  if ((params.targetId !== undefined || params.urlIncludes || params.titleIncludes) && typeof workspaceWindowId === "number" && typeof tab.windowId === "number") {
+    pendingResolution = {
+      resolvedWindowId: tab.windowId,
+      workspaceWindowId,
+      outsideWorkspace: tab.windowId !== workspaceWindowId,
+    };
+  }
   // Tabs Pi interacts with (page.* actions) join this session's group so the user can see exactly
   // which tabs Pi is driving. We only adopt *ungrouped* tabs — never hijack a tab the user (or
-  // another Pi session) already grouped, since groupTab would otherwise rename that group.
+  // another Pi session) already grouped, since groupTab would otherwise rename that group. And only
+  // INSIDE the window this session works in: a user tab elsewhere is driven, never grouped.
   if (params.joinSessionGroup && params.sessionGroupTitle) {
-    await joinSessionGroup(tab, params.sessionGroupTitle, sessionKeyOf(params));
+    await joinSessionGroup(tab, params.sessionGroupTitle, sessionKeyOf(params), workspaceWindowId);
   }
   return tab;
 }
 
-// Add an ungrouped tab to the session's tab group (reusing it by title, else creating it).
-// No-op when the tab is already grouped or tabGroups is unavailable.
-async function joinSessionGroup(tab, title, sessionKey) {
+// Add an ungrouped tab to the session's tab group (reusing it by title, else creating it), but ONLY when
+// the tab is in the window this Pi session works in. A caller may deliberately point a page action at one
+// of the user's tabs in another window — inspecting the user's own page is a feature, not a violation — so
+// a mismatch warns once (both ids) and skips grouping; it never throws and never blocks the action.
+const JOIN_GROUP_WARN_LIMIT = 50;
+const joinGroupWarned = new Set();
+async function joinSessionGroup(tab, title, sessionKey, allowedWindowId) {
   if (!chrome.tabGroups || typeof tab.id !== "number") return;
   if (typeof tab.groupId === "number" && tab.groupId >= 0) return;
+  if (typeof allowedWindowId !== "number" || allowedWindowId !== tab.windowId) {
+    const key = `${sessionKey}:${tab.id}:${typeof allowedWindowId === "number" ? allowedWindowId : "none"}:${typeof tab.windowId === "number" ? tab.windowId : "none"}`;
+    if (!joinGroupWarned.has(key) && joinGroupWarned.size < JOIN_GROUP_WARN_LIMIT) {
+      joinGroupWarned.add(key);
+      console.warn(
+        `[pi-chrome] not grouping tab ${tab.id}: it is in window ${tab.windowId}, but this Pi session works in ` +
+          `${typeof allowedWindowId === "number" ? `window ${allowedWindowId}` : "no chosen window"}. ` +
+          "The page action still ran; nothing was grouped, moved or closed.",
+      );
+    }
+    return;
+  }
   try {
-    const grouped = await groupTab(tab, title);
+    const grouped = await groupTab(tab, title, undefined, allowedWindowId);
     await trackSessionTab(sessionKey, tab.id, false, grouped.group?.id);
   } catch {
     // Grouping is best-effort; never block the actual page action on a grouping failure.

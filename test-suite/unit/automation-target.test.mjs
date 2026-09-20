@@ -23,6 +23,7 @@
 import vm from "node:vm";
 import fs from "node:fs";
 import path from "node:path";
+import { stripTypeScriptTypes } from "node:module";
 import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -130,8 +131,10 @@ function makeChromeState() {
   let nextGroupId = 1;
   const alloc = { tab: () => nextTabId++, window: () => nextWindowId++, group: () => nextGroupId++ };
   // Every way a window or an unanchored tab could appear, recorded so the "never creates a window,
-  // never uses the focused window" invariant can be asserted directly instead of inferred.
-  const events = { windowCreates: [], windowIdLessTabCreates: [], focuses: [], debuggerAttaches: [] };
+  // never uses the focused window" invariant can be asserted directly instead of inferred. The mutation
+  // logs (removes/moves/ungroups/group updates) are how a test proves repair touched NOTHING but
+  // chrome.tabs.ungroup, and that a supersede sweep did not move or close an adopted tab.
+  const events = { windowCreates: [], windowIdLessTabCreates: [], focuses: [], debuggerAttaches: [], tabRemoves: [], tabMoves: [], tabUngroups: [], groupCreates: [], groupUpdates: [] };
   // The page realm survives a service-worker restart (the tab keeps its globals), so it lives on
   // `state`, not on the chrome mock.
   const pageContexts = new Map(); // tabId -> { context, page }
@@ -303,6 +306,7 @@ function makeChrome(state, { withWindows = true, withStorage = true, withTabGrou
         return { ...t };
       },
       remove: async (id) => {
+        state.events.tabRemoves.push({ tabId: id });
         const tab = tabs.get(id);
         tabs.delete(id);
         // Chrome closes a window automatically when its final tab is removed.
@@ -314,6 +318,7 @@ function makeChrome(state, { withWindows = true, withStorage = true, withTabGrou
       // mover regroups the tab afterwards.
       move: async (ids, { windowId, index = -1 } = {}) => {
         const list = Array.isArray(ids) ? ids : [ids];
+        state.events.tabMoves.push({ ids: list.slice(), windowId });
         const moved = [];
         for (const id of list) {
           const tab = tabs.get(id);
@@ -331,6 +336,7 @@ function makeChrome(state, { withWindows = true, withStorage = true, withTabGrou
           gid = alloc.group();
           const firstTab = tabs.get(tabIds[0]);
           groups.set(gid, { id: gid, title: "", color: "grey", collapsed: false, windowId: firstTab ? firstTab.windowId : userWindowId });
+          state.events.groupCreates.push({ groupId: gid, tabIds: tabIds.slice() });
         }
         const group = groups.get(gid);
         for (const tid of tabIds) {
@@ -344,7 +350,21 @@ function makeChrome(state, { withWindows = true, withStorage = true, withTabGrou
         }
         return gid;
       },
-      ungroup: async (id) => { const ids = Array.isArray(id) ? id : [id]; for (const tid of ids) { const t = tabs.get(tid); if (t) t.groupId = -1; } },
+      // Real Chrome DISPOSES a tab group once its last member leaves it; modelling that is what makes
+      // groups.repair's `groupDisposedAfter` assertion honest instead of a hardcoded expectation.
+      ungroup: async (id) => {
+        const ids = Array.isArray(id) ? id : [id];
+        for (const tid of ids) {
+          // A tab that vanished between the preview and the apply is exactly what the repair's accounting
+          // must not call "repaired"; real Chrome rejects for the missing tab.
+          if (state.failUngroupFor && state.failUngroupFor.has(tid)) throw new Error(`No tab with id ${tid}`);
+          const t = tabs.get(tid);
+          if (t) { state.events.tabUngroups.push({ tabId: tid, groupId: t.groupId }); t.groupId = -1; }
+        }
+        for (const groupId of [...groups.keys()]) {
+          if (![...tabs.values()].some((t) => t.groupId === groupId)) groups.delete(groupId);
+        }
+      },
     },
     storage: withStorage ? {
       session: {
@@ -364,7 +384,7 @@ function makeChrome(state, { withWindows = true, withStorage = true, withTabGrou
     chrome.tabGroups = {
       query: async ({ windowId } = {}) => [...groups.values()].filter((g) => windowId === undefined || g.windowId === windowId).map((g) => ({ ...g })),
       get: async (id) => { const g = groups.get(id); if (!g) throw new Error(`No group ${id}`); return { ...g }; },
-      update: async (id, props = {}) => { const g = groups.get(id); if (!g) throw new Error(`No group ${id}`); Object.assign(g, props); return { ...g }; },
+      update: async (id, props = {}) => { const g = groups.get(id); if (!g) throw new Error(`No group ${id}`); state.events.groupUpdates.push({ groupId: id, props: { ...props } }); Object.assign(g, props); return { ...g }; },
     };
   }
 
@@ -397,10 +417,10 @@ function makeChrome(state, { withWindows = true, withStorage = true, withTabGrou
   return chrome;
 }
 
-function loadWorker(chrome) {
+function loadWorker(chrome, { warn } = {}) {
   const noop = () => {};
   const sandbox = {
-    console, JSON, Date, Math, Promise, Array, Object, String, Number, Boolean,
+    console: warn ? { ...console, warn } : console, JSON, Date, Math, Promise, Array, Object, String, Number, Boolean,
     Error, TypeError, Map, Set, BigInt, Symbol, structuredClone,
     setTimeout, clearTimeout, setInterval: () => 0, clearInterval: noop,
     fetch: async (url) => {
@@ -438,6 +458,39 @@ function navWith(w, url, sessionKey, preferredWindow, extra = {}) {
     joinSessionGroup: true,
     ...extra,
   });
+}
+
+// Two windows, one Pi workspace: the user's window (seeded by makeChromeState) plus a second user window
+// with a real user tab in it. The cross-window tests all need this exact shape, because "a user tab in a
+// window Pi does not work in" is the live leak's precondition.
+function twoWindowState() {
+  const state = makeChromeState();
+  const otherWindowId = state.alloc.window();
+  state.windows.set(otherWindowId, { id: otherWindowId });
+  const otherUserTab = { id: state.alloc.tab(), windowId: otherWindowId, url: "https://user.test/other-window", active: false, groupId: -1 };
+  state.tabs.set(otherUserTab.id, otherUserTab);
+  return { state, otherWindowId, otherUserTab };
+}
+
+// Give `tab` a Pi-titled group in its own window, the leftover shape a repair exists for. Written directly
+// rather than produced through grouping, because a build with the containment fix refuses to create it.
+function seedPiGroupIn(state, tab, title = "Pi Agent") {
+  const groupId = state.alloc.group();
+  state.groups.set(groupId, { id: groupId, title, color: "blue", collapsed: false, windowId: tab.windowId });
+  tab.groupId = groupId;
+  return groupId;
+}
+
+// Load the Pi-side outside-window warning straight from index.ts: it is pure, and the exact text is the
+// only thing telling the agent (and the user) that an action ran in a window Pi does not own.
+const indexSource = fs.readFileSync(path.resolve(__dirname, "../../extensions/chrome-profile-bridge/index.ts"), "utf8");
+function loadOutsideWindowWarning() {
+  const start = indexSource.indexOf("function outsideWindowWarning(");
+  const end = indexSource.indexOf("\n}\n", start);
+  if (start < 0 || end <= start) throw new Error("could not locate outsideWindowWarning in index.ts");
+  const sandbox = { console };
+  vm.runInNewContext(stripTypeScriptTypes(`${indexSource.slice(start, end + 3)}\n;globalThis.__w = outsideWindowWarning;`), sandbox);
+  return sandbox.__w;
 }
 
 function assertNoCreation(state, label) {
@@ -564,7 +617,10 @@ async function run() {
   // machine-wide pick; the pick still decides and the record only mirrors it. =====
   {
     const state = makeChromeState();
-    const w = loadWorker(makeChrome(state));
+    // Grouping is on because it is the realistic shape: Pi groups every target it creates, and a Pi group
+    // is the provenance the move guard requires. An ungrouped navigated tab is deliberately NOT moved or
+    // closed by a new pick (the record alone is not proof); the fresh target keeps the workspace usable.
+    const w = loadWorker(makeChrome(state, { withTabGroups: true }));
     const otherWindowId = state.alloc.window();
     state.windows.set(otherWindowId, { id: otherWindowId });
 
@@ -1530,7 +1586,10 @@ async function run() {
     const state = makeChromeState();
     const w = loadWorker(makeChrome(state, { withTabGroups: true }));
     await navWith(w, "https://pi.test/adopt", SK, state.userWindowId, { joinSessionGroup: true, sessionGroupTitle: "Pi Session: alpha" });
-    // Pi groups one of the USER's tabs too (an explicit target), which must be ungrouped only.
+    // Pi groups one of the USER's tabs too (an explicit target), which must be ungrouped only. This is the
+    // ALLOWED case: gmail is in the very window this session works in, so tab.group is entitled to group it.
+    // The forbidden variant — a user tab in another window — is refused by groupTab's allowedWindowId check
+    // ("cross-window group" below), and the old leak this test used to assert is now a refusal.
     const grouped = await w.dispatch("tab.group", { sessionKey: SK, targetId: String(state.userGmail.id), groupTitle: "Pi Session: alpha" });
     ok(grouped.group && state.userGmail.groupId >= 0, "resources: the explicitly grouped user tab joined Pi's group");
     const created = await w.dispatch("tab.new", { sessionKey: SK, groupTitle: "Pi Session: alpha" });
@@ -1571,6 +1630,377 @@ async function run() {
 
     assertNoCreation(state, "sweep");
     ok(state.windows.size === 2, "sweep: the only windows are the two that existed before");
+  }
+
+  // ===== CROSS-WINDOW GROUPING CONTAINMENT (B2). The live bug: Pi created a "Pi Agent" group in the USER's
+  // own Edge window (720723708) and adopted the user's Google tab (720723910) into it, because groupTab
+  // only scoped to `tab.windowId` and never compared it to the window the session picked. Every case below
+  // is a variant of "a tab that does not live in Pi's window must never be grouped". =====
+  {
+    const { state, otherWindowId, otherUserTab } = twoWindowState();
+    const w = loadWorker(makeChrome(state, { withTabGroups: true }));
+    const groupsBefore = state.groups.size;
+    await throwsWith(
+      () => w.dispatch("tab.group", { sessionKey: SK, targetId: String(otherUserTab.id), groupTitle: "Pi Agent", preferredWindow: state.userWindowId }),
+      /Refusing to put tab \d+ into Pi's group: it is in window \d+, but this Pi session works in window \d+/,
+      "cross-window group: tab.group on a user tab outside the picked window is refused",
+    );
+    ok(state.groups.size === groupsBefore, "cross-window group: no group was created");
+    ok(state.tabs.get(otherUserTab.id).groupId === -1, "cross-window group: the user tab was not grouped");
+    ok(state.tabs.get(otherUserTab.id).windowId === otherWindowId, "cross-window group: the user tab was not moved");
+    ok(state.events.tabMoves.length === 0 && state.events.tabRemoves.length === 0 && state.events.groupUpdates.length === 0,
+      "cross-window group: nothing was moved, closed or renamed");
+    ok(state.groups.size === groupsBefore, "cross-window group: nothing was created");
+  }
+
+  // ===== A page action MAY drive a user tab in another window (inspecting the user's own page is a core
+  // feature) — it just must never GROUP it there, or leave any Pi footprint. The warning is emitted once,
+  // not per action. =====
+  {
+    const { state, otherWindowId, otherUserTab } = twoWindowState();
+    const warnings = [];
+    const w = loadWorker(makeChrome(state, { withTabGroups: true }), { warn: (message) => warnings.push(String(message)) });
+    const groupsBefore = state.groups.size;
+    const params = {
+      targetId: String(otherUserTab.id),
+      waitUntilLoad: false,
+      sessionKey: SK,
+      preferredWindow: state.userWindowId,
+      sessionGroupTitle: "Pi Agent",
+      joinSessionGroup: true,
+    };
+    const result = await w.dispatch("page.navigate", { ...params, url: "https://user.test/other-window-2" });
+    ok(state.tabs.get(otherUserTab.id).url === "https://user.test/other-window-2", "cross-window page: the page action still completed");
+    ok(state.tabs.get(otherUserTab.id).groupId === -1 && state.groups.size === groupsBefore, "cross-window page: the user tab was not grouped and no group was created");
+    ok(state.tabs.get(otherUserTab.id).windowId === otherWindowId, "cross-window page: the tab stayed in its own window");
+    ok(result.resolvedWindowId === otherWindowId && result.workspaceWindowId === state.userWindowId && result.outsideWorkspace === true,
+      "cross-window page: the result reports exactly where it acted");
+    const warnCount = () => warnings.filter((message) => /not grouping tab/.test(message)).length;
+    ok(warnCount() === 1, "cross-window page: the skip is warned about exactly once");
+    ok(warnings.some((message) => message.includes(`tab ${otherUserTab.id}`) && message.includes(`window ${otherWindowId}`) && message.includes(`window ${state.userWindowId}`)),
+      "cross-window page: the warning names both window ids");
+    await w.dispatch("page.navigate", { ...params, url: "https://user.test/other-window-3" });
+    ok(warnCount() === 1, "cross-window page: a second action on the same tab does not warn again");
+  }
+
+  // ===== Don't-break: grouping INSIDE the picked window still works (tab.group and page.* joinSessionGroup). =====
+  {
+    const state = makeChromeState();
+    const w = loadWorker(makeChrome(state, { withTabGroups: true }));
+    const grouped = await w.dispatch("tab.group", { sessionKey: SK, targetId: String(state.userGmail.id), groupTitle: "Pi Agent", preferredWindow: state.userWindowId });
+    ok(grouped.group && state.userGmail.groupId >= 0, "in-window group: a user tab in Pi's window still joins the group");
+    ok(state.groups.get(state.userGmail.groupId).windowId === state.userWindowId, "in-window group: the group lives in Pi's window");
+    const nav = await navWith(w, "https://pi.test/in-window", "session:beta", state.userWindowId, { sessionGroupTitle: "Pi Agent" });
+    const navTab = state.tabs.get(nav.id);
+    ok(typeof navTab.groupId === "number" && navTab.groupId >= 0, "in-window group: a page target in Pi's window still joins the session group");
+    ok(state.groups.get(navTab.groupId).windowId === state.userWindowId, "in-window group: that group is in Pi's window too");
+    assertNoCreation(state, "in-window group");
+  }
+
+  // ===== B3: a tab a session recorded as ADOPTED (created:false) is never moved or closed, even when it
+  // sits in a Pi group. Group membership used to be ownership proof, which is what turned the live leak's
+  // adopted Google tab into a tab a later pick could relocate or close. =====
+  {
+    const { state, otherWindowId, otherUserTab } = twoWindowState();
+    const groupId = seedPiGroupIn(state, otherUserTab);
+    // The state the old build produced: the user's tab, adopted into a Pi group in another window, and
+    // named by this session's record. Written as storage because the containment fix refuses to create it.
+    state.storage.piChromeSessionTabs = { [SK]: [{ tabId: otherUserTab.id, created: false, groupId }] };
+    state.storage.piChromeAutomationTargets = { [SK]: { tabId: otherUserTab.id, windowId: otherWindowId, piWindow: false } };
+    const w = loadWorker(makeChrome(state, { withTabGroups: true }));
+    ok(await w.isPiRelocatableTarget(otherUserTab) === false, "adopted-group: a created:false tab in a Pi group is not relocatable");
+
+    const nav = await navWith(w, "https://pi.test/after-adopted", SK, state.userWindowId);
+    ok(state.tabs.has(otherUserTab.id) && state.tabs.get(otherUserTab.id).windowId === otherWindowId,
+      "adopted-group: the supersede sweep neither moved nor closed the adopted user tab");
+    ok(state.tabs.get(otherUserTab.id).groupId === groupId, "adopted-group: it was left exactly as the user can see it");
+    ok(state.events.tabMoves.length === 0 && state.events.tabRemoves.length === 0, "adopted-group: no move or close was even attempted");
+    ok(state.groups.has(groupId), "adopted-group: its group was not touched");
+    ok(nav.id !== otherUserTab.id && state.tabs.get(nav.id).windowId === state.userWindowId, "adopted-group: a fresh target was built in Pi's window");
+    const status = await w.dispatch("automation.status", { sessionKey: SK });
+    ok(status.windowId === state.userWindowId && status.tabId === nav.id, "adopted-group: the record was re-pointed at the fresh target");
+
+    // Don't-break: without the adopted record, a Pi-grouped navigated tab is still Pi evidence.
+    state.storage.piChromeSessionTabs = {};
+    const w2 = loadWorker(makeChrome(state, { withTabGroups: true }));
+    ok(await w2.isPiRelocatableTarget(otherUserTab) === true, "adopted-group: without the adopted record, a Pi-grouped tab is still Pi evidence");
+  }
+
+  // ===== A stale record naming a tab in a window nobody picked (here: the user dragged Pi's recorded tab
+  // away) is never acted on. The record alone cannot make Pi close a tab; the fresh target is built in the
+  // recorded window instead. =====
+  {
+    const { state, otherWindowId } = twoWindowState();
+    const dragged = { id: state.alloc.tab(), windowId: otherWindowId, url: "https://user.test/dragged", active: false, groupId: -1 };
+    state.tabs.set(dragged.id, dragged);
+    const groupId = seedPiGroupIn(state, dragged);
+    state.storage.piChromeSessionTabs = { [SK]: [{ tabId: dragged.id, created: false, groupId }] };
+    state.storage.piChromeAutomationTargets = { [SK]: { tabId: dragged.id, windowId: state.userWindowId, piWindow: false } };
+    const warnings = [];
+    const w = loadWorker(makeChrome(state, { withTabGroups: true }), { warn: (message) => warnings.push(String(message)) });
+
+    const nav = await navWith(w, "https://pi.test/after-stale", SK, state.userWindowId);
+    ok(state.tabs.has(dragged.id) && state.tabs.get(dragged.id).windowId === otherWindowId, "stale-record: the unprovable tab was left where it is");
+    ok(state.events.tabRemoves.length === 0 && state.events.tabMoves.length === 0, "stale-record: nothing was moved or closed");
+    ok(nav.id !== dragged.id && state.tabs.get(nav.id).windowId === state.userWindowId, "stale-record: a fresh target was used in the recorded window");
+    const status = await w.dispatch("automation.status", { sessionKey: SK });
+    ok(status.tabId === nav.id && status.windowId === state.userWindowId, "stale-record: the record now names the fresh target, not the stale id");
+    ok(warnings.some((message) => message.includes(`tab ${dragged.id}`)), "stale-record: the leave-alone decision is warned about");
+  }
+
+  // ===== groupTab's allowedWindowId is REQUIRED and checked before any chrome call. =====
+  {
+    const { state, otherWindowId, otherUserTab } = twoWindowState();
+    const w = loadWorker(makeChrome(state, { withTabGroups: true }));
+    const groupsBefore = state.groups.size;
+    await throwsWith(
+      () => w.groupTab(otherUserTab, "Pi Agent", "blue"),
+      /Refusing to group a tab without the window this Pi session works in/,
+      "groupTab: a missing allowedWindowId is refused",
+    );
+    await throwsWith(
+      () => w.groupTab(otherUserTab, "Pi Agent", "blue", state.userWindowId),
+      /Refusing to put tab \d+ into Pi's group: it is in window \d+, but this Pi session works in window \d+/,
+      "groupTab: a mismatched allowedWindowId is refused",
+    );
+    ok(state.groups.size === groupsBefore && state.tabs.get(otherUserTab.id).groupId === -1, "groupTab: nothing was created or grouped");
+    ok(state.events.groupUpdates.length === 0, "groupTab: no group was named or recolored");
+    ok(state.tabs.get(otherUserTab.id).windowId === otherWindowId, "groupTab: the user tab was not moved");
+  }
+
+  // ===== B5: leak detection + repair. The repair is a DRY RUN by default, and when applied its only
+  // mutation is chrome.tabs.ungroup — pages and tabs survive, no remove/update/move ever happens. =====
+  {
+    const { state, otherWindowId, otherUserTab } = twoWindowState();
+    const groupId = seedPiGroupIn(state, otherUserTab);
+    state.storage.piChromeSessionTabs = { [SK]: [{ tabId: otherUserTab.id, created: false, groupId }] };
+    const w = loadWorker(makeChrome(state, { withTabGroups: true }));
+
+    const dry = await w.dispatch("groups.repair", { sessionKey: SK, preferredWindow: state.userWindowId });
+    ok(dry.dryRun === true && dry.pickedWindowId === state.userWindowId, "repair dry-run: the report is a dry run in Pi's window");
+    ok(dry.groups.length === 1 && dry.groups[0].groupId === groupId && dry.groups[0].windowId === otherWindowId, "repair dry-run: the stray group is reported with its window");
+    const member = dry.groups[0].tabs.find((tab) => tab.tabId === otherUserTab.id);
+    ok(member && member.provenance === "adopted-user" && member.action === "ungroup", "repair dry-run: the adopted user tab is planned for ungrouping");
+    ok(dry.ungroupedTabs.length === 0 && state.events.tabUngroups.length === 0, "repair dry-run: nothing was ungrouped");
+    ok(state.tabs.get(otherUserTab.id).groupId === groupId && state.groups.has(groupId), "repair dry-run: the group and its member are untouched");
+
+    const applied = await w.dispatch("groups.repair", { sessionKey: SK, preferredWindow: state.userWindowId, dryRun: false });
+    ok(applied.ungroupedTabs.includes(otherUserTab.id), "repair: the user tab is ungrouped");
+    ok(state.tabs.has(otherUserTab.id) && state.tabs.get(otherUserTab.id).url === "https://user.test/other-window", "repair: the tab and its page survive");
+    ok(state.tabs.get(otherUserTab.id).groupId === -1, "repair: the tab is no longer grouped");
+    ok(!state.groups.has(groupId) && applied.groups[0].groupDisposedAfter === true, "repair: the empty group is disposed and the report says so");
+    ok(state.events.tabRemoves.length === 0, "repair: no tab was removed");
+    ok(state.events.groupUpdates.length === 0, "repair: no group was renamed or recolored");
+    ok(state.events.tabMoves.length === 0, "repair: no tab was moved");
+  }
+
+  // ===== A Pi group inside the picked window is never touched by a repair, applied or previewed. =====
+  {
+    const state = makeChromeState();
+    const w = loadWorker(makeChrome(state, { withTabGroups: true }));
+    const nav = await navWith(w, "https://pi.test/keep-group", SK, state.userWindowId, { sessionGroupTitle: "Pi Agent" });
+    const groupId = state.tabs.get(nav.id).groupId;
+    ok(groupId >= 0, "in-window repair: the target joined Pi's group in Pi's window");
+    const report = await w.dispatch("groups.repair", { sessionKey: SK, preferredWindow: state.userWindowId, dryRun: false });
+    ok(report.groups.length === 0 && report.ungroupedTabs.length === 0, "in-window repair: there is no stray group to repair");
+    ok(state.groups.has(groupId) && state.tabs.get(nav.id).groupId === groupId, "in-window repair: Pi's own group is untouched");
+    ok(state.events.tabUngroups.length === 0, "in-window repair: nothing was ungrouped");
+  }
+
+  // ===== A member held by another live record is skipped and named, so a repair can never rip a tab out of
+  // a running session's group. =====
+  {
+    const { state, otherWindowId, otherUserTab } = twoWindowState();
+    const groupId = seedPiGroupIn(state, otherUserTab);
+    state.storage.piChromeAutomationTargets = { "session:other": { tabId: otherUserTab.id, windowId: otherWindowId, piWindow: false } };
+    const w = loadWorker(makeChrome(state, { withTabGroups: true }));
+    const report = await w.dispatch("groups.repair", { sessionKey: SK, preferredWindow: state.userWindowId, dryRun: false });
+    const member = report.groups[0].tabs.find((tab) => tab.tabId === otherUserTab.id);
+    ok(member && member.action === "skip" && member.heldBySession === "session:other", "held: the member held by another live record is skipped and reported");
+    ok(report.skippedTabs.includes(otherUserTab.id) && report.ungroupedTabs.length === 0, "held: nothing was ungrouped");
+    ok(state.tabs.get(otherUserTab.id).groupId === groupId && state.groups.has(groupId), "held: the group and tab are untouched");
+  }
+
+  // ===== window.list reports the leak additively (older Pi sides keep working: they ignore the fields). =====
+  {
+    const { state, otherWindowId, otherUserTab } = twoWindowState();
+    const groupId = seedPiGroupIn(state, otherUserTab);
+    const w = loadWorker(makeChrome(state, { withTabGroups: true }));
+    await navWith(w, "https://pi.test/workspace", SK, state.userWindowId, { sessionGroupTitle: "Pi Agent" });
+    const report = await w.dispatch("window.list", { sessionKey: SK, preferredWindow: state.userWindowId });
+    ok(report.strayPiGroups === 1, "window.list: the stray Pi group is counted");
+    const otherWindow = report.windows.find((win) => win.windowId === otherWindowId);
+    const listed = otherWindow.groups.find((group) => group.id === groupId);
+    ok(listed && listed.piGroup === true && listed.leak === true && listed.tabCount === 1, "window.list: the per-window group says it leaks");
+    const ownGroup = report.windows.find((win) => win.windowId === state.userWindowId).groups.find((group) => group.piGroup);
+    ok(ownGroup && ownGroup.leak === false, "window.list: Pi's own window group is not a leak");
+  }
+
+  // ===== B4: an explicit selector matching several tabs prefers the window Pi works in and reports where it
+  // resolved. The live mis-target was `urlIncludes: "google.com/search"` choosing the user's tab in the
+  // user's window instead of the matching tab in Pi's. =====
+  {
+    const state = makeChromeState();
+    const otherWindowId = state.alloc.window();
+    state.windows.set(otherWindowId, { id: otherWindowId });
+    // The FOREIGN match is created FIRST, so a resolver that just takes the first match would choose the
+    // user's tab in the user's window — exactly the live shape. The preference is what makes Pi's window
+    // win despite tab order.
+    const userSearchOutside = { id: state.alloc.tab(), windowId: otherWindowId, url: "https://example.com/search", active: false, groupId: -1 };
+    const userSearchInWorkspace = { id: state.alloc.tab(), windowId: state.userWindowId, url: "https://example.com/search", active: false, groupId: -1 };
+    state.tabs.set(userSearchOutside.id, userSearchOutside);
+    state.tabs.set(userSearchInWorkspace.id, userSearchInWorkspace);
+    const w = loadWorker(makeChrome(state));
+    const result = await w.dispatch("page.navigate", {
+      urlIncludes: "example.com/search",
+      url: "https://pi.test/search-resolved",
+      waitUntilLoad: false,
+      sessionKey: SK,
+      preferredWindow: state.userWindowId,
+    });
+    ok(state.tabs.get(userSearchInWorkspace.id).url === "https://pi.test/search-resolved", "resolution: the matching tab in Pi's window won");
+    ok(state.tabs.get(userSearchOutside.id).url === "https://example.com/search", "resolution: the other window's match was left alone");
+    ok(result.id === userSearchInWorkspace.id && result.resolvedWindowId === state.userWindowId && result.workspaceWindowId === state.userWindowId && result.outsideWorkspace === false,
+      "resolution: the result carries resolvedWindowId for an explicit resolution");
+  }
+
+  // ===== B4 (Pi side): the warning the agent and the user see when a page action ran outside Pi's window.
+  // The exact ids are the live ones from the bug report. =====
+  {
+    const outsideWindowWarning = loadOutsideWindowWarning();
+    ok(
+      outsideWindowWarning({ resolvedWindowId: 720723708, workspaceWindowId: 1808155021, outsideWorkspace: true }) ===
+        "⚠ acted on a tab in window 720723708, not Pi's window 1808155021 (nothing was grouped, moved or closed)",
+      "pi-side warning: the live window ids produce the exact loud line",
+    );
+    ok(outsideWindowWarning({ resolvedWindowId: 11, workspaceWindowId: 11, outsideWorkspace: false }) === "",
+      "pi-side warning: an action inside Pi's window is not warned about");
+    ok(outsideWindowWarning(2) === "" && outsideWindowWarning(undefined) === "" && outsideWindowWarning({"outsideWorkspace": true}) === "",
+      "pi-side warning: scalars and field-less objects are ignored");
+    ok(outsideWindowWarning({ resolvedWindowId: 12, outsideWorkspace: true }).includes("not Pi's window the chosen window"),
+      "pi-side warning: a missing picked window still reads sensibly");
+    ok((indexSource.match(/withOutsideWindowNote\(/g) || []).length >= 8,
+      "pi-side warning: the helper is wired into the page tool texts, not merely defined");
+  }
+
+  // ===== REVIEW FIXES (release guard): the provenance guard must cover the explicit-selector and
+  // window.select paths too, page.evaluate's value is never annotated, a dead boundary is not a
+  // workspace, and a failed repair ungroup is not counted as repaired. =====
+
+  // S1: a pick/record whose window is GONE is not a workspace boundary. window.list already nulls dead
+  // windows, so groups.leaks must not call a live window's groups "stray" relative to a dead one.
+  {
+    const { state, otherUserTab } = twoWindowState();
+    const groupId = seedPiGroupIn(state, otherUserTab);
+    const deadWindowId = state.alloc.window(); // allocated but never added to state.windows
+    const w = loadWorker(makeChrome(state, { withTabGroups: true }));
+    const report = await w.dispatch("groups.leaks", { sessionKey: SK, preferredWindow: deadWindowId });
+    ok(report.pickedWindowId === null, "dead-boundary: a gone pick is not reported as the workspace");
+    ok(report.strayPiGroups.length === 0, "dead-boundary: no group is called stray relative to a dead window");
+    ok(report.pickedWindowGroups.some((group) => group.groupId === groupId), "dead-boundary: the group is listed as in-window and untouched");
+  }
+
+  // C1: an explicit selector whose stale record names the user's own adopted tab must refuse (the
+  // moved-out-of-window error) WITHOUT closing the tab. The explicit-selector path bypasses the implicit
+  // resolver, so this is the sibling the repair fix had to reach; a record alone is not proof.
+  {
+    for (const [label, url] of [["blank", "about:blank"], ["page", "https://user.test/adopted-explicit"]]) {
+      const { state, otherUserTab } = twoWindowState();
+      otherUserTab.url = url;
+      const groupId = seedPiGroupIn(state, otherUserTab);
+      state.storage.piChromeSessionTabs = { [SK]: [{ tabId: otherUserTab.id, created: false, groupId }] };
+      state.storage.piChromeAutomationTargets = { [SK]: { tabId: otherUserTab.id, windowId: state.userWindowId, piWindow: false } };
+      const w = loadWorker(makeChrome(state, { withTabGroups: true }));
+      await throwsWith(
+        () => w.dispatch("page.evaluate", { targetId: String(otherUserTab.id), expression: "1+1", sessionKey: SK }),
+        /moved out of its own window/,
+        `moved-explicit-adopted (${label}): the stale-record refusal still happens`,
+      );
+      ok(state.tabs.has(otherUserTab.id), `moved-explicit-adopted (${label}): the adopted user tab was NOT closed`);
+      ok(state.events.tabRemoves.length === 0, `moved-explicit-adopted (${label}): no removal was even attempted`);
+      const status = await w.dispatch("automation.status", { sessionKey: SK });
+      ok(status.tabId == null, `moved-explicit-adopted (${label}): the record dropped the stale id`);
+    }
+  }
+
+  // B3/C2: window.select must not relocate or close the user's adopted tab a (possibly stale) record
+  // names. The move branch AND the retire-previous branch both go through the adopted veto.
+  {
+    const { state, otherWindowId, otherUserTab } = twoWindowState();
+    otherUserTab.url = "about:blank"; // the shape that used to pass the "absolute evidence" test
+    const groupId = seedPiGroupIn(state, otherUserTab);
+    state.storage.piChromeSessionTabs = { [SK]: [{ tabId: otherUserTab.id, created: false, groupId }] };
+    state.storage.piChromeAutomationTargets = { [SK]: { tabId: otherUserTab.id, windowId: otherWindowId, piWindow: false } };
+    const w = loadWorker(makeChrome(state, { withTabGroups: true }));
+    const selected = await w.dispatch("window.select", { windowId: state.userWindowId, sessionKey: SK, pickSource: "user" });
+    ok(state.tabs.has(otherUserTab.id), "select-adopted: the adopted user tab was not closed");
+    ok(state.tabs.get(otherUserTab.id)?.windowId === otherWindowId, "select-adopted: it was not moved into the picked window");
+    ok(state.events.tabMoves.length === 0, "select-adopted: no move was even attempted");
+    ok(state.events.tabRemoves.length === 0, "select-adopted: no close was even attempted");
+    ok(selected.moved === false && selected.tabId !== otherUserTab.id, "select-adopted: a fresh target was created instead");
+    ok(state.tabs.get(selected.tabId).windowId === state.userWindowId, "select-adopted: the fresh target is in the picked window");
+    const status = await w.dispatch("automation.status", { sessionKey: SK });
+    ok(status.tabId === selected.tabId, "select-adopted: the record now names the fresh target");
+  }
+
+  // C2 (non-adopted): the guard does not lean on the adopted flag alone — a navigated, ungrouped tab the
+  // record names is not provably Pi's either, so a pick creates a fresh target instead of relocating it.
+  // The unprovable tab stays where the user can see it; that is the documented bounded cost of the guard.
+  {
+    const state = makeChromeState();
+    const w = loadWorker(makeChrome(state));
+    const otherWindowId = state.alloc.window();
+    state.windows.set(otherWindowId, { id: otherWindowId });
+    const selected = await w.dispatch("window.select", { windowId: state.userWindowId, sessionKey: SK, pickSource: "user" });
+    await w.dispatch("page.navigate", { targetId: String(selected.tabId), url: "https://pi.test/navigated-target", waitUntilLoad: false, sessionKey: SK });
+    const picked = await w.dispatch("window.select", { windowId: otherWindowId, sessionKey: SK, pickSource: "user" });
+    ok(state.tabs.has(selected.tabId) && state.tabs.get(selected.tabId).windowId === state.userWindowId,
+      "select-unprovable: an ungrouped navigated target is not moved by a new pick");
+    ok(state.tabs.get(selected.tabId).url === "https://pi.test/navigated-target",
+      "select-unprovable: the old tab keeps its page where the user can see it");
+    ok(picked.moved === false && picked.tabId !== selected.tabId && state.tabs.get(picked.tabId).windowId === otherWindowId,
+      "select-unprovable: the pick creates a fresh target in the picked window instead");
+    ok(state.events.tabMoves.length === 0 && state.events.tabRemoves.length === 0,
+      "select-unprovable: no move or close was even attempted");
+  }
+
+  // W1: annotateResolution must not touch page.evaluate's value. The page's own object is data: adding
+  // resolution fields corrupts it, and a page object that carries those field names used to be overwritten
+  // and then read as a real resolution report (a false outside-window warning on the Pi side).
+  {
+    const { state } = twoWindowState();
+    const w = loadWorker(makeChrome(state));
+    const inside = await w.dispatch("page.evaluate", {
+      targetId: String(state.userArticle.id),
+      expression: "({a:1})",
+      sessionKey: SK,
+      preferredWindow: state.userWindowId,
+    });
+    ok(inside.a === 1, "evaluate-value: the page object comes back intact");
+    ok(!Object.prototype.hasOwnProperty.call(inside, "workspaceWindowId") && !Object.prototype.hasOwnProperty.call(inside, "outsideWorkspace"),
+      "evaluate-value: no resolution fields are spread into the page's own object");
+    const forged = await w.dispatch("page.evaluate", {
+      targetId: String(state.userArticle.id),
+      expression: "({outsideWorkspace:true, resolvedWindowId:720723708, a:2})",
+      sessionKey: SK,
+      preferredWindow: state.userWindowId,
+    });
+    ok(forged.outsideWorkspace === true && forged.resolvedWindowId === 720723708 && forged.a === 2,
+      "evaluate-value: a page object carrying the field names is not overwritten by the worker");
+  }
+
+  // W3: a failed ungroup must not be counted as repaired. The report has an honest groupDisposedAfter;
+  // the count next to it must be honest too.
+  {
+    const { state, otherUserTab } = twoWindowState();
+    const groupId = seedPiGroupIn(state, otherUserTab);
+    state.storage.piChromeSessionTabs = { [SK]: [{ tabId: otherUserTab.id, created: false, groupId }] };
+    state.failUngroupFor = new Set([otherUserTab.id]);
+    const w = loadWorker(makeChrome(state, { withTabGroups: true }));
+    const report = await w.dispatch("groups.repair", { sessionKey: SK, preferredWindow: state.userWindowId, dryRun: false });
+    ok(report.ungroupedTabs.length === 0, "repair accounting: a failed ungroup is not reported as repaired");
+    ok(report.groups[0].groupDisposedAfter === false, "repair accounting: the group that still holds the tab is reported as surviving");
+    ok(state.tabs.get(otherUserTab.id).groupId === groupId && state.groups.has(groupId), "repair accounting: the tab and group are untouched by the failed ungroup");
   }
 
   console.log(`\n${passes} passed, ${failures} failed`);

@@ -12,6 +12,71 @@ All notable user-facing changes to `pi-chrome`.
 
 ### Fork additions on top of 0.15.51
 
+- **Pi can no longer create a "Pi Agent" group, or adopt a tab, in a window it was not told to use —
+  and the resolution that caused the live mis-target is fixed and reported.** Reproduced live in the
+  user's own Edge window: Pi created a "Pi Agent" tab group in window `720723708` and adopted the
+  user's Google tab `720723910` into it, while this Pi session's own workspace was window
+  `1808155021`; a `page.*` call carrying `urlIncludes: "google.com/search"` then resolved to that
+  user tab and typed into it. The cause was a group call scoped only to `tab.windowId` plus a
+  `groupTitle`/`joinSessionGroup` pair on every page action, so any target resolving to a user tab in
+  another window was grouped there. `groupTab` now takes a REQUIRED `allowedWindowId` and refuses,
+  before any `chrome.*` call, when it is missing (`Refusing to group a tab without the window this Pi
+  session works in. Run /chrome window …`) or when the tab is not in that window (`Refusing to put tab
+  <id> into Pi's group: it is in window <tab.windowId>, but this Pi session works in window
+  <allowedWindowId>. Nothing was changed. …`). Every call site passes it — `tab.new` uses the target
+  tab's window, `window.select`/`regroupMovedTarget` use the picked window, `tab.group` resolves the
+  session workspace and refuses when none is chosen — and `joinSessionGroup` (the `page.*` auto-group
+  path) **warns once with both window ids and skips grouping** instead of ever failing a page action.
+  Ownership gained the missing half: a tab any session recorded as ADOPTED (`created:false`) is never
+  "provably Pi's", checked before the blank/marker/Pi-window/own-group evidence, so a supersede sweep,
+  an explicit `targetId`, or a new window pick cannot move or close it however it is grouped. Every
+  move/close path (`retargetSupersededRecord`, `resolveOwnedAutomationTarget`,
+  `movedAutomationTargetError`, `window.select`) now acts only on a tab that is provably Pi's
+  (blank/marker/Pi window/own group); otherwise the tab is left exactly where the user can see it, the
+  record's dead id is dropped (with a warning when an explicit target was refused), and Pi rebuilds in
+  the recorded window. Resolution now PREFERS a tab in the session's workspace window when a selector
+  matches several (keeping the browser's ordering inside that group), and an explicit resolution reports
+  `resolvedWindowId` / `workspaceWindowId` /
+  `outsideWorkspace` additively on object results (arrays are untouched, and `page.evaluate` is
+  deliberately excluded so the page's own value is never altered). The Pi-side tool text prints
+  `⚠ acted on a tab in window <w>, not Pi's window <picked> (nothing was grouped, moved or closed)`
+  for the object-returning page tools — snapshot/find/inspect/navigate/click/type/fill/key/
+  screenshot/hover/drag/tap/scroll/upload/wait-for. Acting on one of the user's tabs in another window
+  is deliberately still ALLOWED — inspecting the user's own page is a core feature — and it is reported
+  loudly by those tools. Two deliberate exceptions stay silent: `chrome_evaluate` (its value is the
+  page's own data and is never annotated, so an outside-window evaluate is not warned about), and the
+  console/network tools (the two list tools return arrays and `chrome_get_network_request` prints raw
+  JSON, so none of them appends the warning line yet) plus the `chrome_cdp`/`chrome_cdp_targets`
+  passthrough. The Pi-footprint mutations (group, create, move, close) are the ones that are refused.
+- **Leak detection and a safe repair: `/chrome groups` / `/chrome groups repair`, `chrome_tab
+  action=groups|repair-groups`, `window.list.strayPiGroups`.** `findStrayPiGroups(pickedWindowId)`
+  reads every Pi-titled group via `chrome.tabGroups.query({})`, reports the groups inside Pi's window
+  separately, and classifies each member tab's provenance (`pi-target`, `pi-created`, `adopted-user`,
+  `held` with the holding sessionKey, `unknown`). `repairStrayGroups` is a DRY RUN by default
+  (`dryRun !== false`); on apply its only mutation is `chrome.tabs.ungroup(tabId)` for members that
+  are neither held by a live record nor absolute Pi targets — never a removal, group update, move or
+  `windows.*` call, and never anything in the picked window — and it re-queries the group to report
+  `groupDisposedAfter` honestly. An ungroup that fails (the tab was closed between preview and apply)
+  is not counted as repaired, and a picked/recorded window that is GONE is not a boundary at all: with
+  no live workspace window, nothing is called stray and the repair changes nothing. `window.list` gains
+  additive `strayPiGroups` (count) and per-window
+  `groups` (`{id,title,piGroup,tabCount,leak,heldBySession}`); `/chrome doctor` and
+  `/chrome window list` warn about a stray group with the fix; `/chrome groups repair` previews, then
+  asks for confirmation naming how many tabs will be ungrouped and that pages and tabs are untouched,
+  then applies. `chrome_tab action=list` now prints a Pi group as `[Pi Agent @w<windowId>]`, and the
+  system primer says never to group or adopt outside the chosen window and to offer `/chrome groups
+  repair` when a stray group is reported. Honest limits: Chrome has no group-removal API, so a repair
+  ungroups the members and relies on Chrome disposing the empty group (and says honestly when a group
+  survived because a skipped member kept it); provenance comes from `chrome.storage.session`, so an
+  extension reload loses the `created:false` records and a leftover group Pi once made around a user
+  tab is then classified from tab evidence alone — the repair still previews every member and will not
+  move or close by a guess. Covered by new red-first tests in `automation-target.test.mjs`
+  (cross-window grouping refused, the page action that still completes, in-window grouping that still
+  works, the adopted tab a sweep must not touch, the stale record never acted on, `groupTab`'s two
+  refusals, repair dry-run/apply/held/in-window cases, `window.list` leaks, workspace-window
+  resolution, and the exact Pi-side warning) plus `chrome-command.test.mjs`, `bridge-routing.test.mjs`,
+  `cdp-passthrough.test.mjs`, and `background-policy.test.mjs`.
+
 - **Typing reports what it did, and observations never predate their own navigation.** Two
   silent-success bugs were reproduced live and fixed. `chrome_type` types at the caret, so into a
   field holding `why do flamingos stand on one leg` it produced

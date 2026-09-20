@@ -234,6 +234,15 @@ function connectorMenuOptions(
 	return { autoLabel, options, keyByLabel };
 }
 
+type WindowGroupSummary = {
+	id: number;
+	title: string;
+	piGroup: boolean;
+	tabCount: number;
+	leak: boolean;
+	heldBySession?: string | null;
+};
+
 type WindowSummary = {
 	windowId: number | null;
 	tabCount: number;
@@ -241,6 +250,8 @@ type WindowSummary = {
 	focused: boolean;
 	holdsTargetTab: boolean;
 	ownedByPi?: boolean;
+	// Additive: Pi-titled tab groups in this window. An older extension does not send it.
+	groups?: WindowGroupSummary[];
 };
 
 type WindowReport = {
@@ -251,6 +262,9 @@ type WindowReport = {
 	// Reported by the extension so the picker marks the entry Pi is working in instead of leaving the
 	// user to infer it from which line happens to be highlighted.
 	workingWindowId?: number | null;
+	// Additive: how many Pi-titled tab groups sit outside the window this session works in. An older
+	// extension does not send it, and an older Pi side ignores it.
+	strayPiGroups?: number;
 };
 
 function truncateTitle(title: string, max = 40): string {
@@ -325,6 +339,20 @@ function describeWindows(report: WindowReport, preferredWindow?: number): string
 	// A bare "Windows open:" header with nothing under it would contradict the sentence above when the only
 	// window is Pi's own, so say plainly that there is nothing else to list.
 	const lines = [`This session is working in ${where}.`];
+	// A Pi group in a window other than Pi's is the visible half of the live leak. The repair is a dry run
+	// in the extension and only ungroups, so the wording promises exactly that much and no more.
+	const strayCount = typeof report.strayPiGroups === "number" ? report.strayPiGroups : 0;
+	if (strayCount > 0) {
+		for (const win of report.windows ?? []) {
+			const leaked = (win.groups ?? []).filter((group) => group.leak);
+			if (leaked.length === 0) continue;
+			const tabs = leaked.reduce((total, group) => total + (group.tabCount || 0), 0);
+			lines.push(
+				`⚠ Window ${win.windowId} holds a stray Pi group (${tabs} tab${tabs === 1 ? "" : "s"}). ` +
+					"Run /chrome groups to preview a repair; nothing was changed.",
+			);
+		}
+	}
 	// The machine-wide default is why a brand-new session already knows where to work; showing it makes
 	// the difference between "picked once" and "picked again" visible instead of implicit. A default whose
 	// window is GONE says so: otherwise the list reads as if that window were still a choice, while the
@@ -339,6 +367,49 @@ function describeWindows(report: WindowReport, preferredWindow?: number): string
 	}
 	if (options.length > 0) lines.push("Windows open:", ...options);
 	else lines.push("No other Chrome windows are open right now.");
+	return lines.join("\n");
+}
+
+type GroupRepairTab = { tabId: number; title: string; url: string; provenance: string; action: string; heldBySession?: string | null };
+type GroupRepairGroup = { groupId: number; windowId: number; title: string; tabs: GroupRepairTab[]; groupDisposedAfter?: boolean | null };
+type GroupRepairReport = { dryRun?: boolean; pickedWindowId?: number | null; groups?: GroupRepairGroup[]; ungroupedTabs?: number[]; skippedTabs?: number[] };
+
+// Render a groups.repair report. Pure, because this wording is the only thing that tells the user that a
+// repair touches nothing but the grouping — pages and tabs survive, and held/Pi-target members are skipped.
+function describeGroupRepair(report: GroupRepairReport, applied = false): string {
+	const groups = report.groups ?? [];
+	const lines: string[] = [];
+	if (groups.length === 0) {
+		lines.push(
+			typeof report.pickedWindowId === "number"
+				? `No stray Pi tab groups outside window ${report.pickedWindowId}. Nothing to repair.`
+				: "No browser window is chosen for Pi, so there is no boundary that would make a Pi group stray. Run /chrome window first.",
+		);
+		return lines.join("\n");
+	}
+	const planned = groups.flatMap((group) => group.tabs.filter((tab) => tab.action === "ungroup"));
+	const ungrouped = report.ungroupedTabs ?? [];
+	lines.push(
+		applied || report.dryRun === false
+			? `Repaired ${ungrouped.length} tab${ungrouped.length === 1 ? "" : "s"} — pages and tabs were left in place.`
+			: `Preview: ${planned.length} tab${planned.length === 1 ? "" : "s"} would be ungrouped (pages and tabs are not moved, navigated or closed).`,
+	);
+	for (const group of groups) {
+		lines.push(`  Window ${group.windowId}: "${group.title}" (${group.tabs.length} tab${group.tabs.length === 1 ? "" : "s"})`);
+		for (const tab of group.tabs) {
+			const held = tab.heldBySession ? `, held by ${tab.heldBySession}` : "";
+			const label = String(tab.title || tab.url || "").slice(0, 60);
+			lines.push(`    ${tab.action === "ungroup" ? "ungroup" : "skip   "} tab ${tab.tabId} — ${tab.provenance}${held} — ${label}`);
+		}
+	}
+	if (applied || report.dryRun === false) {
+		const survivors = groups.filter((group) => group.groupDisposedAfter === false).length;
+		lines.push(
+			survivors === 0
+				? "Every repaired group is gone."
+				: `${survivors} group(s) are still present (a skipped member keeps its group; tabs listed as skip were deliberately left grouped).`,
+		);
+	}
 	return lines.join("\n");
 }
 
@@ -403,6 +474,27 @@ function truncateText(text: string, maxChars = MAX_TEXT_CHARS): string {
 
 function safeJson(value: unknown): string {
 	return JSON.stringify(value, null, 2);
+}
+
+// Where a page action actually ran, when the extension reported it additively on an object result. The
+// extension allows acting on one of the user's tabs in ANOTHER window — inspecting the user's own page is a
+// feature — but the action must never be silent about it, because that is exactly the live mis-target (a
+// urlIncludes selector resolved to the user's Google tab instead of Pi's own). Pure so the wording is
+// testable without a bridge.
+function outsideWindowWarning(result: unknown): string {
+	const record = (result && typeof result === "object" ? result : {}) as {
+		outsideWorkspace?: unknown;
+		resolvedWindowId?: unknown;
+		workspaceWindowId?: unknown;
+	};
+	if (record.outsideWorkspace !== true || typeof record.resolvedWindowId !== "number") return "";
+	const picked = typeof record.workspaceWindowId === "number" ? record.workspaceWindowId : "the chosen window";
+	return `⚠ acted on a tab in window ${record.resolvedWindowId}, not Pi's window ${picked} (nothing was grouped, moved or closed)`;
+}
+
+function withOutsideWindowNote(text: string, result: unknown): string {
+	const note = outsideWindowWarning(result);
+	return note ? `${text}\n${note}` : text;
 }
 
 const snapshotModeValues = ["auto", "interactive", "forms", "pageMap", "text", "changes", "full"] as const;
@@ -1289,7 +1381,7 @@ class ChromeProfileBridge {
 	}
 }
 
-const tabActionValues = ["list", "new", "activate", "close", "group", "ungroup", "version"] as const;
+const tabActionValues = ["list", "new", "activate", "close", "group", "ungroup", "version", "groups", "repair-groups"] as const;
 const imageFormatValues = ["png", "jpeg"] as const;
 const waitForValues = ["selector", "expression"] as const;
 const CHROME_TOOL_NAMES = [
@@ -1655,6 +1747,7 @@ Tab/window isolation (important):
 - pi-chrome owns a dedicated automation window/tab. When a chrome_* tool runs with no explicit target, it acts on that pi-chrome-owned target — it never reuses or overwrites the user's currently active tab. The dedicated target is created on first use and reused afterward.
 - To act on a specific *existing* tab (e.g. one the user asks you to use), pass targetId/urlIncludes/titleIncludes. Without one of those, assume you are working in pi-chrome's own automation target.
 - pi-chrome's automation target may be closed automatically when Chrome control is revoked; user tabs/windows are never closed by pi-chrome.
+- Never group or adopt a tab outside the window chosen for Pi, and never put Pi's footprint into a window the user did not choose. If a stray "Pi Agent" group is reported in one of the user's windows, offer /chrome groups repair (it previews first, and only ungroups — pages and tabs are untouched).
 
 Capability model (important):
 - Interactive controls (click/type/fill/key/hover/drag/scroll/tap) use Chrome's real input layer via chrome.debugger / CDP. Events satisfy normal user-activation gates.
@@ -1736,6 +1829,25 @@ Usage rules:
 					if (probe && probe.webdriver) lines.push(`⚠ Your Chrome is reporting itself as automated to websites. Some sites use this signal to block sign-ins or bot checks.`);
 				} catch (error) {
 					lines.push(`⚠ Couldn't inspect the active tab: ${(error as Error).message}`);
+				}
+
+				// A stray Pi tab group in one of the user's windows is a visible footprint Pi should never have
+				// left and must be reported with its fix, not buried.
+				try {
+					const report = (await bridge.send("window.list", { ...preferredWindowParams(), ...windowParams(ctx) }, 10_000)) as WindowReport;
+					const stray = typeof report.strayPiGroups === "number" ? report.strayPiGroups : 0;
+					if (stray > 0) {
+						const tabs = (report.windows ?? []).reduce(
+							(total, win) => total + (win.groups ?? []).filter((group) => group.leak).reduce((count, group) => count + (group.tabCount || 0), 0),
+							0,
+						);
+						lines.push(
+							`⚠ A stray Pi tab group is in one of your windows (${tabs} tab${tabs === 1 ? "" : "s"}). ` +
+								"Run /chrome groups repair to preview and remove it; no page or tab is moved or closed.",
+						);
+					}
+				} catch (error) {
+					lines.push(`⚠ Couldn't check for stray Pi tab groups: ${(error as Error).message}`);
 				}
 			} else if (versionMismatch) {
 				lines.push(`… Skipped the remaining checks until you reload the Chrome extension.`);
@@ -2073,6 +2185,50 @@ Usage rules:
 		}
 	};
 
+	// Preview (and optionally apply) a repair of stray Pi tab groups. `groups.repair` is a dry run unless
+	// dryRun:false, so merely looking cannot change anything. Applying is confirmed first, and the extension
+	// only ever calls chrome.tabs.ungroup for members that are neither held by a live Pi session nor
+	// absolute Pi targets: no page is navigated, no tab is moved or closed, and Pi's own window is excluded.
+	const groupsHandler = async (ctx: ExtensionContext, args: string): Promise<void> => {
+		const arg = args.trim().toLowerCase();
+		const apply = arg === "repair" || arg === "apply" || arg === "fix";
+		try {
+			const preview = (await bridge.send(
+				"groups.repair",
+				{ ...windowParams(ctx), ...preferredWindowParams(), dryRun: true },
+				15_000,
+			)) as GroupRepairReport;
+			if (!apply) {
+				ctx.ui.notify(describeGroupRepair(preview), "info");
+				return;
+			}
+			const groups = preview.groups ?? [];
+			const planned = groups.flatMap((group) => group.tabs.filter((tab) => tab.action === "ungroup"));
+			if (planned.length === 0) {
+				ctx.ui.notify(`${describeGroupRepair(preview)}\n\nNothing to repair — no tab would be ungrouped.`, "info");
+				return;
+			}
+			const confirmed = await ctx.ui.confirm(
+				"Ungroup stray Pi tabs?",
+				`${planned.length} tab${planned.length === 1 ? "" : "s"} in ${groups.length} stray Pi group${groups.length === 1 ? "" : "s"} will be ungrouped.\n\n` +
+					"Pages and tabs are untouched: nothing is navigated, moved or closed, and Pi's own window is never touched — only the stray group goes away.",
+			);
+			if (!confirmed) {
+				ctx.ui.notify("Cancelled — nothing was changed.", "info");
+				return;
+			}
+			const applied = (await bridge.send(
+				"groups.repair",
+				{ ...windowParams(ctx), ...preferredWindowParams(), dryRun: false },
+				20_000,
+			)) as GroupRepairReport;
+			ctx.ui.notify(describeGroupRepair(applied, true), "info");
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			ctx.ui.notify(`Group repair failed: ${message}`, "warning");
+		}
+	};
+
 	const openCommandMenu = async (ctx: ExtensionContext): Promise<void> => {
 		while (true) {
 			ctx.ui.notify("Checking Chrome connection…", "info");
@@ -2100,7 +2256,7 @@ Usage rules:
 
 	pi.registerCommand("chrome", {
 		description:
-			"All pi-chrome controls in one place.\n  /chrome authorize [15m|30m|<minutes>|indefinite] — allow this Pi session to use chrome_* tools.\n  /chrome revoke   — lock Chrome control.\n  /chrome doctor   — full health check plus authorization and background state.\n  /chrome onboard  — install the Chrome companion extension.\n  /chrome background [on|off|status|toggle] — enforce no explicit focus/tab activation, or allow foreground/watch mode.\n  /chrome connector [list|<key>|auto] — choose which installed connector (browser + profile) receives commands.\n  /chrome window [list] — choose which browser window Pi works in (saved for future sessions).\nRun with no arguments for an interactive picker that shows current state.",
+			"All pi-chrome controls in one place.\n  /chrome authorize [15m|30m|<minutes>|indefinite] — allow this Pi session to use chrome_* tools.\n  /chrome revoke   — lock Chrome control.\n  /chrome doctor   — full health check plus authorization and background state.\n  /chrome onboard  — install the Chrome companion extension.\n  /chrome background [on|off|status|toggle] — enforce no explicit focus/tab activation, or allow foreground/watch mode.\n  /chrome connector [list|<key>|auto] — choose which installed connector (browser + profile) receives commands.\n  /chrome window [list] — choose which browser window Pi works in (saved for future sessions).\n  /chrome groups [repair] — preview (or ungroup) stray Pi tab groups in windows Pi does not work in.\nRun with no arguments for an interactive picker that shows current state.",
 		getArgumentCompletions: (prefix) => {
 			const raw = prefix;
 			const trimmedRight = raw.replace(/\s+$/, "");
@@ -2124,6 +2280,7 @@ Usage rules:
 					{ fullValue: "background", label: "background", description: "Enforce hard background or allow foreground/watch mode." },
 					{ fullValue: "connector", label: "connector", description: "Choose which installed connector (browser + profile) receives commands." },
 					{ fullValue: "window", label: "window", description: "Choose which browser window Pi works in." },
+					{ fullValue: "groups", label: "groups", description: "Preview or repair stray Pi tab groups outside Pi's window." },
 				];
 			} else if (path[0] === "authorize" && path.length === 1) {
 				candidates = [
@@ -2146,6 +2303,10 @@ Usage rules:
 			} else if (path[0] === "window" && path.length === 1) {
 				candidates = [
 					{ fullValue: "window list", label: "list", description: "Show the open browser windows and where Pi is working." },
+				];
+			} else if (path[0] === "groups" && path.length === 1) {
+				candidates = [
+					{ fullValue: "groups repair", label: "repair", description: "Preview, confirm, then ungroup stray Pi tab groups (pages and tabs untouched)." },
 				];
 			}
 			if (candidates.length === 0) return null;
@@ -2172,6 +2333,8 @@ Usage rules:
 					return connectorHandler(ctx, subArgs);
 				case "window":
 					return windowHandler(ctx, subArgs);
+				case "groups":
+					return groupsHandler(ctx, subArgs);
 				case "settings": {
 					// Legacy nested form: /chrome settings background ...
 					const [setting, ...settingArgs] = rest;
@@ -2180,7 +2343,7 @@ Usage rules:
 					return;
 				}
 				default:
-					ctx.ui.notify(`Unknown subcommand '${head}'. Run /chrome for current state and controls, or try: /chrome authorize | revoke | doctor | onboard | background | connector.`, "warning");
+					ctx.ui.notify(`Unknown subcommand '${head}'. Run /chrome for current state and controls, or try: /chrome authorize | revoke | doctor | onboard | background | connector | window | groups.`, "warning");
 			}
 		},
 	});
@@ -2289,7 +2452,7 @@ Usage rules:
 	pi.registerTool({
 		name: "chrome_tab",
 		label: "Chrome Tab",
-		description: "List, create, activate, close, group, ungroup, or inspect tabs in the user's existing Chrome profile via the companion extension. New/grouped tabs always use this session's Pi tab group. action=new waits (bounded at 5s) for a real URL to reach load complete and reports loadStatus; about:blank never waits. Background mode keeps new tabs inactive and blocks activate; ask the user to run /chrome background off for foreground/watch mode. activate/close/group/ungroup require a target (targetId/urlIncludes/titleIncludes); with no target they act on this session's pi-chrome automation tab if one exists, and otherwise error rather than touching the user's active tab.",
+		description: "List, create, activate, close, group, ungroup, or inspect tabs in the user's existing Chrome profile via the companion extension. New/grouped tabs always use this session's Pi tab group. action=new waits (bounded at 5s) for a real URL to reach load complete and reports loadStatus; about:blank never waits. Background mode keeps new tabs inactive and blocks activate; ask the user to run /chrome background off for foreground/watch mode. activate/close/group/ungroup require a target (targetId/urlIncludes/titleIncludes); with no target they act on this session's pi-chrome automation tab if one exists, and otherwise error rather than touching the user's active tab. action=groups reports Pi tab groups (marking strays outside Pi's window); action=repair-groups previews ungrouping those strays and only applies with apply=true.",
 		promptSnippet: "List/open/activate/close/group existing Chrome tabs through the companion extension.",
 		parameters: Type.Object({
 			action: StringEnum(tabActionValues),
@@ -2300,10 +2463,48 @@ Usage rules:
 			group: Type.Optional(Type.Boolean({ description: "Deprecated; ignored. Pi-created tabs always join this session's own tab group." })),
 			groupTitle: Type.Optional(Type.String({ description: "Deprecated for action=new/group; ignored so Pi-created tabs use the 'Pi Agent' tab group." })), 
 			groupColor: Type.Optional(Type.String({ description: "Tab group color for action=group/new: grey, blue, red, yellow, green, pink, purple, cyan, or orange. Defaults to blue." })),
+			apply: Type.Optional(Type.Boolean({ description: "For action=repair-groups: true actually ungroups the planned stray tabs; default false previews only (dry run)." })),
 			host: Type.Optional(Type.String()),
 			port: Type.Optional(Type.Number()),
 		}),
 		async execute(_id, params, signal, _onUpdate, ctx): Promise<ToolTextResult> {
+			// Group housekeeping is addressed to the worker's `groups.*` actions, not `tab.*`, and must stay out
+			// of the forced-groupTitle branch below: it inspects and repairs groups, it never joins one.
+			if (params.action === "groups" || params.action === "repair-groups") {
+				if (params.action === "groups") {
+					const result = (await authorizedBridgeSend("groups.leaks", { ...windowParams(ctx), ...preferredWindowParams() }, DEFAULT_TIMEOUT_MS, signal)) as {
+						pickedWindowId?: number | null;
+						strayPiGroups?: GroupRepairGroup[];
+						pickedWindowGroups?: GroupRepairGroup[];
+					};
+					const stray = result.strayPiGroups ?? [];
+					const inWindow = result.pickedWindowGroups ?? [];
+					const lines = [
+						`Pi works in window ${typeof result.pickedWindowId === "number" ? result.pickedWindowId : "(none chosen)"}.`,
+						stray.length === 0 ? "No stray Pi tab groups in other windows." : `Stray Pi tab groups (${stray.length}):`,
+					];
+					for (const group of stray) {
+						lines.push(`  window ${group.windowId} — "${group.title}" (${(group.tabs ?? []).length} tab${(group.tabs ?? []).length === 1 ? "" : "s"})`);
+						for (const tab of group.tabs ?? []) {
+							const held = tab.heldBySession ? `, held by ${tab.heldBySession}` : "";
+							lines.push(`    tab ${tab.tabId} — ${tab.provenance}${held} — ${String(tab.title || tab.url || "").slice(0, 60)}`);
+						}
+					}
+					lines.push(
+						inWindow.length === 0
+							? "No Pi tab groups inside Pi's window."
+							: `Pi tab groups inside Pi's window (left alone): ${inWindow.map((group) => `"${group.title}"`).join(", ")}.`,
+					);
+					return { content: [{ type: "text", text: lines.join("\n") }], details: { result: result as Json } };
+				}
+				const result = (await authorizedBridgeSend(
+					"groups.repair",
+					{ ...windowParams(ctx), ...preferredWindowParams(), dryRun: params.apply === true ? false : true },
+					DEFAULT_TIMEOUT_MS,
+					signal,
+				)) as GroupRepairReport;
+				return { content: [{ type: "text", text: describeGroupRepair(result, params.apply === true) }], details: { result: result as Json } };
+			}
 			const forwarded = { ...params } as typeof params & { groupTitle?: string };
 			// Force every Pi-opened/explicitly-grouped tab into this session's own group,
 			// named after the session display name (falling back to the session id). There is
@@ -2313,8 +2514,17 @@ Usage rules:
 			}
 			const result = await authorizedBridgeSend(`tab.${params.action}`, forwarded, DEFAULT_TIMEOUT_MS, signal);
 			if (params.action === "list") {
-				const tabs = result as Array<{ id: number; title: string; url: string; active: boolean; windowId: number; group?: { title?: string } | null }>;
-				const text = tabs.map((tab) => `${tab.id}\t${tab.active ? "*" : " "}\t${tab.group?.title ? `[${tab.group.title}] ` : ""}${tab.title || "(untitled)"}\t${tab.url}`).join("\n") || "No tabs.";
+				const tabs = result as Array<{ id: number; title: string; url: string; active: boolean; windowId: number; group?: { title?: string; windowId?: number; piGroup?: boolean } | null }>;
+				const text = tabs.map((tab) => {
+					// Pi's own groups carry their window so the same title in two windows is not ambiguous.
+					const group = tab.group;
+					const label = group?.piGroup
+						? `[${group.title} @w${typeof group.windowId === "number" ? group.windowId : tab.windowId}] `
+						: group?.title
+							? `[${group.title}] `
+							: "";
+					return `${tab.id}\t${tab.active ? "*" : " "}\t${label}${tab.title || "(untitled)"}\t${tab.url}`;
+				}).join("\n") || "No tabs.";
 				return { content: [{ type: "text", text }], details: { tabs } };
 			}
 			if (params.action === "new") {
@@ -2356,7 +2566,7 @@ Usage rules:
 				DEFAULT_TIMEOUT_MS,
 				signal,
 			);
-			return { content: [{ type: "text", text: formatChromeSnapshot(snapshot) }], details: { snapshot } };
+			return { content: [{ type: "text", text: withOutsideWindowNote(formatChromeSnapshot(snapshot), snapshot) }], details: { snapshot } };
 		},
 	});
 
@@ -2384,7 +2594,7 @@ Usage rules:
 				DEFAULT_TIMEOUT_MS,
 				signal,
 			);
-			return { content: [{ type: "text", text: formatChromeSnapshot(snapshot) }], details: { snapshot } };
+			return { content: [{ type: "text", text: withOutsideWindowNote(formatChromeSnapshot(snapshot), snapshot) }], details: { snapshot } };
 		},
 	});
 
@@ -2408,7 +2618,7 @@ Usage rules:
 		async execute(_id, params, signal): Promise<ToolTextResult> {
 			try {
 				const inspect = await authorizedBridgeSend("page.inspect", params, DEFAULT_TIMEOUT_MS, signal);
-				return { content: [{ type: "text", text: formatChromeInspect(inspect) }], details: { inspect } };
+				return { content: [{ type: "text", text: withOutsideWindowNote(formatChromeInspect(inspect), inspect) }], details: { inspect } };
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
 				if (!/Unknown action: page\.inspect/i.test(message)) throw error;
@@ -2428,7 +2638,7 @@ Usage rules:
 					signal,
 				);
 				const text = `chrome_inspect fallback: loaded Chrome extension does not yet support page.inspect; reload it at chrome://extensions for deep inspect.\n\n${formatChromeSnapshot(snapshot)}`;
-				return { content: [{ type: "text", text }], details: { snapshot, fallback: "page.snapshot" } };
+				return { content: [{ type: "text", text: withOutsideWindowNote(text, snapshot) }], details: { snapshot, fallback: "page.snapshot" } };
 			}
 		},
 	});
@@ -2453,7 +2663,7 @@ Usage rules:
 		}),
 		async execute(_id, params, signal): Promise<ToolTextResult> {
 			const result = await authorizedBridgeSend("page.navigate", params, (params.timeoutMs ?? 15_000) + 2_000, signal);
-			return { content: [{ type: "text", text: `Navigated to ${params.url}${params.initScript ? " (with initScript)" : ""}` }], details: { result: result as Json } };
+			return { content: [{ type: "text", text: withOutsideWindowNote(`Navigated to ${params.url}${params.initScript ? " (with initScript)" : ""}`, result) }], details: { result: result as Json } };
 		},
 	});
 
@@ -2480,6 +2690,9 @@ Usage rules:
 				: typeof value === "string"
 					? value
 					: safeJson(value) ?? "undefined";
+			// The value IS the page's own data: never spread resolution metadata into it, and never read it for
+			// the outside-window warning either — a page object that happens to carry those keys would print a
+			// false "acted outside Pi's window" line. Reporting for evaluate is a separate problem.
 			return { content: [{ type: "text", text: truncateText(text) }], details: { value: value as Json } };
 		},
 	});
@@ -2511,7 +2724,7 @@ Usage rules:
 			const summary = summarizeActionResult(result);
 			const target = params.uid ?? params.selector ?? `${params.x},${params.y}`;
 			const text = summary ? `Clicked ${target} — ${summary}` : `Clicked ${target}`;
-			return { content: [{ type: "text", text: formatIncludedSnapshotText(raw, text) }], details: { result: raw as Json } };
+			return { content: [{ type: "text", text: formatIncludedSnapshotText(raw, withOutsideWindowNote(text, raw)) }], details: { result: raw as Json } };
 		},
 	});
 
@@ -2555,7 +2768,7 @@ Usage rules:
 			if (spliced && params.pressEnter) warnings.push("⚠ If that Enter submitted the form, it submitted the SPLICED value above, not your text.");
 			if (typeof r.tabStatus === "string" && r.tabStatus !== "complete") warnings.push(`⚠ tab status is ${r.tabStatus}; the page may still be loading`);
 			const text = [base, ...(summary ? [`(${summary})`] : []), ...warnings].join("\n");
-			return { content: [{ type: "text", text: formatIncludedSnapshotText(raw, text) }], details: { result: raw as Json } };
+			return { content: [{ type: "text", text: formatIncludedSnapshotText(raw, withOutsideWindowNote(text, raw)) }], details: { result: raw as Json } };
 		},
 	});
 
@@ -2588,7 +2801,7 @@ Usage rules:
 			const into = params.uid || params.selector ? ` into ${params.uid ?? params.selector}` : "";
 			const base = `Filled ${params.text.length} character(s)${into}.`;
 			const text = summary ? `${base} (${summary})` : base;
-			return { content: [{ type: "text", text: formatIncludedSnapshotText(raw, text) }], details: { result: raw as Json } };
+			return { content: [{ type: "text", text: formatIncludedSnapshotText(raw, withOutsideWindowNote(text, raw)) }], details: { result: raw as Json } };
 		},
 	});
 
@@ -2621,7 +2834,7 @@ Usage rules:
 			const summary = summarizeActionResult(result);
 			const base = `Pressed ${params.key}.`;
 			const text = summary ? `${base} (${summary})` : base;
-			return { content: [{ type: "text", text: formatIncludedSnapshotText(raw, text) }], details: { result: raw as Json } };
+			return { content: [{ type: "text", text: formatIncludedSnapshotText(raw, withOutsideWindowNote(text, raw)) }], details: { result: raw as Json } };
 		},
 	});
 
@@ -2643,7 +2856,7 @@ Usage rules:
 		}),
 		async execute(_id, params, signal): Promise<ToolTextResult> {
 			const result = await authorizedBridgeSend("page.waitFor", params, (params.timeoutMs ?? 10_000) + 2_000, signal);
-			return { content: [{ type: "text", text: `Observed ${params.kind}: ${params.value}` }], details: { result: result as Json } };
+			return { content: [{ type: "text", text: withOutsideWindowNote(`Observed ${params.kind}: ${params.value}`, result) }], details: { result: result as Json } };
 		},
 	});
 
@@ -2773,7 +2986,7 @@ Usage rules:
 			if (!result.dataUrl) throw new Error("Screenshot returned no dataUrl");
 			const base64 = result.dataUrl.replace(/^data:image\/(?:png|jpeg);base64,/, "");
 			await writeFile(outputPath, Buffer.from(base64, "base64"));
-			return { content: [{ type: "text", text: `Saved Chrome screenshot to ${outputPath}${prunedNote}` }], details: { path: outputPath, format, tab: result.tab, method: result.method, pruned: pruned.removed } };
+			return { content: [{ type: "text", text: withOutsideWindowNote(`Saved Chrome screenshot to ${outputPath}${prunedNote}`, result) }], details: { path: outputPath, format, tab: result.tab, method: result.method, pruned: pruned.removed } };
 		},
 	});
 
@@ -2794,7 +3007,7 @@ Usage rules:
 		}),
 		async execute(_id, params, signal): Promise<ToolTextResult> {
 			const result = await authorizedBridgeSend("page.hover", params, DEFAULT_TIMEOUT_MS, signal);
-			return { content: [{ type: "text", text: `Hovered ${params.uid ?? params.selector ?? `${params.x},${params.y}`}` }], details: { result: result as Json } };
+			return { content: [{ type: "text", text: withOutsideWindowNote(`Hovered ${params.uid ?? params.selector ?? `${params.x},${params.y}`}`, result) }], details: { result: result as Json } };
 		},
 	});
 
@@ -2820,7 +3033,7 @@ Usage rules:
 		}),
 		async execute(_id, params, signal): Promise<ToolTextResult> {
 			const result = await authorizedBridgeSend("page.drag", params, DEFAULT_TIMEOUT_MS, signal);
-			return { content: [{ type: "text", text: `Dragged from ${params.fromUid ?? params.fromSelector} to ${params.toUid ?? params.toSelector}` }], details: { result: result as Json } };
+			return { content: [{ type: "text", text: withOutsideWindowNote(`Dragged from ${params.fromUid ?? params.fromSelector} to ${params.toUid ?? params.toSelector}`, result) }], details: { result: result as Json } };
 		},
 	});
 
@@ -2843,7 +3056,7 @@ Usage rules:
 		async execute(_id, params, signal): Promise<ToolTextResult> {
 			const result = await authorizedBridgeSend("page.tap", params, DEFAULT_TIMEOUT_MS, signal);
 			const target = params.uid ?? params.selector ?? `${params.x},${params.y}`;
-			return { content: [{ type: "text", text: `Tapped ${target} (touch)` }], details: { result: result as Json } };
+			return { content: [{ type: "text", text: withOutsideWindowNote(`Tapped ${target} (touch)`, result) }], details: { result: result as Json } };
 		},
 	});
 
@@ -2865,7 +3078,7 @@ Usage rules:
 		}),
 		async execute(_id, params, signal): Promise<ToolTextResult> {
 			const result = await authorizedBridgeSend("page.scroll", params, DEFAULT_TIMEOUT_MS, signal);
-			return { content: [{ type: "text", text: `Scrolled dy=${params.deltaY ?? 0} dx=${params.deltaX ?? 0}` }], details: { result: result as Json } };
+			return { content: [{ type: "text", text: withOutsideWindowNote(`Scrolled dy=${params.deltaY ?? 0} dx=${params.deltaX ?? 0}`, result) }], details: { result: result as Json } };
 		},
 	});
 
@@ -2887,7 +3100,7 @@ Usage rules:
 			const cwd = workspaceCwd(ctx);
 			const paths = params.paths.map((p) => resolve(cwd, p));
 			const result = await authorizedBridgeSend("page.upload", { ...params, paths }, DEFAULT_TIMEOUT_MS, signal);
-			return { content: [{ type: "text", text: `Uploaded ${paths.length} file(s) to ${params.uid ?? params.selector}` }], details: { result: result as Json } };
+			return { content: [{ type: "text", text: withOutsideWindowNote(`Uploaded ${paths.length} file(s) to ${params.uid ?? params.selector}`, result) }], details: { result: result as Json } };
 		},
 	});
 

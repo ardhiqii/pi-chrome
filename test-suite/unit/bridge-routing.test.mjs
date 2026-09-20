@@ -927,3 +927,43 @@ test("state file: a write failure never throws and is reported, not hidden", (t)
   assert.equal(state.writePreferredConnector("edge"), false, "same for the connector preference");
   assert.equal(state.writeConnectorName("edge:x", "X"), false, "same for connector names");
 });
+
+// describeWindows is the user-facing half of the leak report: it must warn about a stray Pi group with
+// the exact fix, and stay silent (and crash-free) when an older extension sends no leak fields at all.
+function loadDescribeWindows() {
+  const start = indexSource.indexOf("function truncateTitle(");
+  const end = indexSource.indexOf("\ntype ClientSummary =", start);
+  assert.ok(start >= 0 && end > start, "could not locate describeWindows");
+  const sandbox = { console, Map };
+  vm.runInNewContext(
+    stripTypeScriptTypes(indexSource.slice(start, end)) + "\n;globalThis.__d = describeWindows;",
+    sandbox,
+  );
+  return sandbox.__d;
+}
+
+test("describeWindows warns about a stray Pi group in the user's window, with the fix, and only then", () => {
+  const describeWindows = loadDescribeWindows();
+  const report = {
+    ownsTargetWindow: false,
+    targetWindowId: null,
+    workingWindowId: 11,
+    strayPiGroups: 1,
+    windows: [
+      { windowId: 11, tabCount: 3, title: "GitHub", focused: false, holdsTargetTab: true, groups: [{ id: 3, title: "Pi Agent", piGroup: true, tabCount: 2, leak: false, heldBySession: "session:a" }] },
+      { windowId: 720723708, tabCount: 8, title: "Extensions", focused: true, holdsTargetTab: false, groups: [{ id: 9, title: "Pi Agent", piGroup: true, tabCount: 2, leak: true, heldBySession: "session:a" }] },
+    ],
+  };
+  const text = describeWindows(report, 11);
+  assert.match(text, /⚠ Window 720723708 holds a stray Pi group \(2 tabs\)\. Run \/chrome groups to preview a repair; nothing was changed\./);
+  assert.doesNotMatch(text, /⚠ Window 11 holds a stray/, "a group inside Pi's window is not a leak");
+  assert.match(text, /This session is working in window 11/, "the normal report is still there");
+
+  const clean = describeWindows({ ...report, strayPiGroups: 0, windows: [report.windows[0]] }, 11);
+  assert.doesNotMatch(clean, /stray Pi group/, "nothing is warned when there is no leak");
+
+  // An older extension: no strayPiGroups, no per-window groups. The report must still render.
+  const older = describeWindows({ windows: [{ windowId: 11, tabCount: 3, title: "GitHub", focused: true, holdsTargetTab: true }], workingWindowId: 11 }, 11);
+  assert.doesNotMatch(older, /stray Pi group/);
+  assert.match(older, /Window 11/);
+});

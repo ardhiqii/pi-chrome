@@ -19,6 +19,9 @@ const commandSource = stripTypeScriptTypes([
   // The connector menu's own helpers: the picker entry constant, the label->key mapping, and the status
   // reporter the connector handler calls.
   section("const RENAME_CONNECTOR_ENTRY =", "\nconst PI_CHROME_GLOBAL_KEY"),
+  // The real report renderer for /chrome groups: the wording is the only place that promises a repair
+  // leaves pages and tabs alone, so it must be tested, not stubbed.
+  section("function describeGroupRepair(", "\ntype ClientSummary ="),
   section("// Shared handlers,", "\n\tfunction registerChromeTools("),
 ].join("\n"));
 
@@ -27,12 +30,13 @@ function healthyResponse(action) {
     case "tab.version": return { extensionVersion: version };
     case "page.evaluate": return 2;
     case "page.probe": return { arithmetic: 2, location: "https://fixture.test/", webdriver: false };
+    case "window.list": return { windows: [], workingWindowId: null, strayPiGroups: 0 };
     default: throw new Error(`Unexpected bridge action: ${action}`);
   }
 }
 
-function harness({ until, background = true, mode = "server", choices = [], send = healthyResponse, clientLabel, clientKey = "edge:unittest", connectors, connectorNames = {}, profileSuggestions = [], preferredWindow, writePreferredWindowFails = false } = {}) {
-  const calls = [], notices = [], menus = [], namesWritten = [], preferredWindowsWritten = [], pickedAtWritten = [], pickedKeysWritten = [];
+function harness({ until, background = true, mode = "server", choices = [], confirmAnswers = [], send = healthyResponse, clientLabel, clientKey = "edge:unittest", connectors, connectorNames = {}, profileSuggestions = [], preferredWindow, writePreferredWindowFails = false } = {}) {
+  const calls = [], notices = [], menus = [], confirms = [], namesWritten = [], preferredWindowsWritten = [], pickedAtWritten = [], pickedKeysWritten = [];
   let savedPreferredWindow = preferredWindow;
   let savedPreferredWindowAt;
   // Client-mode shape by default: the connector key is only known after a status refresh (the real
@@ -55,6 +59,9 @@ function harness({ until, background = true, mode = "server", choices = [], send
         return choice;
       },
       async input() { return undefined; },
+      // The /chrome groups repair path confirms before it applies. A harness that silently declined would
+      // certify a repair that never ran, so the answer queue is explicit and every prompt is recorded.
+      async confirm(title, message) { confirms.push({ title, message }); return confirmAnswers.length ? confirmAnswers.shift() : false; },
     },
   };
   const sandbox = {
@@ -99,7 +106,7 @@ function harness({ until, background = true, mode = "server", choices = [], send
     pi: { registerCommand(name, definition) { assert.equal(name, "chrome"); command = definition; } },
   };
   vm.runInNewContext(commandSource, sandbox);
-  return { command, calls, notices, menus, namesWritten, preferredWindowsWritten, pickedAtWritten, pickedKeysWritten, sandbox, run: (args = "") => command.handler(args, ctx) };
+  return { command, calls, notices, menus, confirms, namesWritten, preferredWindowsWritten, pickedAtWritten, pickedKeysWritten, sandbox, run: (args = "") => command.handler(args, ctx) };
 }
 
 test("command help and root completion omit status; nested background status remains available", () => {
@@ -107,7 +114,7 @@ test("command help and root completion omit status; nested background status rem
   assert.doesNotMatch(h.command.description, /\/chrome status\b/);
   assert.match(h.command.description, /\/chrome doctor/);
   assert.deepEqual(Array.from(h.command.getArgumentCompletions(""), (item) => item.value), [
-    "authorize", "revoke", "doctor", "onboard", "background", "connector", "window",
+    "authorize", "revoke", "doctor", "onboard", "background", "connector", "window", "groups",
   ]);
   assert.equal(h.command.getArgumentCompletions("sta"), null);
   assert.equal(h.command.getArgumentCompletions("doctor")[0].value, "doctor");
@@ -121,6 +128,10 @@ test("command help and root completion omit status; nested background status rem
   assert.deepEqual(Array.from(h.command.getArgumentCompletions("window "), (item) => item.value), [
     "window list",
   ]);
+  assert.deepEqual(Array.from(h.command.getArgumentCompletions("groups "), (item) => item.value), [
+    "groups repair",
+  ]);
+  assert.match(h.command.description, /\/chrome groups \[repair\]/);
 });
 
 test("removed status command returns a warning without probing Chrome", async () => {
@@ -181,7 +192,7 @@ test("Doctor includes locked, timed, indefinite, and expired authorization plus 
       assert.match(report, /can run code/);
       assert.match(report, /fixture\.test/);
       assert.deepEqual(h.calls.map(({ action, timeout }) => [action, timeout]), [
-        ["tab.version", 35_000], ["page.evaluate", 10_000], ["page.probe", 10_000],
+        ["tab.version", 35_000], ["page.evaluate", 10_000], ["page.probe", 10_000], ["window.list", 10_000],
       ]);
       assert.ok(h.calls.filter((call) => call.action.startsWith("page.")).every((call) => call.params.foreground === false));
       assert.ok(h.calls.filter((call) => call.action.startsWith("page.")).every((call) => call.params.sessionKey === "session:test"),
@@ -212,9 +223,35 @@ test("Doctor retains local state and repair hints when connection/version checks
 test("choosing Doctor explicitly from the dashboard runs full diagnostics", async () => {
   const h = harness({ choices: ["Doctor / troubleshoot"] });
   await h.run();
-  assert.deepEqual(h.calls.map((call) => call.action), ["tab.version", "tab.version", "page.evaluate", "page.probe"]);
+  assert.deepEqual(h.calls.map((call) => call.action), ["tab.version", "tab.version", "page.evaluate", "page.probe", "window.list"]);
   assert.match(h.notices.at(-1)[0], /Authorization: locked/);
   assert.match(h.notices.at(-1)[0], /Background: on \(hard\)/);
+});
+
+test("Doctor warns about a stray Pi tab group with the fix, and stays quiet without one", async () => {
+  // The leak report has to reach the user through the diagnostics command too, not only the picker.
+  const send = (action) => {
+    if (action === "tab.version") return { extensionVersion: version };
+    if (action === "page.evaluate") return 2;
+    if (action === "page.probe") return { arithmetic: 2, location: "https://fixture.test/", webdriver: false };
+    if (action === "window.list") {
+      return {
+        windows: [{ windowId: 22, tabCount: 3, title: "Extensions", focused: true, holdsTargetTab: false, groups: [{ id: 9, title: "Pi Agent", piGroup: true, tabCount: 2, leak: true }] }],
+        workingWindowId: 11,
+        strayPiGroups: 1,
+      };
+    }
+    throw new Error(`Unexpected bridge action: ${action}`);
+  };
+  const h = harness({ until: "indefinite", send });
+  await h.run("doctor");
+  const report = h.notices.at(-1)[0];
+  assert.match(report, /⚠ A stray Pi tab group is in one of your windows \(2 tabs\)/);
+  assert.match(report, /\/chrome groups repair/);
+
+  const clean = harness({ until: "indefinite" });
+  await clean.run("doctor");
+  assert.doesNotMatch(clean.notices.at(-1)[0], /stray Pi tab group/);
 });
 
 test("doctor names the browser and profile the bridge is talking to", async () => {
@@ -486,4 +523,75 @@ test("an empty window picker explains how to proceed instead of showing a dead-e
   const text = String(h.notices.at(-1)[0]);
   assert.match(text, /Open a window in Chrome/);
   assert.doesNotMatch(text, /own/, "there is no window of Pi's own to fall back to any more");
+});
+
+// ===== /chrome groups and /chrome groups repair: the preview is a read-only dry run, and applying is
+// confirmed first with the exact number of tabs and the promise that pages/tabs are untouched. =====
+function groupsPreview(overrides = {}) {
+  return {
+    dryRun: true,
+    pickedWindowId: 11,
+    groups: [{
+      groupId: 5,
+      windowId: 22,
+      title: "Pi Agent",
+      tabs: [
+        { tabId: 40, title: "Google", url: "https://google.com/", provenance: "adopted-user", action: "ungroup", heldBySession: null },
+        { tabId: 41, title: "Pi", url: "about:blank", provenance: "pi-target", action: "skip", heldBySession: "session:other" },
+      ],
+      groupDisposedAfter: null,
+    }],
+    ungroupedTabs: [],
+    skippedTabs: [41],
+    ...overrides,
+  };
+}
+
+test("/chrome groups previews the repair as a dry run and changes nothing", async () => {
+  const h = harness({ send: (action, params) => (action === "groups.repair" && params.dryRun === false ? groupsPreview({ dryRun: false }) : groupsPreview()) });
+  await h.run("groups");
+  assert.deepEqual(h.calls.map((call) => [call.action, call.params.dryRun]), [["groups.repair", true]]);
+  assert.equal(h.confirms.length, 0, "a preview never asks to apply");
+  const text = String(h.notices.at(-1)[0]);
+  assert.match(text, /Preview: 1 tab would be ungrouped/);
+  assert.match(text, /Window 22: "Pi Agent"/);
+  assert.match(text, /ungroup tab 40 — adopted-user/);
+  assert.match(text, /skip\s+tab 41 — pi-target/);
+});
+
+test("/chrome groups repair confirms before applying, and names the count plus the untouched guarantee", async () => {
+  const applied = groupsPreview({ dryRun: false, ungroupedTabs: [40], groups: [{ ...groupsPreview().groups[0], groupDisposedAfter: true }] });
+  const h = harness({
+    confirmAnswers: [true],
+    send: (action, params) => (action === "groups.repair" && params.dryRun === false ? applied : groupsPreview()),
+  });
+  await h.run("groups repair");
+  assert.deepEqual(h.calls.map((call) => [call.action, call.params.dryRun]), [["groups.repair", true], ["groups.repair", false]]);
+  assert.equal(h.confirms.length, 1, "the user is asked exactly once");
+  assert.match(h.confirms[0].message, /1 tab in 1 stray Pi group will be ungrouped/);
+  assert.match(h.confirms[0].message, /Pages and tabs are untouched/);
+  assert.match(h.confirms[0].message, /nothing is navigated, moved or closed/);
+  const text = String(h.notices.at(-1)[0]);
+  assert.match(text, /Repaired 1 tab — pages and tabs were left in place/);
+  assert.match(text, /Every repaired group is gone/);
+});
+
+test("/chrome groups repair declines cleanly: no apply call happens without a confirmation", async () => {
+  const h = harness({
+    confirmAnswers: [false],
+    send: (action, params) => (action === "groups.repair" && params.dryRun === false ? groupsPreview({ dryRun: false }) : groupsPreview()),
+  });
+  await h.run("groups repair");
+  assert.deepEqual(h.calls.map((call) => call.params.dryRun), [true], "only the preview ran");
+  assert.match(String(h.notices.at(-1)[0]), /Cancelled — nothing was changed/);
+});
+
+test("/chrome groups repair says so plainly when there is nothing to repair", async () => {
+  const h = harness({ send: () => groupsPreview({ groups: [], skippedTabs: [] }) });
+  await h.run("groups repair");
+  assert.deepEqual(h.calls.map((call) => call.params.dryRun), [true]);
+  assert.equal(h.confirms.length, 0, "nothing to confirm means no dialog");
+  const text = String(h.notices.at(-1)[0]);
+  assert.match(text, /No stray Pi tab groups outside window 11/);
+  assert.match(text, /Nothing to repair/);
 });
