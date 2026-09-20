@@ -144,7 +144,7 @@ function makeChromeState() {
   tabs.set(userGmail.id, userGmail);
   tabs.set(userArticle.id, userArticle);
 
-  return { tabs, windows, groups, storage, alloc, userWindowId, userGmail, userArticle, events, pageContexts };
+  return { tabs, windows, groups, storage, localStorage: { piProfileId: "unittestprofile" }, alloc, userWindowId, userGmail, userArticle, events, pageContexts };
 }
 
 function makeChrome(state, { withWindows = true, withStorage = true, withTabGroups = false } = {}) {
@@ -305,6 +305,23 @@ function makeChrome(state, { withWindows = true, withStorage = true, withTabGrou
         // Chrome closes a window automatically when its final tab is removed.
         if (tab && ![...tabs.values()].some((other) => other.windowId === tab.windowId)) windows.delete(tab.windowId);
       },
+      // Real Chrome: moving a tab to another window keeps the tab (and its page) and DROPS it from its
+      // group, because a tab group cannot span windows. Both halves matter here: the move is how a pick
+      // must relocate a session's live target without losing the page, and the dropped group is why the
+      // mover regroups the tab afterwards.
+      move: async (ids, { windowId, index = -1 } = {}) => {
+        const list = Array.isArray(ids) ? ids : [ids];
+        const moved = [];
+        for (const id of list) {
+          const tab = tabs.get(id);
+          if (!tab) throw new Error(`No tab with id ${id}`);
+          if (!windows.has(windowId)) throw new Error(`No window with id ${windowId}`);
+          if (tab.windowId !== windowId) { tab.groupId = -1; tab.windowId = windowId; }
+          moved.push({ ...tab });
+        }
+        void index;
+        return Array.isArray(ids) ? moved : moved[0];
+      },
       group: async ({ groupId, tabIds = [] } = {}) => {
         let gid = groupId;
         if (typeof gid !== "number") {
@@ -330,6 +347,12 @@ function makeChrome(state, { withWindows = true, withStorage = true, withTabGrou
       session: {
         get: async (key) => (key in storage ? { [key]: storage[key] } : {}),
         set: async (obj) => { Object.assign(storage, obj); },
+      },
+      // Per-profile storage, so the worker can name its own connector key (`${browser}:${profileId}`).
+      // A window pick is scoped to the profile that made it, and that comparison needs a real id here.
+      local: {
+        get: async (key) => (key in state.localStorage ? { [key]: state.localStorage[key] } : {}),
+        set: async (obj) => { Object.assign(state.localStorage, obj); },
       },
     } : undefined,
   };
@@ -399,8 +422,19 @@ function loadWorker(chrome) {
 const SK = "session:alpha"; // a representative sessionKey
 
 // Convenience: a page action for a session that inherits `windowId` as its saved machine-wide default.
+// It carries the same grouping wire params the real Pi side injects for page.* actions
+// (sessionGroupTitle/joinSessionGroup), so a mock with tabGroups groups the target exactly like production
+// — which is what makes it recognisable as Pi's own tab to the pick's move/close guard.
 function navWith(w, url, sessionKey, preferredWindow, extra = {}) {
-  return w.dispatch("page.navigate", { url, waitUntilLoad: false, sessionKey, preferredWindow, ...extra });
+  return w.dispatch("page.navigate", {
+    url,
+    waitUntilLoad: false,
+    sessionKey,
+    preferredWindow,
+    sessionGroupTitle: "Pi Agent",
+    joinSessionGroup: true,
+    ...extra,
+  });
 }
 
 function assertNoCreation(state, label) {
@@ -547,11 +581,273 @@ async function run() {
     const again = await w.dispatch("window.select", { windowId: state.userWindowId, sessionKey: SK });
     ok(again.reused === true && again.tabId === selected.tabId, "explicit: re-selecting the current window reuses the guest tab");
 
-    // Selecting another existing window moves the guest tab there.
+    // Selecting another existing window moves the guest tab there — the tab is MOVED, not replaced:
+    // re-choosing a window must not throw away the page the session was working on, and the new window
+    // must be the only one holding Pi's tab afterwards.
     state.tabs.set(state.alloc.tab(), { id: state.tabs.size + 3, windowId: otherWindowId, url: "https://example.com/other", active: false, groupId: -1 });
     const moved = await w.dispatch("window.select", { windowId: otherWindowId, sessionKey: SK });
     ok(moved.windowId === otherWindowId && state.tabs.get(moved.tabId).windowId === otherWindowId, "explicit: re-selecting moves the assignment");
-    ok(!state.tabs.has(selected.tabId), "explicit: the old guest tab was retired, not left behind");
+    ok(moved.tabId === selected.tabId && moved.moved === true, "explicit: the guest tab itself moved, keeping its page");
+    ok(state.tabs.has(selected.tabId) && state.tabs.get(selected.tabId).windowId === otherWindowId && state.tabs.has(state.userArticle.id) && state.tabs.has(state.userGmail.id),
+      "explicit: the window it left holds only its own tabs again");
+    ok(state.windows.has(state.userWindowId), "explicit: the window it left is still open");
+  }
+
+  // ===== The machine-wide pick supersedes an assignment nobody ever picked. =====
+  // The live bug: a session (or the extension's own unscoped default bucket) had resolved a target inside
+  // the user's window before /chrome window was used, and the pick saved afterwards changed nothing — Pi
+  // kept driving the tab in the user's window while the picker marked another one. A record the implicit
+  // resolver created carries no pickedAt, so it is stale by definition; a record a human picked is not.
+  {
+    const state = makeChromeState();
+    const w = loadWorker(makeChrome(state, { withTabGroups: true }));
+    const otherWindowId = state.alloc.window();
+    state.windows.set(otherWindowId, { id: otherWindowId });
+
+    const before = await navWith(w, "https://pi.test/pre-pick", SK, state.userWindowId);
+    ok(before.windowId === state.userWindowId, "supersede: before the pick the session works where the default pointed");
+    const beforeStatus = await w.dispatch("automation.status", { sessionKey: SK });
+    ok(beforeStatus.windowId === state.userWindowId, "supersede: that implicit workspace is recorded");
+
+    // The user picks the other window. The pick is newer than the record, and the record was never picked.
+    const after = await navWith(w, "https://pi.test/post-pick", SK, otherWindowId, { preferredWindowAt: Date.now() });
+    ok(after.windowId === otherWindowId, "supersede: after the pick the same session works in the picked window");
+    ok(state.tabs.has(before.id), "supersede: the session's tab is MOVED, not destroyed — it may hold work");
+    ok(state.tabs.has(before.id) && state.tabs.get(before.id).windowId === otherWindowId, "supersede: the guest tab physically left the window the user moved away from");
+    ok(after.id === before.id, "supersede: the same tab is reused, so its page state survives the pick");
+    ok(state.tabs.has(before.id) && state.tabs.get(before.id).active === false, "supersede: moving it did not activate it");
+    const status = await w.dispatch("automation.status", { sessionKey: SK });
+    ok(status.windowId === otherWindowId && status.tabId === after.id, "supersede: the record now names the picked window");
+    ok(state.tabs.has(state.userGmail.id) && state.tabs.has(state.userArticle.id), "supersede: no user tab was touched");
+    assertNoCreation(state, "supersede");
+  }
+
+  // A pick belongs to the profile that made it. Window ids are per profile — the same number in another
+  // browser is a different window — so a keyed pick from another connector must not move this profile's
+  // sessions (nor name a window here that merely shares the number).
+  {
+    const state = makeChromeState();
+    const w = loadWorker(makeChrome(state));
+    const otherWindowId = state.alloc.window();
+    state.windows.set(otherWindowId, { id: otherWindowId });
+
+    const before = await navWith(w, "https://pi.test/foreign-pre", SK, state.userWindowId);
+    const ownKey = typeof w.selfClientKey === "function" ? await w.selfClientKey() : undefined;
+    ok(ownKey === "unknown:unittestprofile", `foreign-pick: the worker can name its own connector (got ${JSON.stringify(ownKey)})`);
+
+    const foreign = await navWith(w, "https://pi.test/foreign-post", SK, otherWindowId, { preferredWindowAt: Date.now(), preferredWindowKey: "edge:9d233ecf" });
+    ok(foreign.windowId === state.userWindowId && foreign.id === before.id,
+      "foreign-pick: another profile's pick does not move this profile's session");
+    ok(state.tabs.has(before.id) && state.tabs.get(before.id).windowId === state.userWindowId, "foreign-pick: nothing was moved or closed");
+
+    const mine = await navWith(w, "https://pi.test/own-post", SK, otherWindowId, { preferredWindowAt: Date.now(), preferredWindowKey: ownKey });
+    ok(mine.windowId === otherWindowId, "foreign-pick: a pick carrying this profile's own key still applies");
+    assertNoCreation(state, "foreign-pick");
+  }
+
+  // A pick saved by an older build has a window and no time. It must still beat an implicit assignment:
+  // the user's intent is newer than a record nobody picked, even when the file cannot prove when it was
+  // saved. This is exactly the live state (preferredWindow present, no preferredWindowAt).
+  {
+    const state = makeChromeState();
+    const w = loadWorker(makeChrome(state, { withTabGroups: true }));
+    const otherWindowId = state.alloc.window();
+    state.windows.set(otherWindowId, { id: otherWindowId });
+
+    const before = await navWith(w, "https://pi.test/legacy-pre", SK, state.userWindowId);
+    const after = await navWith(w, "https://pi.test/legacy-post", SK, otherWindowId);
+    ok(after.windowId === otherWindowId, "legacy-pick: an untimestamped pick still supersedes a record nobody picked");
+    ok(state.tabs.has(before.id) && state.tabs.get(before.id).windowId === otherWindowId, "legacy-pick: the stale guest tab was moved, not abandoned");
+    assertNoCreation(state, "legacy-pick");
+  }
+
+  // An explicit session pick is NOT disturbed by a machine-wide default that is older than it — the rule
+  // that keeps session-scoped choices meaningful, asserted with both times present.
+  {
+    const state = makeChromeState();
+    const w = loadWorker(makeChrome(state));
+    const otherWindowId = state.alloc.window();
+    state.windows.set(otherWindowId, { id: otherWindowId });
+
+    const selected = await w.dispatch("window.select", { windowId: state.userWindowId, sessionKey: SK });
+    const nav = await navWith(w, "https://pi.test/explicit-newer", SK, otherWindowId, { preferredWindowAt: Date.now() - 60_000 });
+    ok(nav.windowId === state.userWindowId && nav.id === selected.tabId,
+      "supersede: an explicit pick newer than the machine-wide one still wins");
+  }
+
+  // The reverse, and the reason the pick time exists: a NEWER machine-wide pick moves even a session that
+  // had picked for itself. "Pick a window once; Pi remembers it machine-wide" has to mean the pick wins.
+  {
+    const state = makeChromeState();
+    const w = loadWorker(makeChrome(state));
+    const otherWindowId = state.alloc.window();
+    state.windows.set(otherWindowId, { id: otherWindowId });
+
+    const selected = await w.dispatch("window.select", { windowId: state.userWindowId, sessionKey: SK });
+    const nav = await navWith(w, "https://pi.test/machine-newer", SK, otherWindowId, { preferredWindowAt: Date.now() + 60_000 });
+    ok(nav.windowId === otherWindowId, "supersede: a newer machine-wide pick moves even an explicitly picked session");
+    ok(nav.id === selected.tabId && state.tabs.has(selected.tabId) && state.tabs.get(selected.tabId).windowId === otherWindowId,
+      "supersede: the superseded session's tab moves with it instead of losing its page");
+    assertNoCreation(state, "supersede-newer");
+  }
+
+  // ===== The pick itself is applied to every record it supersedes, on that action rather than later. =====
+  // This is what the user actually sees: Pi's tabs must leave their window the moment they choose another
+  // one, instead of lingering until each abandoned session happens to run again.
+  {
+    const state = makeChromeState();
+    const w = loadWorker(makeChrome(state, { withTabGroups: true }));
+    const otherWindowId = state.alloc.window();
+    state.windows.set(otherWindowId, { id: otherWindowId });
+
+    const a = await navWith(w, "https://pi.test/debris-a", "session:a", state.userWindowId);
+    const b = await navWith(w, "https://pi.test/debris-b", "session:b", state.userWindowId);
+    ok(a.windowId === state.userWindowId && b.windowId === state.userWindowId, "sweep: two sessions are working in the user's window");
+
+    const picked = await w.dispatch("window.select", { windowId: otherWindowId, sessionKey: "session:c" });
+    ok(picked.windowId === otherWindowId, "sweep: the pick is recorded for the picking session");
+    ok(typeof picked.pickedAt === "number", "sweep: the pick reports the stamp it wrote, so the Pi side saves the same one");
+    ok(picked.swept === 2, "sweep: the pick reports how many other sessions it moved");
+    ok(state.tabs.has(a.id) && state.tabs.has(b.id) && state.tabs.get(a.id).windowId === otherWindowId && state.tabs.get(b.id).windowId === otherWindowId,
+      "sweep: guest tabs left in the window the user moved away from are moved by the pick itself");
+    ok(state.tabs.has(a.id) && state.tabs.has(b.id) && state.tabs.get(a.id).url === "https://pi.test/debris-a" && state.tabs.get(b.id).url === "https://pi.test/debris-b",
+      "sweep: those tabs keep their pages — a pick moves Pi's workspace, it does not discard work");
+    const statusA = await w.dispatch("automation.status", { sessionKey: "session:a" });
+    ok(statusA.windowId === otherWindowId && statusA.tabId === a.id, "sweep: the abandoned session is re-pointed at its moved tab");
+    const nextA = await navWith(w, "https://pi.test/debris-a-2", "session:a", otherWindowId, { preferredWindowAt: Date.now() });
+    ok(nextA.windowId === otherWindowId && nextA.id === a.id, "sweep: that session's next action reuses the moved tab");
+    ok(state.tabs.has(state.userGmail.id) && state.tabs.has(state.userArticle.id), "sweep: no user tab was closed");
+    assertNoCreation(state, "sweep-pick");
+  }
+
+  // The guest tabs belonging to other sessions survive a worker restart with their pick time, so a later
+  // machine-wide pick still compares against when a human chose them rather than treating them as unpicked.
+  {
+    const state = makeChromeState();
+    const first = loadWorker(makeChrome(state));
+    const picked = await first.dispatch("window.select", { windowId: state.userWindowId, sessionKey: SK });
+    ok(typeof picked.pickedAt === "number", "durable-pick: window.select stamps the record");
+    const persisted = state.storage.piChromeAutomationTargets || {};
+    ok(persisted[SK] && persisted[SK].pickedAt === picked.pickedAt, "durable-pick: the stamp is persisted, not just kept in memory");
+
+    // A fresh worker over the same browser state (extension reload) hydrates the record.
+    const otherWindowId = state.alloc.window();
+    state.windows.set(otherWindowId, { id: otherWindowId });
+    const second = loadWorker(makeChrome(state));
+    const nav = await navWith(second, "https://pi.test/durable", SK, otherWindowId, { preferredWindowAt: picked.pickedAt - 60_000 });
+    ok(nav.windowId === state.userWindowId && nav.id === picked.tabId,
+      "durable-pick: the hydrating worker still knows this session picked for itself");
+  }
+
+  // An explicit url/title hint is not a way back into a window the pick replaced: the recorded tab is
+  // moved into the picked window first, and the hint then resolves to it THERE (the session's own recorded
+  // identity wins, but only after the move that the pick requires).
+  {
+    const state = makeChromeState();
+    const w = loadWorker(makeChrome(state, { withTabGroups: true }));
+    const otherWindowId = state.alloc.window();
+    state.windows.set(otherWindowId, { id: otherWindowId });
+
+    const stale = await navWith(w, "https://pi.test/hinted", SK, state.userWindowId);
+    const probed = await w.dispatch("page.snapshot", { urlIncludes: "pi.test/hinted", sessionKey: SK, preferredWindow: otherWindowId, preferredWindowAt: Date.now() });
+    ok(Boolean(probed), "hint: an explicit hint still resolves after the pick");
+    ok(state.tabs.has(stale.id) && state.tabs.get(stale.id).windowId === otherWindowId, "hint: the hint resolved to the tab MOVED into the picked window");
+    const status = await w.dispatch("automation.status", { sessionKey: SK });
+    ok(status.windowId === otherWindowId && status.tabId === stale.id, "hint: the record names the moved tab, not a dead id");
+    assertNoCreation(state, "hint");
+  }
+
+  // A pick whose window is GONE is refused before anything is touched: the session keeps its working tab
+  // and the error names the fix. Stale picks are the normal case after a browser restart (window ids do not
+  // survive it), so destroying the live tab first and failing afterwards would be the worst ordering.
+  {
+    const state = makeChromeState();
+    const w = loadWorker(makeChrome(state));
+    const before = await navWith(w, "https://pi.test/dead-pick-pre", SK, state.userWindowId);
+    const pickedAt = Date.now();
+    state.windows.delete(state.userWindowId); // the user closes the window the record lives in
+    for (const [tid, t] of [...state.tabs]) if (t.windowId === state.userWindowId) state.tabs.delete(tid);
+    const reopened = state.alloc.window();
+    state.windows.set(reopened, { id: reopened });
+    const survivor = await navWith(w, "https://pi.test/dead-pick", SK, reopened, { preferredWindowAt: pickedAt });
+    ok(survivor.windowId === reopened, "dead-pick: the session rebuilds in the live window");
+    ok(!state.tabs.has(before.id), "dead-pick: the tab in the closed window went with it");
+
+    // Now: the record names `reopened`, and the saved pick names a window that does not exist.
+    const deadPick = 987654321;
+    await throwsWith(
+      () => navWith(w, "https://pi.test/dead-pick-2", SK, deadPick, { preferredWindowAt: Date.now() + 1000 }),
+      /no longer open|\/chrome window/,
+      "dead-pick: a pick naming a closed window fails with the fix named",
+    );
+    ok(state.tabs.has(survivor.id), "dead-pick: the session's working tab was NOT destroyed before the check");
+    assertNoCreation(state, "dead-pick");
+  }
+
+  // A record alone does not prove a tab is Pi's. A tab whose only "evidence" is the record — navigated away
+  // from about:blank, not in a Pi group, not in a Pi-created window — is left exactly where it is, and only
+  // the record is re-pointed. That is deliberate: a corrupt or hand-edited record must not make a pick
+  // relocate or close one of the user's own tabs. The cost is bounded — a fresh target opens in the picked
+  // window and the unprovable tab stays where the user can see it.
+  {
+    const state = makeChromeState();
+    const w = loadWorker(makeChrome(state)); // no tabGroups: the navigated target cannot be grouped
+    const otherWindowId = state.alloc.window();
+    state.windows.set(otherWindowId, { id: otherWindowId });
+
+    const before = await navWith(w, "https://pi.test/unprovable", SK, state.userWindowId);
+    const nav = await navWith(w, "https://pi.test/unprovable-2", SK, otherWindowId, { preferredWindowAt: Date.now() });
+    ok(nav.windowId === otherWindowId, "unprovable: the session still moves to the picked window");
+    ok(state.tabs.has(before.id) && state.tabs.get(before.id).windowId === state.userWindowId,
+      "unprovable: the unprovable tab was neither moved nor closed");
+    ok(nav.id !== before.id, "unprovable: a fresh target was opened in the picked window instead");
+    ok(state.tabs.has(state.userGmail.id) && state.tabs.has(state.userArticle.id), "unprovable: no user tab was touched");
+    assertNoCreation(state, "unprovable");
+  }
+
+  // An explicit targetId — how an agent usually addresses its own tab — is subject to the same pick: the tab
+  // is moved into the picked window first, so an id cannot keep driving a window the user moved away from.
+  {
+    const state = makeChromeState();
+    const w = loadWorker(makeChrome(state, { withTabGroups: true }));
+    const otherWindowId = state.alloc.window();
+    state.windows.set(otherWindowId, { id: otherWindowId });
+
+    const own = await navWith(w, "https://pi.test/by-id", SK, state.userWindowId);
+    const evaluated = await w.dispatch("page.evaluate", {
+      expression: "1+1",
+      sessionKey: SK,
+      targetId: own.id,
+      preferredWindow: otherWindowId,
+      preferredWindowAt: Date.now(),
+    });
+    ok(Boolean(evaluated), "targetId: the action ran");
+    ok(state.tabs.has(own.id) && state.tabs.get(own.id).windowId === otherWindowId,
+      "targetId: the session's own tab was moved into the picked window instead of being driven where it was");
+    assertNoCreation(state, "targetId");
+  }
+
+  // The profile filter is not just about moving tabs: with no assignment yet, a pick belonging to another
+  // connector must not be used as a window id here either (the same number names a different window in this
+  // profile). It refuses cleanly, and nothing is created or moved.
+  {
+    const state = makeChromeState();
+    const w = loadWorker(makeChrome(state));
+    const otherWindowId = state.alloc.window();
+    state.windows.set(otherWindowId, { id: otherWindowId });
+    const ownKey = typeof w.selfClientKey === "function" ? await w.selfClientKey() : undefined;
+
+    await throwsWith(
+      () => navWith(w, "https://pi.test/foreign-none", "session:none", otherWindowId, { preferredWindowAt: Date.now(), preferredWindowKey: "chrome:deadbeef" }),
+      /\/chrome window/,
+      "foreign-pick: with no assignment, another profile's pick refuses with the fix named",
+    );
+    ok(state.tabs.size === 2, "foreign-pick: no tab was created for the foreign window id");
+    ok(state.tabs.has(state.userArticle.id) && state.tabs.has(state.userGmail.id), "foreign-pick: no user tab was touched");
+
+    const mine = await navWith(w, "https://pi.test/own-none", "session:none", otherWindowId, { preferredWindowAt: Date.now(), preferredWindowKey: ownKey });
+    ok(mine.windowId === otherWindowId, "foreign-pick: this profile's own key is accepted and used");
+    assertNoCreation(state, "foreign-pick");
   }
 
   // ===== Cleanup closes only Pi's guest tab, never the window the user chose, and is idempotent. =====

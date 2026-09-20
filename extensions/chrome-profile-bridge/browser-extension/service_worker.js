@@ -153,6 +153,7 @@ async function hydrateAutomationTargets() {
             windowId: typeof value.windowId === "number" ? value.windowId : undefined,
             tabId: typeof value.tabId === "number" ? value.tabId : undefined,
             piWindow,
+            pickedAt: typeof value.pickedAt === "number" && Number.isFinite(value.pickedAt) ? value.pickedAt : undefined,
           });
           if (piWindow && typeof value.windowId === "number") piCreatedWindowIds.add(value.windowId);
         }
@@ -252,6 +253,9 @@ async function persistAutomationTargets() {
         tabId: typeof value.tabId === "number" ? value.tabId : null,
         windowId: typeof value.windowId === "number" ? value.windowId : null,
         piWindow: value.piWindow === true,
+        // When a human chose this window with /chrome window. Absent means "no one ever picked this",
+        // which is what lets a later machine-wide pick supersede it (see supersededByMachinePick).
+        pickedAt: typeof value.pickedAt === "number" ? value.pickedAt : null,
       };
     }
     await chrome.storage?.session?.set?.({ [AUTOMATION_STORAGE_KEY]: obj });
@@ -265,6 +269,176 @@ async function persistAutomationTargets() {
 // itself once it is cleaned up or retargeted, must not make a live Pi window unrecognizable.
 function isPiOwnedWindow(windowId) {
   return typeof windowId === "number" && piCreatedWindowIds.has(windowId);
+}
+
+// The connector key of THIS profile as the bridge names connectors (`${browser}:${profileId}`). A window
+// pick is made for the profile the user was looking at, and window ids are per profile — the same number
+// in another browser or profile is a DIFFERENT window — so a pick carrying another profile's key is not
+// ours to act on. Cached: one storage read per worker lifetime.
+let selfClientKeyPromise;
+function selfClientKey() {
+  selfClientKeyPromise ??= (async () => {
+    const profileId = await getProfileId().catch(() => "");
+    // No id (storage unavailable): the caller must accept the pick rather than refuse to work at all.
+    return profileId ? `${BROWSER_FAMILY}:${profileId}` : "";
+  })();
+  return selfClientKeyPromise;
+}
+
+// The machine-wide window the user chose with /chrome window, as it arrived on this command: the id they
+// picked, when they picked it, and which connector they picked it in. Every field is optional and
+// validated here — a bad value must never decide where Pi works. Returns null when the pick is not
+// usable here, which callers treat as "no pick": a per-session assignment keeps working, and a session
+// with none fails with the /chrome window message instead of guessing.
+async function machineWindowPick(params) {
+  const windowId = params && typeof params.preferredWindow === "number" && Number.isInteger(params.preferredWindow)
+    ? params.preferredWindow
+    : null;
+  if (windowId === null) return null;
+  const at = params && typeof params.preferredWindowAt === "number" && Number.isFinite(params.preferredWindowAt)
+    ? params.preferredWindowAt
+    : null;
+  const key = params && typeof params.preferredWindowKey === "string" && params.preferredWindowKey
+    ? params.preferredWindowKey
+    : null;
+  if (key !== null) {
+    const own = await selfClientKey();
+    if (own && own !== key) return null;
+  }
+  return { windowId, at };
+}
+
+// A pick is only usable when its window is really open HERE. Checked before anything is retired: a stale
+// pick (a window id from a browser session that has since ended) must fail loudly, not destroy the
+// session's working tab and then fail.
+async function pickWindowIsOpen(windowId) {
+  if (typeof windowId !== "number") return false;
+  if (!chrome.windows || typeof chrome.windows.get !== "function") return true; // tabs.create is the check
+  return Boolean(await chrome.windows.get(windowId).catch(() => null));
+}
+
+// The machine-wide pick as it travels into the resolver from a command's params. Kept in one place so a
+// new pick field cannot reach some paths and not others (the profile key did exactly that).
+function machinePickParams(params) {
+  return {
+    preferredWindow: params ? params.preferredWindow : undefined,
+    preferredWindowAt: params ? params.preferredWindowAt : undefined,
+    preferredWindowKey: params ? params.preferredWindowKey : undefined,
+  };
+}
+
+const SAVED_WINDOW_GONE =
+  "pi-chrome will not silently use a different window, create one, or fall back to the focused window.";
+
+// True when the machine-wide pick replaces this session's recorded workspace.
+//
+// The rule the live bug needed: a record that points somewhere else loses to the pick when nobody ever
+// picked that record's window (`pickedAt` absent — the implicit resolver made it, or an older build
+// wrote it), or when the pick is newer than the session's own pick. An explicit session pick is NOT
+// disturbed: "the session's own assignment beats the saved default" still holds, which is what keeps
+// session-scoped choices meaningful. What dies here is the sticky record that made a pick in one session
+// invisible in every other one — the user chose their window, and Pi still drove a tab in a window they
+// had not chosen (their own, in the live report).
+function supersededByMachinePick(record, pick) {
+  if (!pick || !record || typeof record.windowId !== "number") return false;
+  if (record.windowId === pick.windowId) return false;
+  if (typeof record.pickedAt !== "number") return true;
+  return typeof pick.at === "number" && record.pickedAt < pick.at;
+}
+
+// True when a tab recorded as a session's target is provably Pi's own, so closing it cannot lose user
+// work. Used as a guard: a corrupted or hand-edited record must not turn a pick into "delete that tab id".
+function isPiRemovableTarget(tab) {
+  if (!tab || typeof tab.id !== "number") return false;
+  if (isPiChromeOwnedTarget(tab.id)) return true; // recorded by a session (this one, before the rewrite)
+  if (isPiMarkerTab(tab)) return true; // legacy #pi-chrome target
+  return String(tab.url || "") === BLANK_AUTOMATION_URL; // a plain automation target
+}
+
+// The stronger predicate a machine-wide pick uses before it MOVES or CLOSES a tab. "A record names it" is
+// not enough here: the record is the claim under test, and it cannot corroborate itself. Evidence that
+// stands on its own: a plain about:blank target (how every automation tab starts), a legacy #pi-chrome
+// marker, a window an earlier Pi build created for Pi, or a tab sitting in a "Pi Agent" group (Pi groups
+// every page action it drives, so a live target is grouped). A tab that matches none of these is left
+// exactly where it is and only the record is re-pointed — so a corrupt or hand-edited record cannot make a
+// pick relocate or close one of the user's own tabs. The cost is bounded: Pi then opens a fresh target in
+// the picked window and the unprovable tab stays where the user can see and close it.
+async function isPiRelocatableTarget(tab) {
+  if (!tab || typeof tab.id !== "number") return false;
+  if (String(tab.url || "") === BLANK_AUTOMATION_URL) return true;
+  if (isPiMarkerTab(tab)) return true;
+  if (typeof tab.windowId === "number" && isPiOwnedWindow(tab.windowId)) return true;
+  if (typeof tab.groupId === "number" && tab.groupId >= 0) {
+    const group = await groupRecord(tab.groupId).catch(() => null);
+    const title = group && typeof group.title === "string" ? group.title.trim() : "";
+    if (title && PI_GROUP_RE.test(title)) return true;
+  }
+  return false;
+}
+
+// Heal a legacy marker target after it is adopted or moved: about:blank#pi-chrome cannot be attached (see
+// BLANK_AUTOMATION_URL), and tabs.update needs no debugger. Only ever applied to a marker tab, which is
+// always a blank page, so nothing of the user's is navigated away.
+async function healMarkerTab(tab) {
+  if (!tab || typeof tab.id !== "number" || !isPiMarkerTab(tab)) return tab;
+  return (await chrome.tabs.update(tab.id, { url: BLANK_AUTOMATION_URL }).catch(() => null)) || tab;
+}
+
+// A cross-window move takes a tab out of its group (Chrome groups cannot span windows). Regroup it in the
+// window it landed in, so Pi's tab stays visibly Pi's; cosmetic, so a failure is swallowed.
+async function regroupMovedTarget(tab) {
+  try {
+    const live = await chrome.tabs.get(tab.id).catch(() => null);
+    if (!live || typeof live.groupId !== "number" || live.groupId >= 0) return;
+    await groupTab(live, PI_GROUP_NAME, DEFAULT_GROUP_COLOR);
+  } catch {
+    // Grouping is cosmetic; it must never fail the move.
+  }
+}
+
+// Apply one machine-wide pick to a session's recorded workspace: MOVE the guest tab Pi was using into the
+// picked window when it can be moved, and only close it when it provably cannot. Moving is deliberate —
+// the tab holds real work (a half-filled form, a logged-in page an agent is mid-way through), and a pick
+// must move Pi's workspace without throwing that away; it also removes Pi's presence from the window the
+// user is leaving, which is the visible half of the bug. A tab we cannot prove is ours is never touched.
+// Returns true when it changed the map.
+async function retargetSupersededRecord(sessionKey, record, pick) {
+  const pickedAt = typeof pick.at === "number" ? pick.at : record.pickedAt;
+  const tab = typeof record.tabId === "number" ? await chrome.tabs.get(record.tabId).catch(() => null) : null;
+  const owned = tab ? await isPiRelocatableTarget(tab) : false;
+  if (owned && tab.windowId !== pick.windowId) {
+    const moved = await chrome.tabs.move(tab.id, { windowId: pick.windowId, index: -1 }).catch(() => null);
+    if (moved && typeof moved.id === "number") {
+      const healed = await healMarkerTab(moved);
+      await regroupMovedTarget(healed);
+      automationTargets.set(sessionKey, {
+        windowId: pick.windowId,
+        tabId: healed.id,
+        piWindow: isPiOwnedWindow(pick.windowId),
+        pickedAt,
+      });
+      return true;
+    }
+  } else if (owned && tab.windowId === pick.windowId) {
+    // Already in the picked window: keep it, and keep the record honest about it.
+    automationTargets.set(sessionKey, {
+      windowId: pick.windowId,
+      tabId: tab.id,
+      piWindow: isPiOwnedWindow(pick.windowId),
+      pickedAt,
+    });
+    return true;
+  }
+  // A tab that cannot be moved AND is provably Pi's alone is closed; a record naming anything else (a
+  // corrupted or hand-edited one) is only re-pointed, because guessing there could move or close a user's
+  // tab. Without a move, the record drops the id: the next action rebuilds in the picked window.
+  if (owned) await chrome.tabs.remove(tab.id).catch(() => {});
+  automationTargets.set(sessionKey, {
+    windowId: pick.windowId,
+    piWindow: isPiOwnedWindow(pick.windowId),
+    pickedAt,
+  });
+  return true;
 }
 
 // True if `tabId` is a pi-chrome-owned automation tab. Pass `sessionKey` to check a specific
@@ -293,13 +467,42 @@ function isPiChromeOwnedTarget(tabId, sessionKey) {
 // every window let a leftover group in a window the user owns capture a target recreated after an
 // extension reload (the target lives in chrome.storage.session, which an extension reload clears).
 // Groups are chosen later, scoped to the target's own window, by groupTab.
-async function createAutomationTarget(sessionKey, groupTitle, { preferredWindow } = {}) {
+async function createAutomationTarget(sessionKey, groupTitle, { preferredWindow, preferredWindowAt, preferredWindowKey } = {}) {
   // Hydrate here rather than relying on callers: the workspace is decided from hydrated state, and a
   // direct caller with a cold map would mistake a persisted assignment for "no assignment".
   await hydrateAutomationTargets();
-  const record = automationTargets.get(sessionKey);
+  const pick = await machineWindowPick({ preferredWindow, preferredWindowAt, preferredWindowKey });
+  let record = automationTargets.get(sessionKey);
+  // A record the machine-wide pick supersedes is no longer this session's workspace. Retire its tab and
+  // re-point it BEFORE the workspace is read from the record, so the pick decides where this action runs
+  // — instead of the stale assignment silently winning because it happened to exist. The pick's window is
+  // checked FIRST: a stale pick (an id from a browser session that has ended) must fail loudly, not move
+  // the session out of a window it was working in and then fail.
+  if (record && supersededByMachinePick(record, pick)) {
+    if (!(await pickWindowIsOpen(pick.windowId))) {
+      throw new Error(
+        `The saved browser window ${pick.windowId} is no longer open. Run /chrome window to choose ` +
+          `another window. ${SAVED_WINDOW_GONE}`,
+      );
+    }
+    await retargetSupersededRecord(sessionKey, record, pick);
+    await persistAutomationTargets();
+    record = automationTargets.get(sessionKey);
+    // The retarget MOVED the session's tab into the picked window (or re-pointed the record when there was
+    // nothing to move). A live target that already sits in the picked window IS this session's workspace —
+    // creating another tab here would churn a tab and orphan the one that just kept the agent's page.
+    const survivor = record && typeof record.tabId === "number" ? await chrome.tabs.get(record.tabId).catch(() => null) : null;
+    if (survivor && typeof survivor.windowId === "number" && survivor.windowId === pick.windowId) return survivor;
+  }
   const recordedWindowId = record && typeof record.windowId === "number" ? record.windowId : null;
   if (recordedWindowId !== null) {
+    // A live recorded tab in the recorded window IS this session's workspace: reuse it instead of creating
+    // another one. That covers a supersede that just MOVED the tab here (the record names it already), and
+    // any direct caller whose tab is alive — churning a tab would throw away the page it holds.
+    const recordedTab = record && typeof record.tabId === "number" ? await chrome.tabs.get(record.tabId).catch(() => null) : null;
+    if (recordedTab && typeof recordedTab.windowId === "number" && recordedTab.windowId === recordedWindowId) {
+      return recordedTab;
+    }
     const piWindow = record.piWindow === true || isPiOwnedWindow(recordedWindowId);
     // A recorded Pi window whose own tab is gone may still hold an unowned legacy marker from a
     // wiped record; adopt it instead of adding yet another tab to the shared window.
@@ -311,9 +514,10 @@ async function createAutomationTarget(sessionKey, groupTitle, { preferredWindow 
         // it unmodified would hand out the un-attachable target this change exists to remove.
         // tabs.update needs no debugger attach. If the update fails the tab is gone, so fall through
         // and create a fresh target instead of adopting a dead one.
-        const healed = await chrome.tabs.update(reusable.id, { url: BLANK_AUTOMATION_URL }).catch(() => null);
-        if (healed && typeof healed.id === "number") {
-          automationTargets.set(sessionKey, { windowId: recordedWindowId, tabId: reusable.id, piWindow: true });
+        const healed = await healMarkerTab(reusable);
+        if (healed && typeof healed.id === "number" && healed.id === reusable.id) {
+          // Keep the session's own pick time: adopting a tab does not change who chose the window.
+          automationTargets.set(sessionKey, { windowId: recordedWindowId, tabId: reusable.id, piWindow: true, pickedAt: record.pickedAt });
           await persistAutomationTargets();
           return healed;
         }
@@ -322,7 +526,7 @@ async function createAutomationTarget(sessionKey, groupTitle, { preferredWindow 
     // Creating the tab is also the existence check: Chrome rejects a windowId whose window is gone.
     const created = await chrome.tabs.create({ url: BLANK_AUTOMATION_URL, active: false, windowId: recordedWindowId }).catch((error) => error);
     if (created && typeof created.id === "number") {
-      automationTargets.set(sessionKey, { windowId: recordedWindowId, tabId: created.id, piWindow });
+      automationTargets.set(sessionKey, { windowId: recordedWindowId, tabId: created.id, piWindow, pickedAt: record.pickedAt });
       await persistAutomationTargets();
       return created;
     }
@@ -335,14 +539,16 @@ async function createAutomationTarget(sessionKey, groupTitle, { preferredWindow 
         `window, create one, or fall back to the focused window.`,
     );
   }
-  // No per-session assignment. The only source that may decide the workspace now is the machine-wide
-  // default the user saved with /chrome window. Absent or unusable, this refuses: creating a window
-  // here is the exact behaviour this feature removed.
-  if (typeof preferredWindow !== "number" || !Number.isInteger(preferredWindow)) {
+  // No per-session assignment. Only the machine-wide pick may decide the workspace now — and only when it
+  // is usable HERE. `pick` is null both when no window was chosen and when the pick belongs to ANOTHER
+  // connector, whose window ids name a different window in this profile (or nothing at all); acting on its
+  // id here would put Pi's tab in a window the user never chose. Absent or unusable, this refuses:
+  // creating a window here is the exact behaviour this feature removed.
+  if (!pick) {
     throw new Error(
-      "No browser window has been chosen for Pi yet. Run /chrome window to pick one of your open " +
-        "browser windows (the choice is saved for future sessions). pi-chrome will not create a window, " +
-        "use the focused window, or put a tab in a window you did not choose.",
+      "No browser window has been chosen for Pi in this browser profile yet. Run /chrome window to pick " +
+        "one of your open browser windows (the choice is saved for future sessions). pi-chrome will not " +
+        "create a window, use the focused window, or put a tab in a window you did not choose.",
     );
   }
   // Check the saved window while the API is available, so a stale default fails with a message that
@@ -350,22 +556,22 @@ async function createAutomationTarget(sessionKey, groupTitle, { preferredWindow 
   // explicit-window tabs.create below is still the existence check. Either way the tab carries an
   // explicit windowId, so there is no path where Chrome picks the focused window for us.
   if (chrome.windows && typeof chrome.windows.get === "function") {
-    const savedWindow = await chrome.windows.get(preferredWindow).catch(() => null);
+    const savedWindow = await chrome.windows.get(pick.windowId).catch(() => null);
     if (!savedWindow) {
       throw new Error(
-        `The saved browser window ${preferredWindow} is no longer open. Run /chrome window to choose ` +
-          `another one. pi-chrome will not silently use a different window, create one, or fall back to the focused window.`,
+        `The saved browser window ${pick.windowId} is no longer open. Run /chrome window to choose ` +
+          `another window. ${SAVED_WINDOW_GONE}`,
       );
     }
   }
-  const created = await chrome.tabs.create({ url: BLANK_AUTOMATION_URL, active: false, windowId: preferredWindow }).catch((error) => error);
+  const created = await chrome.tabs.create({ url: BLANK_AUTOMATION_URL, active: false, windowId: pick.windowId }).catch((error) => error);
   if (!created || typeof created.id !== "number") {
     throw new Error(
-      `Chrome refused to open Pi's tab in window ${preferredWindow} (${String(created?.message || created)}). ` +
+      `Chrome refused to open Pi's tab in window ${pick.windowId} (${String(created?.message || created)}). ` +
         `Run /chrome window to choose a window, then retry.`,
     );
   }
-  automationTargets.set(sessionKey, { windowId: preferredWindow, tabId: created.id, piWindow: isPiOwnedWindow(preferredWindow) });
+  automationTargets.set(sessionKey, { windowId: pick.windowId, tabId: created.id, piWindow: isPiOwnedWindow(pick.windowId), pickedAt: typeof pick.at === "number" ? pick.at : undefined });
   await persistAutomationTargets();
   return created;
 }
@@ -442,10 +648,23 @@ async function findReusableOrphanAutomationTab(windowId) {
 // Return the session's owned automation target if it still exists, else null. Robust to the user
 // (or Chrome) having closed it: the dead tab id is forgotten but the recorded window is kept — it
 // is the session's setting, so the caller rebuilds there (or fails naming it) instead of drifting.
-async function resolveOwnedAutomationTarget(sessionKey) {
+async function resolveOwnedAutomationTarget(sessionKey, pick) {
   await hydrateAutomationTargets();
   const t = automationTargets.get(sessionKey);
   if (!t || typeof t.tabId !== "number") return null;
+  // A superseded record must not be handed out: its tab is in a window the user has replaced with their
+  // pick, and driving it there is precisely "Pi is still using my window". Retire it and report "no
+  // target", so the caller rebuilds in the picked window on this very action. A pick whose window is gone
+  // is left alone here — nothing is destroyed, and the caller's own existence check reports the fix.
+  if (supersededByMachinePick(t, pick)) {
+    // A pick whose window is gone is not used AND the window it superseded is not kept: this session is
+    // told to re-pick (the caller's own check throws, naming the fix) instead of quietly continuing in a
+    // window the user moved away from. Nothing is destroyed here — the tab is left for the re-pick to move.
+    if (!(await pickWindowIsOpen(pick.windowId))) return null;
+    await retargetSupersededRecord(sessionKey, t, pick);
+    await persistAutomationTargets();
+    return null;
+  }
   const existing = await chrome.tabs.get(t.tabId).catch(() => null);
   if (existing && typeof existing.id === "number") {
     // A recorded target must still be in the window the record names. If the user dragged it
@@ -453,8 +672,25 @@ async function resolveOwnedAutomationTarget(sessionKey) {
     // back in a window it was not told to use. Retire the tab and let the caller rebuild in the
     // recorded window.
     if (typeof t.windowId === "number" && existing.windowId !== t.windowId) {
+      // The tab sits in the window the machine-wide pick names: that is a move whose record write was
+      // interrupted (worker restart mid-retarget), not a tab the user dragged away. Re-point instead of
+      // destroying it — the tab holds the agent's page, and the pick is the reason it moved.
+      if (pick && existing.windowId === pick.windowId && isPiRemovableTarget(existing)) {
+        automationTargets.set(sessionKey, {
+          windowId: pick.windowId,
+          tabId: existing.id,
+          piWindow: isPiOwnedWindow(pick.windowId),
+          pickedAt: typeof t.pickedAt === "number" ? t.pickedAt : undefined,
+        });
+        await persistAutomationTargets();
+        return existing;
+      }
+      // A recorded target must still be in the window the record names. If the user dragged it
+      // elsewhere, the record no longer describes where it lives, and driving it there would put Pi
+      // back in a window it was not told to use. Retire the tab and let the caller rebuild in the
+      // recorded window.
       await chrome.tabs.remove(existing.id).catch(() => {});
-      automationTargets.set(sessionKey, { windowId: t.windowId, piWindow: t.piWindow });
+      automationTargets.set(sessionKey, { windowId: t.windowId, piWindow: t.piWindow, pickedAt: t.pickedAt });
       await persistAutomationTargets();
       return null;
     }
@@ -463,7 +699,7 @@ async function resolveOwnedAutomationTarget(sessionKey) {
   // The tab is gone (the user closed Pi's tab, or its window closed with it). Drop the dead id but
   // keep the recorded window so the replacement is rebuilt there, or the failure names it.
   if (typeof t.windowId === "number") {
-    automationTargets.set(sessionKey, { windowId: t.windowId, piWindow: t.piWindow });
+    automationTargets.set(sessionKey, { windowId: t.windowId, piWindow: t.piWindow, pickedAt: t.pickedAt });
   } else {
     automationTargets.delete(sessionKey);
   }
@@ -489,8 +725,9 @@ async function movedAutomationTargetError(tab, sessionKey) {
   if (!record || typeof record.windowId !== "number" || record.windowId === tab.windowId) return null;
   await chrome.tabs.remove(tab.id).catch(() => {});
   // Keep the recorded window: it is the session's setting, so the next untargeted action rebuilds
-  // there (or fails naming a gone user window) instead of drifting to another window.
-  automationTargets.set(ownerKey, { windowId: record.windowId, piWindow: record.piWindow });
+  // there (or fails naming a gone user window) instead of drifting to another window. The pick time is
+  // part of that setting: rewriting the record must not turn an explicit pick into "nobody picked this".
+  automationTargets.set(ownerKey, { windowId: record.windowId, piWindow: record.piWindow, pickedAt: record.pickedAt });
   await persistAutomationTargets();
   return (
     `Pi's automation tab ${tab.id} was moved out of its own window (it is in window ${tab.windowId}, ` +
@@ -514,8 +751,9 @@ async function withResolvedWindowId(tab) {
 // Used by page/navigation actions that need a live surface to drive. The target is built only in the
 // session's recorded window or the machine-wide default; an implicit action never ends up in a window
 // Chrome picks for us (see createAutomationTarget).
-async function getOrCreateAutomationTarget(sessionKey, groupTitle, { preferredWindow } = {}) {
-  const target = (await resolveOwnedAutomationTarget(sessionKey)) || await createAutomationTarget(sessionKey, groupTitle, { preferredWindow });
+async function getOrCreateAutomationTarget(sessionKey, groupTitle, { preferredWindow, preferredWindowAt, preferredWindowKey } = {}) {
+  const pick = await machineWindowPick({ preferredWindow, preferredWindowAt, preferredWindowKey });
+  const target = (await resolveOwnedAutomationTarget(sessionKey, pick)) || await createAutomationTarget(sessionKey, groupTitle, { preferredWindow, preferredWindowAt, preferredWindowKey });
   return withResolvedWindowId(target);
 }
 
@@ -1683,6 +1921,23 @@ async function groupTab(tab, title, color) {
   return { tab: await formatTab(grouped), group: await groupRecord(groupId) };
 }
 
+// Apply one machine-wide pick to every session record it supersedes: each one's guest tab is moved into
+// the picked window (or closed when it cannot be moved and is provably Pi's) and the record is re-pointed at
+// the picked window. Records that a human picked no later than this pick are left alone. `keepKey` is the
+// session that made the pick: its record is already written and must not be rewritten here. Returns the
+// number of records retargeted.
+async function sweepSupersededTargets(keepKey, wanted, at) {
+  const pick = { windowId: wanted, at };
+  let retargeted = 0;
+  for (const [key, record] of [...automationTargets]) {
+    if (key === keepKey || !supersededByMachinePick(record, pick)) continue;
+    await retargetSupersededRecord(key, record, pick);
+    retargeted++;
+  }
+  if (retargeted > 0) await persistAutomationTargets();
+  return retargeted;
+}
+
 async function dispatch(action, params) {
   switch (action) {
     case "tab.version":
@@ -1716,7 +1971,7 @@ async function dispatch(action, params) {
       // window sent Pi's tabs there uninvited. Resolving the target can create Pi's guest tab inside
       // the chosen window, but it never creates a window: with no assignment and no saved default it
       // fails with a message naming /chrome window.
-      const targetTab = await getOrCreateAutomationTarget(sessionKeyOf(params), params.groupTitle, { preferredWindow: params.preferredWindow });
+      const targetTab = await getOrCreateAutomationTarget(sessionKeyOf(params), params.groupTitle, machinePickParams(params));
       // A tab must never be created without a window: chrome.tabs.create defaults to the FOCUSED window
       // — the user's — and that is exactly how the live Edge run left tab.new's tab and its new group
       // among the user's tabs while the automation marker sat in Pi's window. The helper resolves the
@@ -1911,6 +2166,26 @@ async function dispatch(action, params) {
       const dedicatedWindowIds = dedicatedPiWindowIds(windows, groups);
       const ownsTargetWindow = targetTabWindowId !== null &&
         (isPiOwnedWindow(targetTabWindowId) || dedicatedWindowIds.has(targetTabWindowId));
+      // Where this session will actually work next. A record the machine-wide pick supersedes is about to
+      // be rebuilt in the picked window, so reporting it as "Pi is working here" would point the picker at
+      // a window Pi is leaving — the exact contradiction the live report caught (the ✓ sat on a window
+      // while the user's own window held Pi's tabs). The pick is therefore the answer whenever it wins.
+      const pick = await machineWindowPick(params);
+      const superseded = supersededByMachinePick(target, pick);
+      const workingCandidate = superseded
+        ? pick.windowId
+        : targetTabWindowId !== null
+          ? targetTabWindowId
+          : typeof target?.windowId === "number"
+            ? target.windowId
+            : pick
+              ? pick.windowId
+              : null;
+      // Only ever report a workspace the user can see in this list. A closed window would otherwise mark
+      // no entry in the picker, which leaves the TUI cursor on the first line — usually the user's focused
+      // window — and makes a bare Enter pick a window Pi was not working in.
+      const liveWindowIds = new Set(windows.map((win) => win.id));
+      const workingWindowId = typeof workingCandidate === "number" && liveWindowIds.has(workingCandidate) ? workingCandidate : null;
       return {
         windows: windows.map((win) => {
           const tabs = Array.isArray(win.tabs) ? win.tabs : [];
@@ -1934,6 +2209,9 @@ async function dispatch(action, params) {
         // claims to have closed a window it did not.
         targetWindowId: ownsTargetWindow ? targetTabWindowId : null,
         ownsTargetWindow,
+        // The workspace the picker should mark and offer first; the Pi side falls back to the saved
+        // default when this is absent (an older extension never sends it).
+        workingWindowId,
         // Diagnostic only (index.ts ignores it): the session has a target whose record no longer
         // matches where that tab lives, i.e. the state the live report caught in the act.
         targetStale: typeof target?.tabId === "number" && (targetTabWindowId === null || (recordedWindowId !== null && targetTabWindowId !== recordedWindowId)),
@@ -1948,9 +2226,16 @@ async function dispatch(action, params) {
       const groupTitle = params.groupTitle || PI_GROUP_NAME;
       await hydrateAutomationTargets();
       const current = automationTargets.get(sessionKey);
+      // The moment the user chose this window. Every record written by this pick — this session's and the
+      // ones swept below — carries it, so a later session pick can still win on recency while everything
+      // older is retired. One timestamp for the whole pick keeps the sweep and the assignment consistent.
+      const pickedAt = Date.now();
       const retireCurrent = async (keepTabId) => {
         if (current && typeof current.tabId === "number" && current.tabId !== keepTabId) {
-          await chrome.tabs.remove(current.tabId).catch(() => {});
+          // Only a tab we can prove is Pi's is closed; a corrupted record naming a user tab must not turn a
+          // new pick into "close that tab".
+          const previous = await chrome.tabs.get(current.tabId).catch(() => null);
+          if (previous && isPiRemovableTarget(previous)) await chrome.tabs.remove(current.tabId).catch(() => {});
         }
       };
       if (wanted === null) {
@@ -1974,28 +2259,55 @@ async function dispatch(action, params) {
           // only the tab; for a Pi-created window the record stays a Pi window. The recorded window is
           // the setting later actions rebuild in, so a stale numeric Pi-window id must not survive here.
           const piWindow = isPiOwnedWindow(wanted) || current.piWindow === true;
-          if (current.windowId !== wanted || current.piWindow !== piWindow) {
-            automationTargets.set(sessionKey, { windowId: wanted, tabId: current.tabId, piWindow });
+          if (current.windowId !== wanted || current.piWindow !== piWindow || typeof current.pickedAt !== "number") {
+            automationTargets.set(sessionKey, { windowId: wanted, tabId: current.tabId, piWindow, pickedAt });
             await persistAutomationTargets();
           }
-          return { windowId: wanted, tabId: current.tabId, reused: true };
+          const swept = await sweepSupersededTargets(sessionKey, wanted, pickedAt);
+          return { windowId: wanted, tabId: current.tabId, reused: true, pickedAt, swept };
         }
       }
-      // Created inactive, and the window is never focused: choosing a window must not bring that window,
-      // or this tab, to the front.
-      const tab = await chrome.tabs.create({ url: BLANK_AUTOMATION_URL, active: false, windowId: wanted });
+      // Working somewhere else: MOVE the target tab we already have into the chosen window rather than
+      // creating a replacement and closing the old one. The tab holds the agent's page — a half-filled
+      // form, a logged-in session — and re-choosing a window must not throw that away; it also means Pi's
+      // tab physically leaves the window it was in, which is what the user sees when they pick a new one.
+      let tab = null;
+      let moved = false;
+      if (typeof current?.tabId === "number") {
+        const existing = await chrome.tabs.get(current.tabId).catch(() => null);
+        // Moving a tab is only safe for a tab we can prove is Pi's: a corrupted record naming one of the
+        // user's tabs must not relocate it to a window they did not put it in.
+        if (existing && typeof existing.id === "number" && isPiRemovableTarget(existing)) {
+          const relocated = await chrome.tabs.move(existing.id, { windowId: wanted, index: -1 }).catch(() => null);
+          if (relocated && typeof relocated.id === "number") {
+            tab = await healMarkerTab(relocated);
+            moved = true;
+          }
+        }
+      }
+      if (!tab) {
+        // Created inactive, and the window is never focused: choosing a window must not bring that window,
+        // or this tab, to the front.
+        tab = await chrome.tabs.create({ url: BLANK_AUTOMATION_URL, active: false, windowId: wanted });
+      }
       // Record the chosen window: this is the session's workspace setting. piWindow says who owns the
       // window, so cleanup closes the tab (and only the tab) in one of the user's windows.
-      automationTargets.set(sessionKey, { windowId: wanted, tabId: tab.id, piWindow: isPiOwnedWindow(wanted) });
+      automationTargets.set(sessionKey, { windowId: wanted, tabId: tab.id, piWindow: isPiOwnedWindow(wanted), pickedAt });
       await persistAutomationTargets();
-      await retireCurrent(tab.id);
+      if (moved) await regroupMovedTarget(tab);
+      else await retireCurrent(tab.id);
+      // A pick is machine-wide intent, so it is applied to every OTHER record still sitting in a window
+      // nobody picked for it — on this action, not on some later one. This is what makes the user's window
+      // stop holding Pi's tabs the moment they choose a different window, instead of until each abandoned
+      // session happens to run again.
+      const swept = await sweepSupersededTargets(sessionKey, wanted, pickedAt);
       // NOTE (follow-up, out of scope for the about:blank fix): the record above was written before
       // groupTab ran. If grouping ever relocates this tab (Chrome moves a tab that joins a group in
       // another window), the record's windowId no longer matches where the tab lives, and the next
       // implicit action's resolveOwnedAutomationTarget retires and recreates it. Re-read the tab's
       // windowId after groupTab and update the record (or record after grouping).
       await groupTab(tab, groupTitle, params.groupColor).catch(() => {});
-      return { windowId: tab.windowId ?? null, tabId: tab.id ?? null, reused: false };
+      return { windowId: tab.windowId ?? null, tabId: tab.id ?? null, reused: false, moved, pickedAt, swept };
     }
     case "automation.status": {
       // Report this session's owned automation target (ids only). Used for diagnostics/tests.
@@ -2067,6 +2379,21 @@ async function getTabByParams(params, { createOwnedTarget = true } = {}) {
         `Current tabs:\n${listed || "  (none)"}`,
       );
     }
+    // An explicit targetId that names THIS session's own automation tab is still subject to the user's
+    // newest pick: the tab is moved into the picked window first, so an explicit id cannot keep driving a
+    // window the user has moved away from (the explicit id is how the agent usually addresses its own tab).
+    // A targetId naming any other tab is left exactly where it is — that is a deliberate choice by the caller.
+    await hydrateAutomationTargets();
+    const ownerKey = sessionKeyOf(params);
+    const ownRecord = automationTargets.get(ownerKey);
+    if (ownRecord && typeof tab.id === "number" && ownRecord.tabId === tab.id) {
+      const pick = await machineWindowPick(params);
+      if (supersededByMachinePick(ownRecord, pick) && (await pickWindowIsOpen(pick.windowId))) {
+        await retargetSupersededRecord(ownerKey, ownRecord, pick);
+        await persistAutomationTargets();
+        tab = (await chrome.tabs.get(tab.id).catch(() => null)) || tab;
+      }
+    }
   } else if (params.urlIncludes || params.titleIncludes) {
     const matches = (candidate) => {
       if (params.urlIncludes && !(candidate.url || "").includes(params.urlIncludes)) return false;
@@ -2078,12 +2405,30 @@ async function getTabByParams(params, { createOwnedTarget = true } = {}) {
     // (the two-about:blank live bug). If it does not match, the hint searches the browser's other
     // tabs — Pi-owned automation tabs are excluded so a hint cannot land on one.
     await hydrateAutomationTargets();
-    const own = automationTargets.get(sessionKeyOf(params));
+    const ownKey = sessionKeyOf(params);
+    const own = automationTargets.get(ownKey);
+    let candidates = tabs;
     if (own && typeof own.tabId === "number") {
-      const ownTab = await chrome.tabs.get(own.tabId).catch(() => null);
-      if (ownTab && matches(ownTab)) tab = ownTab;
+      // A hint must not reach into a workspace the user has already replaced with their pick: a record the
+      // machine-wide pick supersedes is moved (never silently kept where it is) before the hint is matched.
+      const pick = await machineWindowPick(params);
+      if (supersededByMachinePick(own, pick) && (await pickWindowIsOpen(pick.windowId))) {
+        await retargetSupersededRecord(ownKey, own, pick);
+        await persistAutomationTargets();
+        // The candidate list was read before that tab moved, and moving changes where it lives, so re-read
+        // the list the browser actually has.
+        candidates = await chrome.tabs.query({}).catch(() => tabs);
+      }
+      // The session's recorded identity wins when the hint matches it: a hint must never redirect Pi to a
+      // different tab that happens to match (the two-about:blank live bug). Read AFTER any supersede, so the
+      // tab that just moved into the picked window is the one the hint resolves to.
+      const settled = automationTargets.get(ownKey);
+      if (settled && typeof settled.tabId === "number") {
+        const ownTab = await chrome.tabs.get(settled.tabId).catch(() => null);
+        if (ownTab && matches(ownTab)) tab = ownTab;
+      }
     }
-    if (!tab) tab = tabs.find((candidate) => matches(candidate) && !isPiChromeOwnedTarget(candidate.id));
+    if (!tab) tab = candidates.find((candidate) => matches(candidate) && !isPiChromeOwnedTarget(candidate.id));
   } else {
     // No explicit target: use this session's dedicated automation target instead of hijacking the
     // user's active tab. This keeps human browsing and Pi automation separated — navigating here
@@ -2091,8 +2436,8 @@ async function getTabByParams(params, { createOwnedTarget = true } = {}) {
     // existing tab pass targetId/urlIncludes/titleIncludes above.
     const sessionKey = sessionKeyOf(params);
     tab = createOwnedTarget
-      ? await getOrCreateAutomationTarget(sessionKey, params.sessionGroupTitle, { preferredWindow: params.preferredWindow })
-      : await resolveOwnedAutomationTarget(sessionKey);
+      ? await getOrCreateAutomationTarget(sessionKey, params.sessionGroupTitle, machinePickParams(params))
+      : await resolveOwnedAutomationTarget(sessionKey, await machineWindowPick(params));
     if (!tab) {
       throw new Error(
         "No target tab specified and this Pi session has no automation tab yet. " +

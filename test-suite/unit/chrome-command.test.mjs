@@ -31,9 +31,10 @@ function healthyResponse(action) {
   }
 }
 
-function harness({ until, background = true, mode = "server", choices = [], send = healthyResponse, clientLabel, connectors, connectorNames = {}, profileSuggestions = [], preferredWindow, writePreferredWindowFails = false } = {}) {
-  const calls = [], notices = [], menus = [], namesWritten = [], preferredWindowsWritten = [];
+function harness({ until, background = true, mode = "server", choices = [], send = healthyResponse, clientLabel, clientKey = "edge:unittest", connectors, connectorNames = {}, profileSuggestions = [], preferredWindow, writePreferredWindowFails = false } = {}) {
+  const calls = [], notices = [], menus = [], namesWritten = [], preferredWindowsWritten = [], pickedAtWritten = [], pickedKeysWritten = [];
   let savedPreferredWindow = preferredWindow;
+  let savedPreferredWindowAt;
   let command;
   const ctx = {
     ui: {
@@ -67,12 +68,24 @@ function harness({ until, background = true, mode = "server", choices = [], send
     // ~/.pi/agent/pi-chrome.json, which a test must never touch. The stubs keep the value in memory
     // so the picker's save path and the injected wire parameter can still be asserted.
     readPreferredWindow: () => savedPreferredWindow,
-    writePreferredWindow: (value) => { preferredWindowsWritten.push(value); savedPreferredWindow = value; return !writePreferredWindowFails; },
-    preferredWindowParams: () => (typeof savedPreferredWindow === "number" ? { preferredWindow: savedPreferredWindow } : {}),
+    readPreferredWindowAt: () => savedPreferredWindowAt,
+    writePreferredWindow: (value, at, key) => {
+      const stamp = typeof at === "number" ? at : Date.now();
+      preferredWindowsWritten.push(value);
+      pickedAtWritten.push(stamp);
+      pickedKeysWritten.push(key);
+      savedPreferredWindow = value;
+      savedPreferredWindowAt = value === undefined ? undefined : stamp;
+      return !writePreferredWindowFails;
+    },
+    preferredWindowParams: () => (typeof savedPreferredWindow === "number"
+      ? { preferredWindow: savedPreferredWindow, ...(typeof savedPreferredWindowAt === "number" ? { preferredWindowAt: savedPreferredWindowAt } : {}) }
+      : {}),
     bridge: {
       status: () => ({ mode }),
       refreshStatus: async () => ({ mode, clients: connectors }),
       clientLabel: () => clientLabel,
+      clientKey: () => clientKey,
       async send(action, params, timeout) {
         calls.push({ action, params: JSON.parse(JSON.stringify(params)), timeout });
         return send(action, params, timeout);
@@ -81,7 +94,7 @@ function harness({ until, background = true, mode = "server", choices = [], send
     pi: { registerCommand(name, definition) { assert.equal(name, "chrome"); command = definition; } },
   };
   vm.runInNewContext(commandSource, sandbox);
-  return { command, calls, notices, menus, namesWritten, preferredWindowsWritten, sandbox, run: (args = "") => command.handler(args, ctx) };
+  return { command, calls, notices, menus, namesWritten, preferredWindowsWritten, pickedAtWritten, pickedKeysWritten, sandbox, run: (args = "") => command.handler(args, ctx) };
 }
 
 test("command help and root completion omit status; nested background status remains available", () => {
@@ -166,6 +179,8 @@ test("Doctor includes locked, timed, indefinite, and expired authorization plus 
         ["tab.version", 35_000], ["page.evaluate", 10_000], ["page.probe", 10_000],
       ]);
       assert.ok(h.calls.filter((call) => call.action.startsWith("page.")).every((call) => call.params.foreground === false));
+      assert.ok(h.calls.filter((call) => call.action.startsWith("page.")).every((call) => call.params.sessionKey === "session:test"),
+        "the probes are scoped to this session: unscoped, they resolve the extension's default bucket and can open or drive a Pi tab in a window the user did not choose");
       assert.equal(h.sandbox.chromeAuthorizedUntil, until, "diagnostics do not grant or change authorization");
       assert.equal(h.sandbox.backgroundEnabled, background);
     }
@@ -261,25 +276,80 @@ test("/chrome window is routed, carries this session's key, and saves the pick m
   const windowResponse = (action) =>
     action === "window.list"
       ? { windows: [{ windowId: 11, tabCount: 2, title: "T", focused: false, holdsTargetTab: true }], ownsTargetWindow: false, targetWindowId: null }
-      : { windowId: 11, reused: false };
+      : { windowId: 11, reused: false, pickedAt: 4242 };
   const h = harness({ send: windowResponse, preferredWindow: 11 });
 
   await h.run("window list");
   assert.equal(h.calls[0].action, "window.list", "window must be a real subcommand, not an unknown one");
   assert.doesNotMatch(String(h.notices[0][0]), /Unknown subcommand/);
   assert.equal(h.calls[0].params.sessionKey, "session:test", "the read is scoped to this session");
+  assert.equal(h.calls[0].params.preferredWindow, 11, "the read carries the saved pick, so the extension marks the window Pi will really use");
   assert.match(String(h.notices[0][0]), /Saved default/, "window list shows the saved machine-wide default");
 
   // Picking a specific window sends that window's id with the same session scope, and saves the id
   // as the machine-wide default so a new session inherits it without being asked again.
-  const picked = harness({ send: windowResponse, choices: ["✓ Window 11 — 2 tabs — T"] });
+  const picked = harness({ send: windowResponse, preferredWindow: 11, choices: ["✓ Window 11 — 2 tabs, saved default — T"] });
   await picked.run("window");
   assert.equal(picked.calls[0].action, "window.list");
   assert.equal(picked.calls[1].action, "window.select");
   assert.equal(picked.calls[1].params.windowId, 11);
   assert.equal(picked.calls[1].params.sessionKey, "session:test");
   assert.deepEqual(picked.preferredWindowsWritten, [11], "the pick is persisted machine-wide");
+  assert.deepEqual(picked.pickedAtWritten, [4242],
+    "the file gets the SAME stamp the extension applied, not a locally invented one — two clocks would let a record written moments earlier look newer than the pick");
+  assert.deepEqual(picked.pickedKeysWritten, ["edge:unittest"],
+    "and the connector that made the pick, so another profile's window id can never match it");
   assert.match(String(picked.notices.at(-1)[0]), /saved, so new sessions use it too/);
+});
+
+test("the picker marks the saved default and offers it first, so re-choosing cannot land on the user's window", async () => {
+  // The live report this comes from: the picker listed the user's focused window first with the TUI
+  // cursor on it, and the ✓ on the other entry. "Re-choose window 2" was one Enter away from picking
+  // window 1 — the user's own. The saved default now leads, and the choice the user queues is that label.
+  const windowResponse = (action) =>
+    action === "window.list"
+      ? {
+          windows: [
+            { windowId: 708, tabCount: 8, title: "Extensions", focused: true, holdsTargetTab: false },
+            { windowId: 947, tabCount: 2, title: "New tab", focused: false, holdsTargetTab: true },
+          ],
+          ownsTargetWindow: false,
+          targetWindowId: null,
+          workingWindowId: 947,
+        }
+      : { windowId: 947, reused: true };
+  const h = harness({ send: windowResponse, preferredWindow: 947, choices: ["✓ Window 947 — 2 tabs, saved default — New tab"] });
+  await h.run("window");
+  assert.deepEqual(h.menus[0].items, [
+    "✓ Window 947 — 2 tabs, saved default — New tab",
+    "  Window 708 — 8 tabs, focused — Extensions",
+  ], "the saved default is the first entry, so the default cursor position is the window the user chose");
+  assert.equal(h.calls[1].params.windowId, 947, "the pick is the window the user actually chose");
+  assert.deepEqual(h.preferredWindowsWritten, [947]);
+});
+
+test("a pick that moves other sessions' tabs says so, instead of moving them silently", async () => {
+  // The pick is machine-wide, so it can move tabs belonging to sessions the user is not looking at. That is
+  // the feature working, but it must not be invisible: the notify names how many others came along.
+  const windowResponse = (action) =>
+    action === "window.list"
+      ? { windows: [{ windowId: 11, tabCount: 2, title: "T", focused: false, holdsTargetTab: true }], ownsTargetWindow: false, targetWindowId: null, workingWindowId: 11 }
+      : { windowId: 11, reused: true, moved: false, pickedAt: 777, swept: 2 };
+  const h = harness({ send: windowResponse, preferredWindow: 11, choices: ["✓ Window 11 — 2 tabs, saved default — T"] });
+  await h.run("window");
+  const text = String(h.notices.at(-1)[0]);
+  assert.match(text, /2 other Pi sessions' tabs were moved there too/, "the user is told other sessions moved");
+  assert.deepEqual(h.pickedAtWritten, [777]);
+
+  const quiet = harness({
+    send: (action) => (action === "window.list"
+      ? { windows: [{ windowId: 11, tabCount: 2, title: "T", focused: false, holdsTargetTab: true }], ownsTargetWindow: false, targetWindowId: null, workingWindowId: 11 }
+      : { windowId: 11, reused: true, moved: false, pickedAt: 777, swept: 0 }),
+    preferredWindow: 11,
+    choices: ["✓ Window 11 — 2 tabs, saved default — T"],
+  });
+  await quiet.run("window");
+  assert.doesNotMatch(String(quiet.notices.at(-1)[0]), /other Pi session/, "nothing is claimed when nothing moved");
 });
 
 test("a pick that cannot be saved says so instead of claiming it was remembered", async () => {
@@ -357,6 +427,24 @@ test("the window picker offers only open windows, never Pi's own or a create-new
   assert.equal(h.calls[1].action, "window.select");
   assert.equal(h.calls[1].params.windowId, 11);
   assert.equal(h.calls[1].params.fresh, undefined, "the picker has no fresh-window request to send");
+});
+
+test("/chrome window list says a saved window that is gone, instead of listing it as a choice", async () => {
+  // The saved default points at a window that no longer exists (window ids do not survive a browser
+  // restart). Saying "new sessions inherit it" would be a lie, and the picker has nothing to mark, so the
+  // user would be left to guess which entry Enter takes.
+  const h = harness({
+    preferredWindow: 99,
+    send: async (action) =>
+      action === "window.list"
+        ? { windows: [{ windowId: 42, tabCount: 5, title: "WhatsApp", focused: true, holdsTargetTab: false }], ownsTargetWindow: false, targetWindowId: null, workingWindowId: 42 }
+        : {},
+  });
+  await h.run("window list");
+  const text = String(h.notices[0][0]);
+  assert.match(text, /Saved default: window 99 — no longer open/);
+  assert.match(text, /Run \/chrome window to pick another/);
+  assert.doesNotMatch(text, /new sessions inherit it/);
 });
 
 test("an empty window picker explains how to proceed instead of showing a dead-end dialog", async () => {

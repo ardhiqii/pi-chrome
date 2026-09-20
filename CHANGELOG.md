@@ -117,6 +117,39 @@ All notable user-facing changes to `pi-chrome`.
   action fails with a message naming `/chrome window` rather than creating a window, using the focused
   one, or landing in one of yours uninvited. `/chrome window own` is gone with the automatic-creation
   path it configured.
+- **Fixed: a pick saved with `/chrome window` did not reach sessions that already had an assignment,
+  and Pi kept working in the user's window.** The resolver treated any recorded window as final ("the
+  session's record wins when it exists"), so a record made *before* the pick — by the implicit resolver,
+  or by an older build — outranked the pick forever. Two live consequences: the extension's unscoped
+  default bucket (and `/chrome doctor`'s own probes, which were sent without a session key) kept
+  driving a tab in the user's window, and a window the user had already replaced still held Pi's tabs.
+  Now the pick carries when it was made and which connector made it (`preferredWindowAt`,
+  `preferredWindowKey`, stored beside the existing `preferredWindow`), each record carries when a human
+  picked it (`pickedAt`), and the newer of the two wins: an explicit session pick still beats an older
+  machine-wide default, while a pick in any session beats every record that was never picked or was
+  picked earlier — including the unscoped default bucket, which is why an unscoped caller can no longer
+  resurrect the user's window. A pick whose window is gone is refused before anything is touched, so a
+  stale id cannot move a session out of a working window and then fail. The connector key means a pick
+  made in Edge cannot move a tab in Chrome: window ids are per profile, and the same number in another
+  browser is a different window.
+
+  Superseded sessions are moved by **moving their tab** into the picked window, not by closing it and
+  rebuilding — the tab holds the agent's page (a half-filled form, a logged-in session), and re-picking a
+  window must relocate Pi's workspace without discarding that. The moved tab is regrouped in its new
+  window. A tab is only ever moved or closed when it is recognisably Pi's *without trusting the record*
+  (a plain `about:blank` target, a legacy `#pi-chrome` marker, a window an earlier Pi build created, or a
+  tab in a `Pi Agent` group); a tab whose only evidence is the record itself — a corrupted or hand-edited
+  one, or a page a previous build adopted — is left exactly where it is and only the record is re-pointed,
+  so a pick can never relocate or close one of the user's own tabs. `/chrome window` applies all of this
+  immediately and its notice says how many other sessions came along; tabs opened with `chrome_tab
+  new`/`chrome_launch` keep their own bookkeeping and are only removed by `/chrome revoke` or session
+  cleanup. `/chrome doctor`'s probes now carry this session's key like every other command.
+
+  The picker was the other half of the live bug: it marked the right window with `✓` but listed the
+  user's focused window *first*, where the TUI puts its cursor, so "re-choosing my window" was one Enter
+  away from picking theirs. The window Pi is working in (or the saved default, when this session has none
+  yet) is now listed first and labelled (`Pi works here` / `saved default`), and a saved window that is no
+  longer open is named as gone instead of silently leaving the cursor on the first entry.
 - **Fixed: a fresh automation tab could not run page actions on Edge.**
   Automation targets were created at `about:blank#pi-chrome`. Measured on Edge 123, the debugger
   refuses that URL with `Cannot access contents of url "about:blank#pi-chrome". Extension manifest

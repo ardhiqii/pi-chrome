@@ -652,6 +652,11 @@ test("the window picker marks the window Pi is ACTUALLY using, and maps clicks b
   const report = {
     ownsTargetWindow: false,
     targetWindowId: null,
+    // The extension reports the workspace itself. The mark must follow THAT, not "which window happens
+    // to hold a target tab": a record the machine-wide pick has replaced still has a tab somewhere, and
+    // marking it would point the user at a window Pi is leaving — the live report that read
+    // "✓ Window 720723947" while the user's own window held Pi's tabs and the pick had moved on.
+    workingWindowId: 22,
     windows: [
       { windowId: 11, tabCount: 12, title: "WhatsApp", focused: true, holdsTargetTab: false },
       { windowId: 22, tabCount: 3, title: "GitHub", focused: false, holdsTargetTab: true },
@@ -662,12 +667,52 @@ test("the window picker marks the window Pi is ACTUALLY using, and maps clicks b
   // Spread into a host-realm array: values from the vm have a different prototype, which strict deepEqual
   // rejects even when the contents match.
   assert.deepEqual([...built.options], [
+    "✓ Window 22 — 3 tabs, Pi works here — GitHub",
     "  Window 11 — 12 tabs, focused — WhatsApp",
-    "✓ Window 22 — 3 tabs — GitHub",
-  ]);
+  ], "the window Pi is working in is marked and listed first");
   assert.equal(built.windowByLabel.get("  Window 11 — 12 tabs, focused — WhatsApp"), 11);
-  assert.equal(built.windowByLabel.get("✓ Window 22 — 3 tabs — GitHub"), 22, "the marked one still maps correctly");
+  assert.equal(built.windowByLabel.get("✓ Window 22 — 3 tabs, Pi works here — GitHub"), 22, "the marked one still maps correctly");
   assert.equal(built.options.some((label) => /Pi's own/.test(label)), false, "Pi's own window is not an entry");
+});
+
+test("the picker lists the saved default first and labels it, so a bare Enter never lands in a window the user did not pick", () => {
+  // This is the live bug in the picker itself: the TUI highlights the FIRST entry, and the old list put
+  // the user's focused window there while the ✓ sat on another line. "Re-choosing my window" then meant
+  // pressing Enter on a window of theirs. The saved default (or the session's own choice) comes first.
+  const menu = loadWindowMenuOptions();
+  const report = {
+    ownsTargetWindow: false,
+    targetWindowId: null,
+    windows: [
+      { windowId: 720723708, tabCount: 8, title: "Extensions", focused: true, holdsTargetTab: false },
+      { windowId: 720723947, tabCount: 2, title: "New tab", focused: false, holdsTargetTab: false },
+    ],
+  };
+  const built = menu(report, 720723947);
+  assert.deepEqual([...built.options], [
+    "✓ Window 720723947 — 2 tabs, saved default — New tab",
+    "  Window 720723708 — 8 tabs, focused — Extensions",
+  ], "the saved default leads, so Enter keeps it instead of moving Pi into the user's window");
+  assert.equal(built.windowByLabel.get("✓ Window 720723947 — 2 tabs, saved default — New tab"), 720723947);
+});
+
+test("a session's own window wins the mark, and the saved default is still shown as such", () => {
+  // Both facts are useful at once: where THIS session works, and what a brand-new session inherits.
+  const menu = loadWindowMenuOptions();
+  const report = {
+    ownsTargetWindow: false,
+    targetWindowId: null,
+    workingWindowId: 11,
+    windows: [
+      { windowId: 22, tabCount: 3, title: "GitHub", focused: false, holdsTargetTab: false },
+      { windowId: 11, tabCount: 12, title: "WhatsApp", focused: true, holdsTargetTab: true },
+    ],
+  };
+  const built = menu(report, 22);
+  assert.deepEqual([...built.options], [
+    "✓ Window 11 — 12 tabs, focused, Pi works here — WhatsApp",
+    "  Window 22 — 3 tabs, saved default — GitHub",
+  ]);
 });
 
 test("Pi's own window is not offered at all — only windows that exist right now are", () => {
@@ -733,13 +778,14 @@ test("the window picker offers exactly the real windows — and nothing when the
   const withWindows = menu({
     ownsTargetWindow: false,
     targetWindowId: null,
+    workingWindowId: 11,
     windows: [
-      { windowId: 11, tabCount: 12, title: "WhatsApp", focused: true, holdsTargetTab: true },
       { windowId: 22, tabCount: 3, title: "GitHub", focused: false, holdsTargetTab: false },
+      { windowId: 11, tabCount: 12, title: "WhatsApp", focused: true, holdsTargetTab: true },
     ],
   });
   assert.deepEqual([...withWindows.options], [
-    "✓ Window 11 — 12 tabs, focused — WhatsApp",
+    "✓ Window 11 — 12 tabs, focused, Pi works here — WhatsApp",
     "  Window 22 — 3 tabs — GitHub",
   ], "exactly the real windows, and nothing else");
   assert.equal(withWindows.options.some((label) => /(Pi's own|isolated|new window)/i.test(label)), false,
@@ -778,7 +824,7 @@ function loadStateHelpers({ failWrites = false } = {}) {
 ;globalThis.__state = {
   statePath: PI_CHROME_STATE_PATH,
   readPreferredConnector, writePreferredConnector,
-  readPreferredWindow, writePreferredWindow,
+  readPreferredWindow, readPreferredWindowAt, readPreferredWindowPick, writePreferredWindow,
   readConnectorNames, writeConnectorName,
 };`, sandbox);
   return { state: sandbox.__state, home, filePath: path.join(home, ".pi", "agent", "pi-chrome.json") };
@@ -791,14 +837,16 @@ test("state file: every preference goes through one writer that preserves its si
   assert.equal(state.writePreferredWindow(42), true, "the write reports success");
   assert.equal(state.writePreferredConnector("edge"), true, "writing a second field succeeds");
   assert.equal(state.writeConnectorName("edge:ab12cd34", "Profile 1"), true, "writing a third field succeeds");
-  assert.equal(state.writePreferredWindow(43), true, "overwriting one field succeeds");
+  assert.equal(state.writePreferredWindow(43, Date.now(), "edge:ab12cd34"), true, "overwriting one field succeeds");
 
   const raw = fs.readFileSync(filePath, "utf8");
-  assert.deepEqual(JSON.parse(raw), {
-    preferredConnector: "edge",
-    preferredWindow: 43,
-    connectorNames: { "edge:ab12cd34": "Profile 1" },
-  }, "no field clobbered another, whatever the order");
+  const parsed = JSON.parse(raw);
+  assert.equal(parsed.preferredConnector, "edge");
+  assert.equal(parsed.preferredWindow, 43);
+  assert.equal(parsed.preferredWindowKey, "edge:ab12cd34", "the pick records which connector made it");
+  assert.deepEqual(parsed.connectorNames, { "edge:ab12cd34": "Profile 1" });
+  assert.ok(Number.isFinite(parsed.preferredWindowAt),
+    "the pick time is stored with the window: without it a stale assignment cannot be told from a fresh pick");
   assert.ok(raw.endsWith("\n"), "the file ends with a newline");
   assert.ok(!raw.includes("\r"), "the file is LF-exact");
 
@@ -806,6 +854,46 @@ test("state file: every preference goes through one writer that preserves its si
   // bypass the preserve-siblings discipline above.
   assert.equal((indexSource.match(/writeFileSync\(PI_CHROME_STATE_PATH/g) || []).length, 1, "one state-file writer");
   assert.equal((indexSource.match(/readFileSync\(PI_CHROME_STATE_PATH/g) || []).length, 1, "one state-file read site");
+});
+
+test("state file: the pick time moves with the window, and is absent for a pick by an older build", (t) => {
+  // The extension orders a session's own pick against the machine-wide one by time. A stale or missing
+  // time is not fatal — an absent one means "nobody ever picked this", which is exactly the stale case
+  // the fix has to recognise — but a wrong-shaped one must never decide where Pi works.
+  const { state, home, filePath } = loadStateHelpers();
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  assert.equal(state.writePreferredWindow(11), true);
+  const first = state.readPreferredWindowAt();
+  assert.ok(Number.isFinite(first), "a pick stores when it happened");
+  assert.equal(state.writePreferredWindow(22), true);
+  const second = state.readPreferredWindowAt();
+  assert.ok(second >= first, "the newer pick carries a newer time");
+
+  // A file written before this change has a window and no time or connector; reading it must not invent
+  // either. The extension then treats records that were never picked as stale, which is the point.
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(filePath, JSON.stringify({ preferredWindow: 12 }));
+  assert.equal(state.readPreferredWindow(), 12);
+  assert.equal(state.readPreferredWindowAt(), undefined, "a legacy pick has no time to report");
+  const legacy = state.readPreferredWindowPick();
+  assert.equal(legacy.windowId, 12);
+  assert.ok(legacy.at === undefined && legacy.key === undefined, "and nothing is invented for its missing fields");
+  for (const bad of ["12", null, true, [12], { id: 12 }, Number.NaN, Number.POSITIVE_INFINITY]) {
+    fs.writeFileSync(filePath, JSON.stringify({ preferredWindow: 12, preferredWindowAt: bad }));
+    assert.equal(state.readPreferredWindowAt(), undefined, `preferredWindowAt ${JSON.stringify(bad)} is rejected`);
+  }
+  for (const bad of [7, true, "", "   ", ["edge:x"]]) {
+    fs.writeFileSync(filePath, JSON.stringify({ preferredWindow: 12, preferredWindowKey: bad }));
+    assert.equal(state.readPreferredWindowPick().key, undefined, `preferredWindowKey ${JSON.stringify(bad)} is rejected`);
+  }
+  fs.writeFileSync(filePath, JSON.stringify({ preferredWindow: 12, preferredWindowKey: " edge:ab12cd34 " }));
+  assert.equal(state.readPreferredWindowPick().key, "edge:ab12cd34", "a real connector key is trimmed and returned");
+
+  assert.equal(state.writePreferredWindow(undefined), true);
+  assert.equal(state.readPreferredWindow(), undefined, "clearing the window clears the choice");
+  assert.equal(state.readPreferredWindowAt(), undefined, "and its time with it");
+  assert.equal(state.readPreferredWindowPick()?.key, undefined, "and the connector that made it");
 });
 
 test("state file: reads tolerate missing, corrupt, and wrong-shaped values", (t) => {

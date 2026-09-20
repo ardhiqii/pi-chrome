@@ -23,7 +23,7 @@ function piHarness({ session = "alpha", send, files, unlinkFails = false, client
   const calls = [], tools = new Map(), notices = [], writes = [], removed = [];
   // The saved window default is disk state read at command time; the harness keeps it in a box so a
   // test can change it between calls and observe that authorizedBridgeSend re-reads it.
-  const preferred = { value: preferredWindow };
+  const preferred = { value: preferredWindow, at: undefined, key: undefined };
   // In-memory stand-in for the screenshot folder: name -> mtimeMs. Lets the retention tests drive
   // readdir/stat/unlink without touching the real filesystem.
   const folder = new Map(Object.entries(files ?? {}));
@@ -53,6 +53,12 @@ function piHarness({ session = "alpha", send, files, unlinkFails = false, client
     requireChromeControlAuthorized() { if (!authorized) throw new Error("Chrome control locked"); },
     sessionCtx: ctx, sessionKeyFor: (c) => c?.key, sessionGroupTitle: (c) => c.title,
     readPreferredWindow: () => preferred.value,
+    readPreferredWindowAt: () => preferred.at,
+    // The one helper preferredWindowParams actually calls: one read of the state file, so a window can
+    // never be paired with the stamp of a different pick.
+    readPreferredWindowPick: () => (typeof preferred.value === "number"
+      ? { windowId: preferred.value, at: preferred.at, key: preferred.key }
+      : undefined),
     chromeToolsRegistered: false, StringEnum: () => ({}),
     tabActionValues: [], snapshotModeValues: [], waitForValues: [], imageFormatValues: [],
     safeJson: JSON.stringify, truncateText: (s) => s, formatChromeSnapshot: JSON.stringify,
@@ -86,7 +92,7 @@ function piHarness({ session = "alpha", send, files, unlinkFails = false, client
   sandbox.registerChromeTools({ registerTool: (tool) => tools.set(tool.name, tool) });
   return {
     calls, tools, notices, writes, ctx, removed, folder, unlinkAttempts,
-    setPreferredWindow: (value) => { preferred.value = value; },
+    setPreferredWindow: (value) => { preferred.value = value; preferred.at = value === undefined ? undefined : Date.now(); preferred.key = value === undefined ? undefined : "edge:fixture"; },
     send: async (...args) => sandbox.send(...args),
     background: (arg) => sandbox.background(ctx, arg),
     tool: (name, params = {}, signal) => tools.get(name).execute("test", params, signal, undefined, ctx),
@@ -106,12 +112,21 @@ test("the machine-wide window default is injected from disk on every command, no
   const h = piHarness({ preferredWindow: 7 });
   await h.send("page.snapshot", {});
   assert.equal(h.calls.at(-1).params.preferredWindow, 7);
+  assert.ok(!("preferredWindowAt" in h.calls.at(-1).params) && !("preferredWindowKey" in h.calls.at(-1).params),
+    "a pick saved by an older build has no time or profile, and none is invented for it");
   h.setPreferredWindow(9);
   await h.send("page.snapshot", {});
   assert.equal(h.calls.at(-1).params.preferredWindow, 9, "the value was re-read, not cached at session start");
+  assert.ok(Number.isFinite(h.calls.at(-1).params.preferredWindowAt),
+    "and when it was picked, so the extension can tell a stale assignment from this one");
+  assert.equal(h.calls.at(-1).params.preferredWindowKey, "edge:fixture",
+    "and which connector picked it, because window ids are per profile");
   h.setPreferredWindow(undefined);
   await h.send("page.snapshot", {});
   assert.ok(!("preferredWindow" in h.calls.at(-1).params), "with nothing saved, no default field is sent at all");
+  assert.ok(!("preferredWindowAt" in h.calls.at(-1).params) && !("preferredWindowKey" in h.calls.at(-1).params),
+    "and no orphan pick time or profile either");
+  assert.ok(!("preferredWindowAt" in h.calls.at(-1).params), "and no orphan pick time either");
 });
 
 test("session background on overrides all per-call/legacy foreground flags; off preserves per-call background", async () => {

@@ -124,9 +124,37 @@ function readPreferredWindow(): number | undefined {
 	return typeof value === "number" && Number.isInteger(value) ? value : undefined;
 }
 
-function writePreferredWindow(value: number | undefined): boolean {
+// WHEN that window was chosen, and in WHICH connector. The extension keeps a per-session assignment too,
+// and it has to know which of the two is newer before it lets either one decide where Pi works: a record
+// the user never picked (created by the implicit resolver, or by an older build) must lose to the
+// machine-wide pick, while a session's own deliberate pick still wins. The connector matters because
+// window ids are per profile — the same number in another browser is a different window — so a pick made
+// in Edge must never move a tab in Chrome. Absent fields mean "an older build saved this": the extension
+// then treats records with no pick time of their own as stale, which is exactly what they are.
+function readPreferredWindowPick(): { windowId: number; at?: number; key?: string } | undefined {
+	// One read of the state file per call: two independent reads can pair a window with the time of a
+	// DIFFERENT pick when another Pi process rewrites the file in between.
+	const state = readPIChromeState();
+	const windowId = state.preferredWindow;
+	if (typeof windowId !== "number" || !Number.isInteger(windowId)) return undefined;
+	const at = typeof state.preferredWindowAt === "number" && Number.isFinite(state.preferredWindowAt) ? state.preferredWindowAt : undefined;
+	const key = typeof state.preferredWindowKey === "string" && state.preferredWindowKey.trim() ? state.preferredWindowKey.trim() : undefined;
+	return { windowId, at, key };
+}
+
+function readPreferredWindow(): number | undefined {
+	return readPreferredWindowPick()?.windowId;
+}
+
+function readPreferredWindowAt(): number | undefined {
+	return readPreferredWindowPick()?.at;
+}
+
+function writePreferredWindow(value: number | undefined, at?: number, key?: string): boolean {
 	return writePIChromeState((state) => {
 		state.preferredWindow = value ?? null;
+		state.preferredWindowAt = value === undefined ? null : typeof at === "number" ? at : Date.now();
+		state.preferredWindowKey = value === undefined ? null : key ?? null;
 	});
 }
 
@@ -226,6 +254,10 @@ type WindowReport = {
 	windows?: WindowSummary[];
 	targetWindowId?: number | null;
 	ownsTargetWindow?: boolean;
+	// The window this session will actually act in (its own assignment, else the machine-wide pick).
+	// Reported by the extension so the picker marks the entry Pi is working in instead of leaving the
+	// user to infer it from which line happens to be highlighted.
+	workingWindowId?: number | null;
 };
 
 function truncateTitle(title: string, max = 40): string {
@@ -238,34 +270,55 @@ function truncateTitle(title: string, max = 40): string {
 // Pi's work somewhere the user is not looking. The current choice is marked from the target's recorded
 // state rather than from the labels, because "our own window" and "a guest tab in theirs" look alike
 // otherwise — and that difference decides whether cleanup may close a whole window.
-function windowMenuOptions(report: WindowReport): {
+function windowMenuOptions(report: WindowReport, savedWindow?: number): {
 	options: string[];
 	windowByLabel: Map<string, number>;
 } {
-	const ownsOwn = report.ownsTargetWindow === true;
 	// The menu lists only windows that exist right now, and only real ones: an entry for a window Pi
 	// would have to create is gone for good, because that automatic path is what kept dropping the
 	// user's tab into their own window.
 	const options: string[] = [];
 	const windowByLabel = new Map<string, number>();
+	// Where Pi will act: this session's own assignment when it has one, else the machine-wide pick. Marking
+	// it — and listing it FIRST — is the difference between "re-choose my window" doing nothing and the
+	// user landing in a window of theirs: the old list put the cursor on the first window (usually the
+	// user's, because it is the focused one) while the ✓ sat on another line, so a bare Enter picked the
+	// window Pi was not using at all.
+	const workingWindow =
+		typeof report.workingWindowId === "number"
+			? report.workingWindowId
+			: typeof savedWindow === "number"
+				? savedWindow
+				: null;
+	const rendered: Array<{ label: string; windowId: number; working: boolean }> = [];
 	for (const win of report.windows ?? []) {
 		if (typeof win.windowId !== "number") continue;
 		// A window an earlier Pi build created is never offered: Pi does not create windows any more, so
 		// the only windows worth choosing are the user's own.
 		if (win.ownedByPi === true) continue;
-		const mark = !ownsOwn && win.holdsTargetTab ? "✓ " : "  ";
+		const working = workingWindow !== null && win.windowId === workingWindow;
+		const mark = working ? "✓ " : "  ";
 		const count = `${win.tabCount} tab${win.tabCount === 1 ? "" : "s"}`;
-		const base = `${mark}Window ${win.windowId} — ${count}${win.focused ? ", focused" : ""} — ${truncateTitle(win.title)}`;
-		let label = base;
-		for (let n = 2; windowByLabel.has(label); n++) label = `${base} (${n})`;
+		const roles = [win.focused ? "focused" : undefined];
+		if (working) roles.push(win.windowId === savedWindow ? "saved default" : "Pi works here");
+		else if (win.windowId === savedWindow) roles.push("saved default");
+		const notes = roles.some(Boolean) ? `, ${roles.filter(Boolean).join(", ")}` : "";
+		const label = `${mark}Window ${win.windowId} — ${count}${notes} — ${truncateTitle(win.title)}`;
+		rendered.push({ label, windowId: win.windowId, working });
+	}
+	// Stable order, with the window Pi is working in first: a bare Enter keeps the current choice instead
+	// of moving Pi somewhere the user did not ask for, and the choice they already made is the visible one.
+	for (const entry of [...rendered].sort((left, right) => Number(right.working) - Number(left.working))) {
+		let label = entry.label;
+		for (let n = 2; windowByLabel.has(label); n++) label = `${entry.label} (${n})`;
 		options.push(label);
-		windowByLabel.set(label, win.windowId);
+		windowByLabel.set(label, entry.windowId);
 	}
 	return { options, windowByLabel };
 }
 
 function describeWindows(report: WindowReport, preferredWindow?: number): string {
-	const { options } = windowMenuOptions(report);
+	const { options } = windowMenuOptions(report, preferredWindow);
 	// targetWindowId is only set for a window Pi created, so a guest tab has none — naming the window that
 	// actually holds our tab is the whole point of this list.
 	const holder = (report.windows ?? []).find((win) => win.holdsTargetTab);
@@ -273,13 +326,24 @@ function describeWindows(report: WindowReport, preferredWindow?: number): string
 		? `a window of its own${typeof report.targetWindowId === "number" ? ` (window ${report.targetWindowId})` : ""}`
 		: holder
 			? `window ${holder.windowId} — yours; cleanup closes only Pi's tab in it`
-			: "no window yet";
+			: typeof report.workingWindowId === "number"
+				? `window ${report.workingWindowId} — chosen; Pi opens its tab there on the next action`
+				: "no window yet";
 	// A bare "Windows open:" header with nothing under it would contradict the sentence above when the only
 	// window is Pi's own, so say plainly that there is nothing else to list.
 	const lines = [`This session is working in ${where}.`];
 	// The machine-wide default is why a brand-new session already knows where to work; showing it makes
-	// the difference between "picked once" and "picked again" visible instead of implicit.
-	if (typeof preferredWindow === "number") lines.push(`Saved default: window ${preferredWindow} — new sessions inherit it.`);
+	// the difference between "picked once" and "picked again" visible instead of implicit. A default whose
+	// window is GONE says so: otherwise the list reads as if that window were still a choice, while the
+	// next action refuses and names /chrome window.
+	const savedIsOpen = typeof preferredWindow === "number" && (report.windows ?? []).some((win) => win.windowId === preferredWindow);
+	if (typeof preferredWindow === "number") {
+		lines.push(
+			savedIsOpen
+				? `Saved default: window ${preferredWindow} — new sessions inherit it.`
+				: `Saved default: window ${preferredWindow} — no longer open. Run /chrome window to pick another.`,
+		);
+	}
 	if (options.length > 0) lines.push("Windows open:", ...options);
 	else lines.push("No other Chrome windows are open right now.");
 	return lines.join("\n");
@@ -681,6 +745,20 @@ class ChromeProfileBridge {
 			profileId: this.clientProfileId,
 			key: this.clientKeyOf(this.clientBrowser, this.clientProfileId, this.clientName),
 		});
+	}
+
+	// The key of the connector this session drives (`edge:9d233ecf`), or undefined while nothing has
+	// polled. Saved with a window pick so the extension that receives the pick can tell whether it belongs
+	// to ITS profile: window ids are per profile, and a numeric id from one browser must never move a tab
+	// in another. Client mode asks the owner's status, which is the connector the commands are routed to.
+	clientKey(): string | undefined {
+		if (this.mode === "client") {
+			const status = (this.ownerStatus ?? {}) as { clientBrowser?: string; clientProfileId?: string; clientName?: string };
+			if (!status.clientBrowser && !status.clientProfileId) return undefined;
+			return this.clientKeyOf(status.clientBrowser, status.clientProfileId, status.clientName);
+		}
+		if (!this.clientBrowser && !this.clientProfileId) return undefined;
+		return this.clientKeyOf(this.clientBrowser, this.clientProfileId, this.clientName);
 	}
 
 	private clientKeyOf(browser?: string, profileId?: string, name?: string): string {
@@ -1444,8 +1522,13 @@ export default function (pi: ExtensionAPI): void {
 	// extension uses it only when the session has no assignment of its own, and refuses — naming
 	// /chrome window — when neither exists; it never creates or guesses a window on the strength of it.
 	const preferredWindowParams = (): Record<string, unknown> => {
-		const preferred = readPreferredWindow();
-		return preferred === undefined ? {} : { preferredWindow: preferred };
+		const pick = readPreferredWindowPick();
+		if (!pick) return {};
+		return {
+			preferredWindow: pick.windowId,
+			...(pick.at === undefined ? {} : { preferredWindowAt: pick.at }),
+			...(pick.key === undefined ? {} : { preferredWindowKey: pick.key }),
+		};
 	};
 
 	const updateChromeStatus = (ctx: ExtensionContext): void => {
@@ -1639,7 +1722,7 @@ Usage rules:
 			if (extensionAlive && !versionMismatch) {
 				// Sanity-check that pi-chrome can actually run code in the active tab.
 				try {
-					const value = await bridge.send("page.evaluate", { ...preferredWindowParams(), expression: "1+1", awaitPromise: true, foreground: false }, 10_000);
+					const value = await bridge.send("page.evaluate", { ...preferredWindowParams(), ...windowParams(ctx), expression: "1+1", awaitPromise: true, foreground: false }, 10_000);
 					if (value === 2) lines.push(`✓ pi-chrome can run code in the active Chrome tab.`);
 					else lines.push(`⚠ pi-chrome ran code in the active tab but got an unexpected result (${JSON.stringify(value)}). The current tab may be locked-down (a Chrome internal page or a strict site).`);
 				} catch (error) {
@@ -1648,7 +1731,7 @@ Usage rules:
 
 				// Surface obvious site-side automation flags so the user knows why a site might block pi.
 				try {
-					const probe = (await bridge.send("page.probe", { ...preferredWindowParams(), foreground: false }, 10_000)) as Record<string, unknown>;
+					const probe = (await bridge.send("page.probe", { ...preferredWindowParams(), ...windowParams(ctx), foreground: false }, 10_000)) as Record<string, unknown>;
 					if (probe && probe.arithmetic === 2) lines.push(`✓ The active tab is ${hostnameOf(String(probe.location))} and accepts pi-chrome's commands.`);
 					if (probe && probe.webdriver) lines.push(`⚠ Your Chrome is reporting itself as automated to websites. Some sites use this signal to block sign-ins or bot checks.`);
 				} catch (error) {
@@ -1904,8 +1987,12 @@ Usage rules:
 	// it. Pi's tab goes in there — created inactive, and the window is never focused. Pi never creates a
 	// window of its own, so a picker with nothing to offer just says so.
 	const openWindowMenu = async (ctx: ExtensionContext): Promise<void> => {
-		const report = (await bridge.send("window.list", windowParams(ctx), 15_000)) as WindowReport;
-		const { options, windowByLabel } = windowMenuOptions(report);
+		const savedWindow = readPreferredWindow();
+		// The report carries the saved pick, so the extension marks the window Pi will ACTUALLY use: a record
+		// the pick has replaced still owns a tab somewhere, and reporting that tab's window as "Pi works here"
+		// is the contradiction the live report showed (marked one window, working in another).
+		const report = (await bridge.send("window.list", { ...windowParams(ctx), ...preferredWindowParams() }, 15_000)) as WindowReport;
+		const { options, windowByLabel } = windowMenuOptions(report, savedWindow);
 		if (options.length === 0) {
 			// A zero-item select is a dead end in the TUI: Enter does nothing and only Esc exits. Pi will not
 			// create a window to fill the list, so the user has to open one.
@@ -1915,7 +2002,14 @@ Usage rules:
 			);
 			return;
 		}
-		const choice = await ctx.ui.select("Which window should Pi use?", options);
+		const choice = await ctx.ui.select(
+			// A saved window that is gone cannot be "kept": say so in the question, because with nothing marked
+			// the cursor sits on the first entry and a bare Enter would silently make it the new workspace.
+			savedWindow !== undefined && !(report.windows ?? []).some((win) => win.windowId === savedWindow)
+				? `Which window should Pi use? (the saved window ${savedWindow} is gone)`
+				: "Which window should Pi use?",
+			options,
+		);
 		if (!choice) return;
 		const windowId = windowByLabel.get(choice);
 		if (windowId === undefined) return;
@@ -1923,15 +2017,21 @@ Usage rules:
 			"window.select",
 			{ ...windowParams(ctx), windowId },
 			20_000,
-		)) as { windowId?: number | null; reused?: boolean };
+		)) as { windowId?: number | null; reused?: boolean; moved?: boolean; pickedAt?: number; swept?: number };
 		// The pick is machine-wide state, not a per-session detail: save it so a new session inherits it
 		// instead of starting with nothing and falling back to the automatic choice this feature removed.
+		// The stamp and the connector key come from the extension that actually applied the pick, so the
+		// file and the records it was compared against agree on both — a locally invented stamp would let
+		// a record written moments earlier look newer (or older) than it is.
 		const chosenWindowId = typeof result.windowId === "number" ? result.windowId : windowId;
-		const saved = writePreferredWindow(chosenWindowId);
+		const saved = writePreferredWindow(chosenWindowId, result.pickedAt, bridge.clientKey());
+		const sweptNote = typeof result.swept === "number" && result.swept > 0
+			? ` ${result.swept} other Pi session${result.swept === 1 ? "'s tab was" : "s' tabs were"} moved there too.`
+			: "";
 		ctx.ui.notify(
 			saved
-				? `Pi will work in window ${chosenWindowId}${result.reused ? " (already there)" : ""} — saved, so new sessions use it too.`
-				: `Pi will work in window ${chosenWindowId}${result.reused ? " (already there)" : ""} for this session, but the choice could not be saved for future sessions.`,
+				? `Pi will work in window ${chosenWindowId}${result.reused ? " (already there)" : result.moved ? " (its tab was moved there)" : ""} — saved, so new sessions use it too.${sweptNote}`
+				: `Pi will work in window ${chosenWindowId}${result.reused ? " (already there)" : result.moved ? " (its tab was moved there)" : ""} for this session, but the choice could not be saved for future sessions.`,
 			"info",
 		);
 	};
@@ -1940,7 +2040,7 @@ Usage rules:
 		const arg = args.trim().toLowerCase();
 		try {
 			if (arg === "list" || arg === "status") {
-				ctx.ui.notify(describeWindows((await bridge.send("window.list", windowParams(ctx), 15_000)) as WindowReport, readPreferredWindow()), "info");
+				ctx.ui.notify(describeWindows((await bridge.send("window.list", { ...windowParams(ctx), ...preferredWindowParams() }, 15_000)) as WindowReport, readPreferredWindow()), "info");
 				return;
 			}
 			if (arg === "own" || arg === "auto") {
