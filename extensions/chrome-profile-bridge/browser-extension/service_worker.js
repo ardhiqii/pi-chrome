@@ -1599,6 +1599,116 @@ async function contentEditableInTab(tabId, selectAllParams = null) {
   return results?.[0]?.result === true;
 }
 
+// Read the target's value and caret so chrome_type can report what typing actually did instead of
+// trusting a bare character count. Follows snapshot_injected.js's isSensitiveField redaction
+// convention: password-like fields report only valueRedacted + length, never their contents. Value
+// display is truncated the same way snapshots truncate values (120 chars).
+async function readInputStateInTab(tabId, params) {
+  const results = await executeScriptWithFallback({
+    target: { tabId, frameIds: [0] },
+    world: "MAIN",
+    func: (selector, uid) => {
+      const state = window.__PI_CHROME_STATE__;
+      const carrierOf = (node) => {
+        if (!node) return null;
+        if ("value" in node && typeof node.value === "string") return "value";
+        if (node.isContentEditable === true) return "contenteditable";
+        return null;
+      };
+      let el = uid ? (state && state.elements ? state.elements[uid] : null) : null;
+      if (uid && (!el || !el.isConnected)) return { found: false, staleUid: true, reason: `snapshot uid ${uid} is stale; refresh chrome_snapshot` };
+      if (!el && selector) el = document.querySelector(selector);
+      if (!el) {
+        const active = document.activeElement;
+        el = active && active !== document.body && active !== document.documentElement ? active : null;
+      }
+      if (!el) return { found: false };
+      // A uid/selector can point at a wrapper or ARIA textbox rather than the element that actually
+      // receives the text (uids are assigned to tabindex/role nodes). Fall back to the focused
+      // carrier so typing inside a wrapper is not reported as a false "" -> "".
+      let carrier = carrierOf(el);
+      if (!carrier) {
+        const active = document.activeElement;
+        if (active && active !== el && carrierOf(active)) el = active;
+        carrier = carrierOf(el);
+      }
+      const raw = carrier === "value" ? el.value : carrier === "contenteditable" ? String(el.textContent || "") : "";
+      const type = String(el.type || el.getAttribute?.("type") || "").toLowerCase();
+      const haystack = [type, el.name, el.getAttribute?.("name"), el.id, el.getAttribute?.("autocomplete"), el.getAttribute?.("aria-label"), el.getAttribute?.("placeholder"), el.getAttribute?.("data-testid")].filter(Boolean).join(" ").toLowerCase();
+      const sensitive = type === "password" || /password|passwd|\bpwd\b|secret|token|bearer|api[-_ ]?key|access[-_ ]?key|auth[-_ ]?code|one[-_ ]?time|otp|2fa|mfa|verification[-_ ]?code|recovery[-_ ]?code|credit[-_ ]?card|card[-_ ]?number|cc-number|cc-csc|cvc|cvv|security[-_ ]?code|ssn|social[-_ ]?security/.test(haystack);
+      let selectionStart = null;
+      let selectionEnd = null;
+      try {
+        if (typeof el.selectionStart === "number") selectionStart = el.selectionStart;
+        if (typeof el.selectionEnd === "number") selectionEnd = el.selectionEnd;
+      } catch {}
+      let caretOffset = null;
+      if (carrier === "contenteditable") {
+        // Contenteditables have no selectionStart; measure the caret from the range start so a
+        // splice past the 120-char display truncation is still detectable.
+        try {
+          const selection = window.getSelection && window.getSelection();
+          if (selection && selection.rangeCount > 0 && selection.anchorNode && (!el.contains || el.contains(selection.anchorNode))) {
+            const range = document.createRange();
+            range.selectNodeContents(el);
+            range.setEnd(selection.anchorNode, selection.anchorOffset);
+            caretOffset = range.toString().length;
+          }
+        } catch {}
+      }
+      return {
+        found: true,
+        tag: el.tagName,
+        carrier,
+        value: carrier && !sensitive ? raw.slice(0, 120) : undefined,
+        valueLength: carrier ? raw.length : undefined,
+        valueRedacted: carrier && sensitive && raw.length > 0 ? true : undefined,
+        selectionStart,
+        selectionEnd,
+        caretOffset,
+      };
+    },
+    args: [params.selector ?? null, params.uid ?? null],
+  }, `read input value in tab ${tabId}`);
+  const v = results?.[0]?.result;
+  return v && typeof v === "object" ? v : { found: false };
+}
+
+// Classify where the typed text landed from the caret at typing time (inputs/textareas via
+// selectionStart, contenteditables via the measured caret) or the before/after value diff as a
+// fallback. A target that carries no value reports nothing rather than a false "" -> "".
+function inputInsertPosition(before, after) {
+  if (!before?.found || !before.carrier) return undefined;
+  if (before.selectionStart !== null && before.selectionStart !== undefined && before.selectionEnd !== null && before.selectionEnd !== undefined) {
+    if (before.selectionEnd > before.selectionStart) return "replaced-selection";
+    return before.selectionStart < (before.valueLength ?? 0) ? "caret-middle" : "caret-end";
+  }
+  if (typeof before.caretOffset === "number") {
+    return before.caretOffset < (before.valueLength ?? 0) ? "caret-middle" : "caret-end";
+  }
+  const b = typeof before.value === "string" ? before.value : "";
+  const a = after && typeof after.value === "string" ? after.value : "";
+  if (b && a && a.length >= b.length && !a.startsWith(b)) return "caret-middle";
+  return "caret-end";
+}
+
+function inputValueEvidence(before, after, { replaced = false } = {}) {
+  const redacted = Boolean(before?.valueRedacted || after?.valueRedacted);
+  // A non-carrier target (wrapper div, ARIA textbox, iframe focus) has no value to report; omit the
+  // value fields entirely so the Pi text does not claim an empty field was typed into.
+  const beforeCarrier = Boolean(before?.found && before.carrier);
+  const afterCarrier = Boolean(after?.found && after.carrier);
+  if (!beforeCarrier && !afterCarrier) return replaced ? { replaced: true } : {};
+  return {
+    valueBefore: redacted ? undefined : before?.value,
+    valueAfter: redacted ? undefined : after?.value,
+    valueRedacted: redacted || undefined,
+    existingTextLengthBefore: beforeCarrier ? before?.valueLength : undefined,
+    insertedAt: replaced ? "replaced-selection" : inputInsertPosition(before, after),
+    ...(replaced ? { replaced: true } : {}),
+  };
+}
+
 async function typeTextInTab(tabId, text, perCharacter) {
   if (!text) return "none";
   if (!perCharacter && await contentEditableInTab(tabId)) {
@@ -1626,9 +1736,30 @@ async function chromeInputType(params) {
     await sleep(rng(50, 120));
   }
   const text = String(params.text || "");
+  // Read before/after so the caller can see a caret insertion (and any splice) instead of trusting a
+  // bare character count. The "before" read must precede replace's select-all/delete, or a replaced
+  // field would report an empty pre-existing value. Reads are best-effort: a read failure must never
+  // block typing.
+  const before = await readInputStateInTab(tab.id, params).catch(() => null);
+  if (params.replace) {
+    // Explicit replacement uses real Ctrl+A key events (not a DOM selection) then Delete, so editors
+    // that track key handling see the same sequence a human would produce.
+    await chromeInputKey({ ...params, targetId: tab.id, key: "a", modifiers: { ctrlKey: true } });
+    await cdp(tab.id, "Input.dispatchKeyEvent", { type: "keyDown", key: "Delete", code: "Delete", windowsVirtualKeyCode: 46 });
+    await cdp(tab.id, "Input.dispatchKeyEvent", { type: "keyUp", key: "Delete", code: "Delete", windowsVirtualKeyCode: 46 });
+    await sleep(rng(20, 60));
+  }
   const typing = await typeTextInTab(tab.id, text, params.perCharacter);
+  const after = await readInputStateInTab(tab.id, params).catch(() => null);
   if (params.pressEnter) await chromeInputKey({ ...params, targetId: tab.id, key: "Enter" });
-  return { input: "chrome", length: text.length, typing };
+  const tabStatus = chrome.tabs?.get ? (await chrome.tabs.get(tab.id).catch(() => null))?.status : undefined;
+  return {
+    input: "chrome",
+    length: text.length,
+    typing,
+    ...inputValueEvidence(before, after, { replaced: params.replace === true }),
+    ...(tabStatus ? { tabStatus } : {}),
+  };
 }
 
 async function domFillFallback(tabId, params, cause) {
@@ -2077,7 +2208,17 @@ async function dispatch(action, params) {
       await trackSessionTab(sessionKeyOf(params), tab.id, true);
       try {
         await bringToFront(tab, params);
-        return await groupTab(tab, groupTitle, params.groupColor);
+        const grouped = await groupTab(tab, groupTitle, params.groupColor);
+        // chrome.tabs.create returns the t=0 Tab ({url:"", title:"", status:"loading"}); report the
+        // settled tab instead so an immediate read does not look like "the URL never loaded".
+        const load = await waitForCreatedTabLoad(tab.id, createParams.url, params.timeoutMs);
+        const settled = await chrome.tabs.get(tab.id).catch(() => load.tab);
+        return {
+          ...grouped,
+          tab: settled ? await formatTab(settled) : grouped.tab,
+          loadStatus: load.loadStatus,
+          waitedMs: load.waitedMs,
+        };
       } catch (error) {
         if (typeof tab.id === "number") await chrome.tabs.remove(tab.id).catch(() => {});
         throw error;
@@ -2723,13 +2864,59 @@ async function evaluateInTab(params) {
   return v;
 }
 
+// Snapshot actions run the action then observe the page. A navigation started by the action is
+// invisible to an immediate read: the snapshot can describe the OUTGOING document while the new one
+// is still loading. Anchor the tab's url/status before the action, and when a load is plausibly in
+// flight (the URL changed, or the tab was complete and is now loading) wait for it (bounded) before
+// snapshotting. A tab that was ALREADY loading is reported but not waited on, so a hanging
+// subresource cannot add a wait to every action. A timeout NEVER fails the action; it just reports
+// navigation.settled=false so the caller knows the snapshot may be the old document.
 async function withOptionalSnapshot(params, actionFn) {
-  const result = await actionFn(params);
-  if (params.includeSnapshot) {
-    const snapshot = await snapshotInTab({ ...params, foreground: false });
-    return { result, snapshot };
+  if (!params.includeSnapshot) return actionFn(params);
+  let anchor = null;
+  try {
+    const tab = await getTabByParams(params);
+    if (tab && typeof tab.id === "number") {
+      const live = await chrome.tabs.get(tab.id).catch(() => null);
+      anchor = {
+        tabId: tab.id,
+        params: { ...params, targetId: String(tab.id) },
+        url: String(live?.url ?? tab.url ?? ""),
+        status: String(live?.status ?? tab.status ?? ""),
+      };
+    }
+  } catch {
+    anchor = null; // Fall back to the old unanchored flow rather than failing the action.
   }
-  return result;
+  const result = await actionFn(anchor ? anchor.params : params);
+  let navigation;
+  if (anchor) {
+    const after = await chrome.tabs.get(anchor.tabId).catch(() => null);
+    const afterUrl = String(after?.url ?? "");
+    const urlChanged = Boolean(afterUrl && afterUrl !== anchor.url);
+    const loading = after?.status === "loading";
+    if (urlChanged || loading) {
+      const bound = Math.min(Number(params.timeoutMs) || 15_000, 5_000);
+      const started = Date.now();
+      // Only wait when the action plausibly STARTED a load: the URL changed, or the tab was complete
+      // before the action and is now loading. A tab that was already loading with the same URL
+      // (hanging subresource/iframe/stream) stays flagged but must not add a bounded wait.
+      const startedLoading = loading && (urlChanged || anchor.status === "complete");
+      let settled = !loading;
+      if (startedLoading) {
+        try {
+          await waitForTabComplete(anchor.tabId, bound);
+          settled = true;
+        } catch {
+          settled = false; // Bounded wait: return the snapshot, flagged as possibly stale.
+        }
+      }
+      const finalTab = await chrome.tabs.get(anchor.tabId).catch(() => after);
+      navigation = { from: anchor.url, to: String(finalTab?.url ?? afterUrl), settled, waitedMs: Date.now() - started };
+    }
+  }
+  const snapshot = await snapshotInTab(anchor ? { ...anchor.params, foreground: false } : { ...params, foreground: false });
+  return navigation ? { result, snapshot, navigation } : { result, snapshot };
 }
 
 // Snapshot/inspect run from a packaged MAIN-world script (snapshot_injected.js) injected via
@@ -2880,6 +3067,25 @@ function waitForTabComplete(tabId, timeoutMs) {
     };
     chrome.tabs.onUpdated.addListener(listener);
   });
+}
+
+// tab.new returns chrome.tabs.create's t=0 object ({url:"", title:"", status:"loading"}), which
+// reads as "the URL never loaded" to an immediate consumer. Wait (bounded) for a real URL to reach
+// complete, then report the SETTLED tab. A timeout never throws; about:blank never waits.
+async function waitForCreatedTabLoad(tabId, url, requestedTimeoutMs) {
+  const started = Date.now();
+  const read = () => chrome.tabs.get(tabId).catch(() => null);
+  if (!url || String(url) === "about:blank") return { loadStatus: "complete", tab: await read(), waitedMs: Date.now() - started };
+  let tab = await read();
+  if (tab?.status === "complete") return { loadStatus: "complete", tab, waitedMs: Date.now() - started };
+  const bound = Math.min(Number(requestedTimeoutMs) || 15_000, 5_000);
+  try {
+    await waitForTabComplete(tabId, bound);
+    return { loadStatus: "complete", tab: await read(), waitedMs: Date.now() - started };
+  } catch {
+    tab = await read();
+    return { loadStatus: tab?.status === "complete" ? "complete" : "timedOut", tab, waitedMs: Date.now() - started };
+  }
 }
 
 async function captureTabScreenshot(tabId, params) {

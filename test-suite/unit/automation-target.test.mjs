@@ -287,7 +287,10 @@ function makeChrome(state, { withWindows = true, withStorage = true, withTabGrou
         // Chrome rejects a tab target whose window is gone; modelling that here makes the
         // chosen-window-closed path fail loudly instead of resurrecting a window id.
         if (!windows.has(windowId)) throw new Error(`No window with id ${windowId}`);
-        const tab = { id: alloc.tab(), windowId, url, active, groupId: -1 };
+        // This mock does not simulate a loading phase; created tabs are already complete. tab.new's
+        // bounded load wait must therefore short-circuit on the live status instead of hanging on an
+        // onUpdated event this mock never fires (load/timeout states are covered in background-policy).
+        const tab = { id: alloc.tab(), windowId, url, active, groupId: -1, status: "complete" };
         if (active) for (const t of tabs.values()) if (t.windowId === windowId) t.active = false;
         tabs.set(tab.id, tab);
         return { ...tab };

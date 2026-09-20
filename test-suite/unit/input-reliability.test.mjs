@@ -9,8 +9,9 @@ import { test } from "node:test";
 const workerSource = fs.readFileSync(new URL("../../extensions/chrome-profile-bridge/browser-extension/service_worker.js", import.meta.url), "utf8");
 const clone = (value) => JSON.parse(JSON.stringify(value));
 
-function harness({ tag = "DIV", editable = true, initial = "", nodeId = 7 } = {}) {
-  const calls = [], selected = [], files = [], tabLookups = [];
+function harness({ tag = "DIV", editable = true, initial = "", nodeId = 7, caretOffset = null } = {}) {
+  const calls = [], selected = [], files = [], tabLookups = [], tabsGetCalls = [];
+  const tabState = { id: 2, windowId: 1, url: "https://fixture.test/", status: "complete", title: "Fixture" };
   let selectAll = false;
   const element = {
     tagName: tag, type: tag === "INPUT" ? "text" : undefined,
@@ -19,6 +20,10 @@ function harness({ tag = "DIV", editable = true, initial = "", nodeId = 7 } = {}
     contains: (el) => el === element,
   };
   const selection = {
+    rangeCount: caretOffset === null ? 0 : 1,
+    anchorNode: element,
+    anchorOffset: caretOffset ?? 0,
+    isCollapsed: true,
     removeAllRanges() { selectAll = false; },
     addRange(range) { selected.push(range.target); selectAll = range.target === element; },
   };
@@ -26,7 +31,16 @@ function harness({ tag = "DIV", editable = true, initial = "", nodeId = 7 } = {}
     document: {
       activeElement: element,
       querySelector: (selector) => selector === "#target" ? element : null,
-      createRange: () => ({ selectNodeContents(target) { this.target = target; } }),
+      createRange: () => ({
+        target: null,
+        endOffset: 0,
+        selectNodeContents(target) { this.target = target; },
+        setEnd(_node, offset) { this.endOffset = offset; },
+        toString() {
+          if (this.target !== element) return "";
+          return String(element.value ?? element.textContent ?? "").slice(0, this.endOffset);
+        },
+      }),
     },
     getSelection: () => selection,
     location: { href: "https://fixture.test/" },
@@ -34,6 +48,7 @@ function harness({ tag = "DIV", editable = true, initial = "", nodeId = 7 } = {}
   });
   page.window = page;
   const listener = { addListener() {}, removeListener() {} };
+  const tabUpdated = { listeners: new Set(), addListener(fn) { this.listeners.add(fn); }, removeListener(fn) { this.listeners.delete(fn); } };
   const chrome = {
     runtime: { id: "test", getManifest: () => ({ version: "0.0.0" }), onInstalled: listener, onStartup: listener },
     alarms: { create() {}, onAlarm: listener }, action: { onClicked: listener }, webNavigation: { onCommitted: listener },
@@ -43,6 +58,14 @@ function harness({ tag = "DIV", editable = true, initial = "", nodeId = 7 } = {}
       const fn = vm.runInContext(`(${func.toString()})`, page);
       return [{ result: await fn(...args) }];
     } },
+    tabs: {
+      get: async (id) => {
+        tabsGetCalls.push(id);
+        if (Number(id) !== tabState.id) throw new Error(`No tab with id ${id}`);
+        return { ...tabState };
+      },
+      onUpdated: tabUpdated,
+    },
   };
   const worker = {
     chrome, console, setTimeout, clearTimeout, setInterval: () => 0,
@@ -89,7 +112,7 @@ function harness({ tag = "DIV", editable = true, initial = "", nodeId = 7 } = {}
     return { input: "dom-fallback" };
   };
   const h = {
-    worker, chrome, page, calls, element, selected, files, tabLookups, failures: new Map(), nodeResult: { nodeId },
+    worker, chrome, page, calls, element, selected, files, tabLookups, tabState, tabsGetCalls, selection, tabUpdated, failures: new Map(), nodeResult: { nodeId },
     call: (action, params = {}) => worker.dispatch(`page.${action}`, { targetId: "2", background: true, ...params }),
     commands: (method) => calls.filter((call) => call.method === method),
   };
@@ -398,4 +421,276 @@ test("pressEnter/submit emit one Enter after text and stay pinned to the resolve
       assert.equal(String(h.tabLookups.at(-1).targetId), "2", "Enter must not resolve a different URL/title match");
     }
   }
+});
+
+// ---- chrome_type value read-back (measured live: "why do flamingos why do cats knead blanketsstand
+// on one leg" was typed mid-string and the tool text only said "Typed 26 character(s) into #q.").
+// A mid-string splice must be visible in the result, and credential fields must stay redacted.
+
+test("chrome_type reports valueBefore/valueAfter and flags a caret-middle splice", async () => {
+  const h = harness({ tag: "INPUT", editable: false });
+  const original = "why do flamingos stand on one leg";
+  const typed = "why do cats knead blankets";
+  h.element.value = original;
+  h.element.selectionStart = 16;
+  h.element.selectionEnd = 16;
+  const baseCdp = h.worker.cdp;
+  h.worker.cdp = async (tabId, method, params = {}) => {
+    if (method === "Input.dispatchKeyEvent" && params.type === "keyDown" && params.text) {
+      // Insert at the caret like the live browser did, leaving the caret after the inserted text.
+      const caret = h.element.selectionStart ?? h.element.value.length;
+      h.element.value = h.element.value.slice(0, caret) + params.text + h.element.value.slice(caret);
+      h.element.selectionStart = h.element.selectionEnd = caret + params.text.length;
+      return {};
+    }
+    return baseCdp(tabId, method, params);
+  };
+  const result = await h.call("type", { selector: "#target", text: typed, perCharacter: true });
+  assert.equal(result.typing, "keys");
+  assert.equal(result.valueBefore, original);
+  assert.equal(result.valueAfter, `${original.slice(0, 16)}${typed}${original.slice(16)}`);
+  assert.equal(result.existingTextLengthBefore, original.length);
+  assert.equal(result.insertedAt, "caret-middle");
+  assert.equal(result.valueRedacted, undefined);
+});
+
+test("chrome_type reports caret-end for an append and replaces the classification under replace:true", async () => {
+  const h = harness();
+  h.element.textContent = "hello";
+  const appended = await h.call("type", { selector: "#target", text: " world" });
+  assert.equal(appended.valueBefore, "hello");
+  assert.equal(appended.valueAfter, "hello world");
+  assert.equal(appended.insertedAt, "caret-end");
+
+  const h2 = harness();
+  h2.element.textContent = "hello";
+  const baseCdp = h2.worker.cdp;
+  h2.worker.cdp = async (tabId, method, params = {}) => {
+    if (method === "Input.dispatchKeyEvent" && params.type === "keyDown" && params.key === "Delete") {
+      h2.element.textContent = "";
+      return {};
+    }
+    return baseCdp(tabId, method, params);
+  };
+  const replaced = await h2.call("type", { selector: "#target", text: "fresh", replace: true });
+  assert.equal(replaced.replaced, true);
+  assert.equal(replaced.valueBefore, "hello", "the before read must run before replace deletes");
+  assert.equal(replaced.insertedAt, "replaced-selection");
+  assert.equal(replaced.valueAfter, "fresh");
+  assert.deepEqual(
+    h2.commands("Input.dispatchKeyEvent").filter((c) => c.params.code === "KeyA" && c.params.type !== "keyUp").map((c) => c.params.type),
+    ["rawKeyDown"],
+    "replace uses a real Ctrl+A chord, not a DOM selection",
+  );
+});
+
+test("chrome_type redacts password and credential field values", async () => {
+  for (const [type, name] of [["password", "password"], ["text", "api_key"]]) {
+    const h = harness({ tag: "INPUT", editable: false });
+    h.element.type = type;
+    h.element.name = name;
+    h.element.value = "hunter2";
+    h.element.selectionStart = 0;
+    h.element.selectionEnd = 0;
+    const result = await h.call("type", { selector: "#target", text: "x", perCharacter: true });
+    assert.equal(result.valueRedacted, true, `${type}/${name}`);
+    assert.equal(result.valueBefore, undefined, `${type}/${name} before value must not leak`);
+    assert.equal(result.valueAfter, undefined, `${type}/${name} after value must not leak`);
+    assert.equal(result.existingTextLengthBefore, 7);
+    assert.equal(result.insertedAt, "caret-middle");
+  }
+});
+
+test("replace:true reports the pre-delete length for a password field", async () => {
+  const h = harness({ tag: "INPUT", editable: false });
+  h.element.type = "password";
+  h.element.value = "hunter2";
+  h.element.selectionStart = 0;
+  h.element.selectionEnd = 0;
+  const baseCdp = h.worker.cdp;
+  h.worker.cdp = async (tabId, method, params = {}) => {
+    if (method === "Input.dispatchKeyEvent" && params.type === "keyDown" && params.key === "Delete") {
+      h.element.value = "";
+      h.element.selectionStart = h.element.selectionEnd = 0;
+      return {};
+    }
+    return baseCdp(tabId, method, params);
+  };
+  const result = await h.call("type", { selector: "#target", text: "fresh", replace: true, perCharacter: true });
+  assert.equal(result.replaced, true);
+  assert.equal(result.valueRedacted, true);
+  assert.equal(result.valueBefore, undefined, "the password value never leaks");
+  assert.equal(result.valueAfter, undefined, "the password value never leaks");
+  assert.equal(result.existingTextLengthBefore, 7, "the before read must run before replace deletes");
+  assert.equal(result.insertedAt, "replaced-selection");
+});
+
+test("chrome_type omits the value report when the focus target carries no value", async () => {
+  // A snapshot uid can point at a div[role=textbox][tabindex] wrapper; the typed text is real but
+  // the wrapper has no value, so evidence must stay silent instead of reporting "" -> "".
+  const h = harness({ tag: "DIV", editable: false });
+  const result = await h.call("type", { selector: "#target", text: "hello", perCharacter: true });
+  assert.equal(result.typing, "keys");
+  assert.equal(result.length, 5);
+  assert.equal(result.valueBefore, undefined);
+  assert.equal(result.valueAfter, undefined);
+  assert.equal(result.existingTextLengthBefore, undefined);
+  assert.equal(result.insertedAt, undefined);
+  assert.equal(result.valueRedacted, undefined);
+  assert.equal(h.element.textContent, "hello", "the text still reached the page");
+});
+
+test("readInputStateInTab reads the focused carrier when the uid points at a non-carrier wrapper", async () => {
+  const h = harness({ tag: "INPUT", editable: false });
+  const wrapper = { tagName: "DIV", isContentEditable: false, isConnected: true };
+  h.page.__PI_CHROME_STATE__.elements["el-wrap"] = wrapper;
+  h.page.document.activeElement = h.element;
+  h.element.value = "seed";
+  h.element.selectionStart = 4;
+  h.element.selectionEnd = 4;
+  const state = await h.worker.readInputStateInTab(2, { uid: "el-wrap" });
+  assert.equal(state.carrier, "value");
+  assert.equal(state.value, "seed");
+  assert.equal(state.valueLength, 4);
+  assert.equal(state.selectionStart, 4);
+});
+
+test("chrome_type flags a mid-string contenteditable splice past the 120-char truncation", async () => {
+  const original = "A".repeat(150) + "B".repeat(150);
+  const h = harness({ caretOffset: 150 });
+  h.element.textContent = original;
+  const baseCdp = h.worker.cdp;
+  h.worker.cdp = async (tabId, method, params = {}) => {
+    if (method === "Input.insertText") {
+      const caret = h.selection.anchorOffset;
+      h.element.textContent = h.element.textContent.slice(0, caret) + params.text + h.element.textContent.slice(caret);
+      h.selection.anchorOffset = caret + params.text.length;
+      return {};
+    }
+    return baseCdp(tabId, method, params);
+  };
+  const result = await h.call("type", { selector: "#target", text: "ZYX" });
+  assert.equal(result.typing, "insertText");
+  assert.equal(result.valueBefore, "A".repeat(120), "the before value is truncated like snapshots");
+  assert.equal(result.valueAfter, "A".repeat(120), "the truncated before/after look identical");
+  assert.equal(result.existingTextLengthBefore, 300);
+  assert.equal(result.insertedAt, "caret-middle", "the measured caret exposes a splice past 120 chars");
+});
+
+// ---- withOptionalSnapshot must never observe a document that predates its own navigation.
+
+test("withOptionalSnapshot does not wait when the action did not navigate", async () => {
+  const h = harness();
+  h.worker.snapshotInTab = async () => ({ title: "Fixture", url: h.tabState.url });
+  const waits = [];
+  h.worker.waitForTabComplete = async (tabId, timeoutMs) => { waits.push({ tabId, timeoutMs }); return true; };
+  const payload = await h.call("type", { selector: "#target", text: "hello", includeSnapshot: true });
+  assert.deepEqual(waits, [], "a non-navigating action must not call the load wait");
+  assert.equal(payload.navigation, undefined);
+  assert.equal(payload.snapshot.url, "https://fixture.test/");
+  assert.equal(payload.snapshot.title, "Fixture");
+});
+
+test("withOptionalSnapshot does not wait when the tab was already loading before a non-navigating action", async () => {
+  const h = harness();
+  h.tabState.status = "loading";
+  h.worker.snapshotInTab = async () => ({ title: "Fixture", url: h.tabState.url });
+  const waits = [];
+  h.worker.waitForTabComplete = async (tabId, timeoutMs) => { waits.push({ tabId, timeoutMs }); return true; };
+  const payload = await h.call("type", { selector: "#target", text: "hello", includeSnapshot: true });
+  assert.deepEqual(waits, [], "an already-loading tab must not add a bounded wait to every includeSnapshot action");
+  assert.equal(payload.navigation.from, "https://fixture.test/");
+  assert.equal(payload.navigation.to, "https://fixture.test/");
+  assert.equal(payload.navigation.settled, false, "the snapshot is still flagged as possibly mid-load");
+  assert.ok(payload.navigation.waitedMs >= 0);
+  assert.equal(payload.snapshot.title, "Fixture");
+});
+
+test("waitForTabComplete removes its onUpdated listener on resolve and on timeout", async () => {
+  const h = harness();
+  const resolved = h.worker.waitForTabComplete(2, 250);
+  assert.equal(h.tabUpdated.listeners.size, 1, "listener attached");
+  for (const fn of [...h.tabUpdated.listeners]) fn(2, { status: "complete" });
+  await resolved;
+  assert.equal(h.tabUpdated.listeners.size, 0, "listener removed after resolve");
+
+  const timedOut = h.worker.waitForTabComplete(2, 10);
+  assert.equal(h.tabUpdated.listeners.size, 1, "listener attached for the timeout wait");
+  await assert.rejects(timedOut, /Timed out after 10ms waiting for tab 2 to load/);
+  assert.equal(h.tabUpdated.listeners.size, 0, "listener removed after timeout");
+});
+
+test("withOptionalSnapshot settles through the real onUpdated wait, not only a stub", async () => {
+  const h = harness();
+  h.worker.snapshotInTab = async () => ({ title: "Result page", url: h.tabState.url });
+  const baseCdp = h.worker.cdp;
+  h.worker.cdp = async (tabId, method, params = {}) => {
+    const value = await baseCdp(tabId, method, params);
+    if (method === "Input.dispatchKeyEvent" && params.type === "keyDown" && params.key === "Enter") {
+      h.tabState.url = "https://fixture.test/results";
+      h.tabState.status = "loading";
+    }
+    return value;
+  };
+  // Complete the real tab load as soon as the real wait attaches its onUpdated listener.
+  const completion = setInterval(() => {
+    for (const fn of [...h.tabUpdated.listeners]) fn(2, { status: "complete" });
+  }, 1);
+  try {
+    const payload = await h.call("type", { selector: "#target", text: "x", pressEnter: true, includeSnapshot: true });
+    assert.equal(payload.navigation.settled, true, "the real wait resolved on the onUpdated event");
+    assert.equal(payload.navigation.to, "https://fixture.test/results");
+  } finally {
+    clearInterval(completion);
+  }
+  assert.equal(h.tabUpdated.listeners.size, 0, "the real wait removed its listener");
+});
+
+for (const [settled, outcome] of [[true, "resolves"], [false, "times out"]]) {
+  test(`withOptionalSnapshot waits out a navigation and reports settled=${settled} when the wait ${outcome}`, async () => {
+    const h = harness();
+    h.worker.snapshotInTab = async () => ({ title: "Result page", url: h.tabState.url });
+    const waits = [];
+    h.worker.waitForTabComplete = async (tabId, timeoutMs) => {
+      waits.push({ tabId, timeoutMs });
+      if (!settled) throw new Error(`Timed out after ${timeoutMs}ms waiting for tab ${tabId} to load`);
+      h.tabState.status = "complete";
+      h.tabState.title = "Result page";
+      return true;
+    };
+    const baseCdp = h.worker.cdp;
+    h.worker.cdp = async (tabId, method, params = {}) => {
+      const value = await baseCdp(tabId, method, params);
+      if (method === "Input.dispatchKeyEvent" && params.type === "keyDown" && params.key === "Enter") {
+        h.tabState.url = "https://fixture.test/results?q=mice";
+        h.tabState.status = "loading";
+      }
+      return value;
+    };
+    const payload = await h.call("type", { selector: "#target", text: "mice", pressEnter: true, includeSnapshot: true, timeoutMs: 900 });
+    assert.deepEqual(waits, [{ tabId: 2, timeoutMs: 900 }], "the bounded wait uses min(params.timeoutMs, 5000)");
+    assert.equal(payload.navigation.from, "https://fixture.test/");
+    assert.equal(payload.navigation.to, "https://fixture.test/results?q=mice");
+    assert.equal(payload.navigation.settled, settled);
+    assert.ok(payload.navigation.waitedMs >= 0);
+    assert.equal(payload.snapshot.title, "Result page", "the snapshot still returns even when the wait timed out");
+  });
+}
+
+test("withOptionalSnapshot caps the navigation wait at 5000ms", async () => {
+  const h = harness();
+  h.worker.snapshotInTab = async () => ({ title: "Result page", url: h.tabState.url });
+  const waits = [];
+  h.worker.waitForTabComplete = async (tabId, timeoutMs) => { waits.push(timeoutMs); return true; };
+  const baseCdp = h.worker.cdp;
+  h.worker.cdp = async (tabId, method, params = {}) => {
+    const value = await baseCdp(tabId, method, params);
+    if (method === "Input.dispatchKeyEvent" && params.type === "keyDown" && params.key === "Enter") {
+      h.tabState.url = "https://fixture.test/results";
+      h.tabState.status = "loading";
+    }
+    return value;
+  };
+  await h.call("type", { selector: "#target", text: "x", pressEnter: true, includeSnapshot: true, timeoutMs: 60_000 });
+  assert.deepEqual(waits, [5_000]);
 });

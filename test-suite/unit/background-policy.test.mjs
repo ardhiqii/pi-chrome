@@ -265,7 +265,7 @@ test("shared-owner sessions retain independent policies; per-call background sti
   assert.equal(sharedCalls[2].params.foreground, false);
 });
 
-function workerHarness({ withWindows = true } = {}) {
+function workerHarness({ withWindows = true, autoCompleteTabs = true } = {}) {
   const calls = [];
   const tabs = new Map([
     [1, { id: 1, windowId: 1, active: true, groupId: -1, url: "https://user.test/", title: "User" }],
@@ -274,6 +274,10 @@ function workerHarness({ withWindows = true } = {}) {
   let focusedWindow = 1, nextTab = 3, nextWindow = 2;
   const storage = {}, localStore = {}, groups = new Map();
   const listener = { addListener() {}, removeListener() {} };
+  // Dedicated onUpdated dispatcher (the shared `listener` is a noop). Real Chrome finishes a load
+  // shortly after create; the mock fires completion on the next tick so tab.new's bounded wait
+  // settles fast. Tests that need the timeout path pass autoCompleteTabs:false.
+  const tabUpdated = { listeners: new Set(), addListener(fn) { this.listeners.add(fn); }, removeListener(fn) { this.listeners.delete(fn); } };
   const chrome = {
     runtime: { id: "test", getManifest: () => ({ version: "0.0.0" }), onInstalled: listener, onStartup: listener },
     alarms: { onAlarm: listener, create() {} }, action: { onClicked: listener }, webNavigation: { onCommitted: listener },
@@ -283,14 +287,24 @@ function workerHarness({ withWindows = true } = {}) {
       local: { get: async (key) => ({ [key]: localStore[key] }), set: async (value) => Object.assign(localStore, value) },
     },
     tabs: {
-      onUpdated: listener,
+      onUpdated: tabUpdated,
       query: async (query = {}) => [...tabs.values()].filter((t) => (!query.active || t.active) && (query.windowId === undefined || query.windowId === t.windowId)).map(clone),
       get: async (id) => { if (!tabs.has(id)) throw new Error("No tab"); return clone(tabs.get(id)); },
       create: async (params) => {
         calls.push({ action: "tabs.create", params });
-        const tab = { id: nextTab++, windowId: params.windowId ?? 1, active: params.active, url: params.url, groupId: -1 };
+        const url = params.url ?? "about:blank";
+        const tab = { id: nextTab++, windowId: params.windowId ?? 1, active: params.active, url, title: "", groupId: -1, status: url === "about:blank" ? "complete" : "loading" };
         if (tab.active) for (const t of tabs.values()) if (t.windowId === tab.windowId) t.active = false;
         tabs.set(tab.id, tab);
+        if (autoCompleteTabs && tab.status === "loading") {
+          setTimeout(() => {
+            const live = tabs.get(tab.id);
+            if (!live || live.status !== "loading") return;
+            live.status = "complete";
+            live.title = live.title || live.url;
+            for (const fn of tabUpdated.listeners) fn(tab.id, { status: "complete" });
+          }, 0);
+        }
         return clone(tab);
       },
       update: async (id, params) => {
@@ -828,4 +842,32 @@ test("chrome_launch names the browser and profile it is connected to", async () 
     out.content[0].text.includes("connected to Edge (profile ab12cd34)"),
     `chrome_launch should name the target, got: ${out.content[0].text}`,
   );
+});
+
+// ---- tab.new load outcome (measured live: chrome.tabs.create returns {url:"", title:"",
+// status:"loading"} at t=0, so an immediate read looks like "the URL never loaded" even though the
+// tab loads; measured complete in under 10s).
+
+test("tab.new waits out a real URL and reports the settled tab; about:blank never waits", async () => {
+  const h = workerHarness();
+  const waits = [];
+  const realWait = h.w.waitForTabComplete;
+  // Record the real bounded wait so the test proves it was used (and not just a status short-circuit).
+  h.w.waitForTabComplete = async (tabId, timeoutMs) => { waits.push({ tabId, timeoutMs }); return realWait(tabId, timeoutMs); };
+  const opened = await h.w.dispatch("tab.new", { sessionKey: "alpha", groupTitle: "Pi Session: alpha", preferredWindow: 1, url: "https://example.com/" });
+  assert.equal(opened.loadStatus, "complete");
+  assert.equal(opened.tab.url, "https://example.com/");
+  assert.equal(opened.tab.title, "https://example.com/", "the settled title is re-read, not the t=0 empty string");
+  assert.deepEqual(waits, [{ tabId: opened.tab.id, timeoutMs: 5_000 }], "the bounded wait caps at 5000ms");
+  const blank = await h.w.dispatch("tab.new", { sessionKey: "alpha", groupTitle: "Pi Session: alpha", preferredWindow: 1 });
+  assert.equal(blank.loadStatus, "complete");
+  assert.equal(waits.length, 1, "about:blank must never wait");
+});
+
+test("tab.new reports loadStatus=timedOut without throwing and keeps the created tab", async () => {
+  const h = workerHarness({ autoCompleteTabs: false });
+  const opened = await h.w.dispatch("tab.new", { sessionKey: "alpha", groupTitle: "Pi Session: alpha", preferredWindow: 1, url: "https://slow.test/", timeoutMs: 30 });
+  assert.equal(opened.loadStatus, "timedOut");
+  assert.equal(opened.tab.url, "https://slow.test/");
+  assert.ok(h.tabs.has(opened.tab.id), "the tab is not closed or lost when the wait times out");
 });

@@ -435,3 +435,130 @@ test("chrome_cdp_targets calls cdp.targets and renders a bounded summary", async
   assert.match(out.content[0].text, /Fixture/);
   assert.deepEqual(out.details.value.tab, { id: 8, title: "Fixture", url: "https://fixture.test/" });
 });
+
+// ---- Pi-side text for input evidence and tab.new load outcome ----
+function sourceSection(start, end) {
+  const from = indexSource.indexOf(start);
+  const to = indexSource.indexOf(end, from);
+  assert.ok(from >= 0 && to > from, `missing source section: ${start}`);
+  return indexSource.slice(from, to);
+}
+
+function inputReportingHarness() {
+  const registered = new Map(), sent = [];
+  let respond = () => ({});
+  const ctx = { key: "session:test", title: "Pi Session: test" };
+  const sandbox = {
+    Type: new Proxy({}, { get: () => (value = {}) => value }),
+    DEFAULT_TIMEOUT_MS: 30_000,
+    MAX_ELEMENTS: 80,
+    BACKGROUND_PARAM_DESCRIPTION: "background policy",
+    StringEnum: () => ({}),
+    tabActionValues: [],
+    truncateText: (text) => text,
+    safeJson: (value) => JSON.stringify(value, null, 2),
+    formatChromeSnapshot: (snapshot) => JSON.stringify(snapshot),
+    summarizeActionResult: () => undefined,
+    sessionGroupTitle: (c) => c?.title ?? "Pi Agent",
+    authorizedBridgeSend: async (action, params) => { sent.push({ action, params: clone(params) }); return respond(action, params); },
+    pi: { registerTool: (tool) => registered.set(tool.name, tool) },
+  };
+  const source = [
+    sourceSection("function formatIncludedSnapshotText(", "\n\nfunction formatChromeInspect("),
+    registrationSource("chrome_type"),
+    registrationSource("chrome_fill"),
+    registrationSource("chrome_tab"),
+  ].join("\n");
+  vm.runInNewContext(stripTypeScriptTypes(source), sandbox);
+  return {
+    registered, sent,
+    tool: (name, params = {}) => registered.get(name).execute("test", params, undefined, undefined, ctx),
+    respond: (fn) => { respond = fn; },
+  };
+}
+
+test("chrome_type/chrome_fill descriptions state the caret-vs-replace contract", () => {
+  const h = inputReportingHarness();
+  const type = h.registered.get("chrome_type");
+  const fill = h.registered.get("chrome_fill");
+  assert.match(type.description, /AT THE CARET/);
+  assert.match(type.description, /does NOT replace/);
+  assert.match(type.description, /chrome_fill/);
+  assert.match(fill.description, /Unlike chrome_type/);
+  assert.match(fill.description, /select-all \+ delete \+ type/);
+  assert.ok(type.promptSnippet.length < 100, "promptSnippet stays short");
+  assert.ok(fill.promptSnippet.length < 100, "promptSnippet stays short");
+});
+
+test("chrome_type text reports the field before/after and warns loudly about a mid-string splice", async () => {
+  const h = inputReportingHarness();
+  h.respond(() => ({
+    input: "chrome", length: 26, typing: "keys",
+    valueBefore: "why do flamingos stand on one leg",
+    valueAfter: "why do flamingos why do cats knead blanketsstand on one leg",
+    existingTextLengthBefore: 33, insertedAt: "caret-middle",
+  }));
+  const out = await h.tool("chrome_type", { uid: "#q", text: "why do cats knead blankets" });
+  const text = out.content[0].text;
+  assert.match(text, /Typed 26 character\(s\) into #q\./);
+  assert.match(text, /Field went from "why do flamingos stand on one leg" to "why do flamingos why do cats knead blanketsstand on one leg"\./);
+  assert.match(text, /⚠ text was spliced into existing content \(it does NOT replace\); use chrome_fill to replace a field's contents/);
+  assert.doesNotMatch(text, /submitted the SPLICED value/, "no submit claim when pressEnter was not used");
+});
+
+test("chrome_type says a pressEnter submission carried the spliced value, and never echoes redacted fields", async () => {
+  const h = inputReportingHarness();
+  h.respond(() => ({ input: "chrome", length: 3, typing: "keys", valueRedacted: true, existingTextLengthBefore: 12, insertedAt: "caret-middle" }));
+  const out = await h.tool("chrome_type", { uid: "#pw", text: "abc", pressEnter: true });
+  const text = out.content[0].text;
+  assert.match(text, /Field value \[redacted\] \(12 chars before typing; insert position caret-middle\)\./);
+  assert.match(text, /⚠ If that Enter submitted the form, it submitted the SPLICED value above, not your text\./);
+  assert.doesNotMatch(text, /abc/, "the typed secret never appears in the text");
+});
+
+test("chrome_type does not warn about a splice when zero characters were typed", async () => {
+  const h = inputReportingHarness();
+  h.respond(() => ({ input: "chrome", length: 0, typing: "none", valueBefore: "abc", valueAfter: "abc", existingTextLengthBefore: 3, insertedAt: "caret-middle" }));
+  const out = await h.tool("chrome_type", { uid: "#q", text: "" });
+  assert.doesNotMatch(out.content[0].text, /spliced/);
+  assert.match(out.content[0].text, /Typed 0 character\(s\) into #q\./);
+});
+
+test("chrome_type prints a tabStatus warning only when the tab is not complete", async () => {
+  const h = inputReportingHarness();
+  h.respond(() => ({ input: "chrome", length: 1, typing: "keys", insertedAt: "caret-end", tabStatus: "complete" }));
+  let out = await h.tool("chrome_type", { uid: "#q", text: "x" });
+  assert.doesNotMatch(out.content[0].text, /tab status/);
+  h.respond(() => ({ input: "chrome", length: 1, typing: "keys", insertedAt: "caret-end", tabStatus: "loading" }));
+  out = await h.tool("chrome_type", { uid: "#q", text: "x" });
+  assert.match(out.content[0].text, /⚠ tab status is loading; the page may still be loading/);
+});
+
+test("an unsettled included snapshot is loudly labelled as possibly the outgoing document", async () => {
+  const h = inputReportingHarness();
+  h.respond(() => ({
+    result: { input: "chrome", length: 1, typing: "keys", insertedAt: "caret-end" },
+    snapshot: { title: "Example Domain", url: "https://example.com/" },
+    navigation: { from: "https://example.com/", to: "https://example.com/results", settled: false, waitedMs: 5_000 },
+  }));
+  const out = await h.tool("chrome_type", { uid: "#q", text: "x", includeSnapshot: true, pressEnter: true });
+  assert.match(out.content[0].text, /Snapshot taken while the page was still navigating \(waited 5000ms; https:\/\/example\.com\/ → https:\/\/example\.com\/results\)/);
+  assert.match(out.content[0].text, /re-check with chrome_snapshot/);
+});
+
+test("chrome_tab action=new prints the load outcome in one line and keeps raw JSON in details", async () => {
+  const h = inputReportingHarness();
+  const created = { tab: { id: 123, windowId: 456, title: "Example Domain", url: "https://example.com/" }, group: { title: "Pi Agent" }, loadStatus: "complete", waitedMs: 0 };
+  h.respond(() => created);
+  const out = await h.tool("chrome_tab", { action: "new", url: "https://example.com/" });
+  assert.equal(out.content[0].text, "created tab 123 in window 456 (Pi Agent) — loadStatus=complete Example Domain https://example.com/");
+  assert.ok(!out.content[0].text.includes("\n"), "the summary stays one line");
+  assert.deepEqual(clone(out.details.result), created);
+});
+
+test("chrome_tab action=new reports loadStatus=timedOut plainly", async () => {
+  const h = inputReportingHarness();
+  h.respond(() => ({ tab: { id: 9, windowId: 1, title: "", url: "https://slow.test/" }, group: { title: "Pi Session: t" }, loadStatus: "timedOut" }));
+  const out = await h.tool("chrome_tab", { action: "new" });
+  assert.match(out.content[0].text, /created tab 9 in window 1 \(Pi Session: t\) — loadStatus=timedOut/);
+});

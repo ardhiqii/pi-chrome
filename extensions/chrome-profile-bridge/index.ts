@@ -503,8 +503,15 @@ function formatChromeSnapshot(snapshot: any): string {
 }
 
 function formatIncludedSnapshotText(raw: unknown, text: string): string {
-	const snapshot = raw && typeof raw === "object" ? (raw as { snapshot?: unknown }).snapshot : undefined;
-	return snapshot ? `${text}\n\n${formatChromeSnapshot(snapshot)}` : text;
+	const payload = raw && typeof raw === "object" ? (raw as { snapshot?: unknown; navigation?: { settled?: boolean; from?: string; to?: string; waitedMs?: number } }) : undefined;
+	const snapshot = payload?.snapshot;
+	const body = snapshot ? `${text}\n\n${formatChromeSnapshot(snapshot)}` : text;
+	// A bounded wait that timed out still returns the snapshot, but it describes the document the
+	// navigation is replacing — say so loudly instead of presenting it as the settled page.
+	if (payload?.navigation && payload.navigation.settled === false) {
+		return `${body}\n\n⚠ Snapshot taken while the page was still navigating (waited ${payload.navigation.waitedMs ?? "?"}ms; ${payload.navigation.from || "?"} → ${payload.navigation.to || "?"}). It may describe the document being replaced; re-check with chrome_snapshot.`;
+	}
+	return body;
 }
 
 function formatChromeInspect(inspect: any): string {
@@ -2282,7 +2289,7 @@ Usage rules:
 	pi.registerTool({
 		name: "chrome_tab",
 		label: "Chrome Tab",
-		description: "List, create, activate, close, group, ungroup, or inspect tabs in the user's existing Chrome profile via the companion extension. New/grouped tabs always use this session's Pi tab group. Background mode keeps new tabs inactive and blocks activate; ask the user to run /chrome background off for foreground/watch mode. activate/close/group/ungroup require a target (targetId/urlIncludes/titleIncludes); with no target they act on this session's pi-chrome automation tab if one exists, and otherwise error rather than touching the user's active tab.",
+		description: "List, create, activate, close, group, ungroup, or inspect tabs in the user's existing Chrome profile via the companion extension. New/grouped tabs always use this session's Pi tab group. action=new waits (bounded at 5s) for a real URL to reach load complete and reports loadStatus; about:blank never waits. Background mode keeps new tabs inactive and blocks activate; ask the user to run /chrome background off for foreground/watch mode. activate/close/group/ungroup require a target (targetId/urlIncludes/titleIncludes); with no target they act on this session's pi-chrome automation tab if one exists, and otherwise error rather than touching the user's active tab.",
 		promptSnippet: "List/open/activate/close/group existing Chrome tabs through the companion extension.",
 		parameters: Type.Object({
 			action: StringEnum(tabActionValues),
@@ -2309,6 +2316,13 @@ Usage rules:
 				const tabs = result as Array<{ id: number; title: string; url: string; active: boolean; windowId: number; group?: { title?: string } | null }>;
 				const text = tabs.map((tab) => `${tab.id}\t${tab.active ? "*" : " "}\t${tab.group?.title ? `[${tab.group.title}] ` : ""}${tab.title || "(untitled)"}\t${tab.url}`).join("\n") || "No tabs.";
 				return { content: [{ type: "text", text }], details: { tabs } };
+			}
+			if (params.action === "new") {
+				const created = result as { tab?: { id?: number; windowId?: number; title?: string; url?: string }; group?: { title?: string } | null; loadStatus?: string };
+				const tab = created?.tab ?? {};
+				const groupLabel = created?.group?.title ? ` (${created.group.title})` : "";
+				const text = `created tab ${tab.id ?? "?"} in window ${tab.windowId ?? "?"}${groupLabel} — loadStatus=${created?.loadStatus ?? "unknown"} ${tab.title || "(untitled)"} ${tab.url || ""}`.trim();
+				return { content: [{ type: "text", text }], details: { result: result as Json } };
 			}
 			return { content: [{ type: "text", text: safeJson(result) }], details: { result: result as Json } };
 		},
@@ -2505,13 +2519,14 @@ Usage rules:
 		name: "chrome_type",
 		label: "Chrome Type",
 		description:
-			"Focus an optional snapshot uid or CSS selector, then type using Chrome's real input. Contenteditables use one native text insertion; other fields use key events. Set perCharacter=true for editors needing individual keydown events. Pass includeSnapshot=true to verify after typing.",
-		promptSnippet: "Type text into Chrome, optionally focusing a snapshot uid or selector first.",
+			"Focus an optional snapshot uid or CSS selector, then type using Chrome's real input AT THE CARET. It does NOT replace the field's contents: in a non-empty field the text is appended or spliced wherever the caret sits after the focus click. Use chrome_fill to replace a field's whole value (select-all + delete + type). Contenteditables use one native text insertion; other fields use key events. Set perCharacter=true for editors needing individual keydown events. The result reports the field's value before/after and where the insert landed (insertedAt), and warns when text was spliced into existing content. Optional replace=true does select-all (Ctrl+A) + Delete first, reporting replaced:true. includeSnapshot=true waits (bounded at 5s) only for a navigation already in flight; a result with no navigation field can still miss a delayed navigation, so verify with chrome_snapshot when in doubt.",
+		promptSnippet: "Type text at the caret in Chrome (does NOT replace field contents; use chrome_fill to replace).",
 		parameters: Type.Object({
 			text: Type.String(),
 			uid: Type.Optional(Type.String({ description: "Stable element uid from chrome_snapshot." })),
 			selector: Type.Optional(Type.String({ description: "CSS selector to focus before typing." })),
 			perCharacter: Type.Optional(Type.Boolean({ default: false, description: "Send individual key events even in contenteditables. Default: one native text insertion for contenteditables; key events for other fields." })),
+			replace: Type.Optional(Type.Boolean({ default: false, description: "If true, select-all (Ctrl+A) then Delete before typing, replacing the whole value. Prefer chrome_fill for replacement; the result reports replaced:true." })),
 			includeSnapshot: Type.Optional(Type.Boolean({ description: "If true, include a fresh chrome_snapshot result after typing." })),
 			maxElements: Type.Optional(Type.Number({ default: MAX_ELEMENTS, description: "Max elements in the included snapshot." })),
 			pressEnter: Type.Optional(Type.Boolean()),
@@ -2527,8 +2542,19 @@ Usage rules:
 			const result = (params.includeSnapshot ? (raw as { result: unknown }).result : raw) as Json;
 			const summary = summarizeActionResult(result);
 			const into = params.uid || params.selector ? ` into ${params.uid ?? params.selector}` : "";
-			const base = `Typed ${params.text.length} character(s)${into}.`;
-			const text = summary ? `${base} (${summary})` : base;
+			let base = `Typed ${params.text.length} character(s)${into}.`;
+			const r = (result && typeof result === "object" ? result : {}) as Record<string, unknown>;
+			const spliced = r.insertedAt === "caret-middle" && (params.text.length > 0);
+			if (r.valueRedacted === true) {
+				base += ` Field value [redacted] (${r.existingTextLengthBefore ?? "?"} chars before typing; insert position ${r.insertedAt ?? "unknown"}).`;
+			} else if (typeof r.valueBefore === "string" && typeof r.valueAfter === "string") {
+				base += ` Field went from ${JSON.stringify(r.valueBefore)} to ${JSON.stringify(r.valueAfter)}.`;
+			}
+			const warnings: string[] = [];
+			if (spliced) warnings.push("⚠ text was spliced into existing content (it does NOT replace); use chrome_fill to replace a field's contents");
+			if (spliced && params.pressEnter) warnings.push("⚠ If that Enter submitted the form, it submitted the SPLICED value above, not your text.");
+			if (typeof r.tabStatus === "string" && r.tabStatus !== "complete") warnings.push(`⚠ tab status is ${r.tabStatus}; the page may still be loading`);
+			const text = [base, ...(summary ? [`(${summary})`] : []), ...warnings].join("\n");
 			return { content: [{ type: "text", text: formatIncludedSnapshotText(raw, text) }], details: { result: raw as Json } };
 		},
 	});
@@ -2537,8 +2563,8 @@ Usage rules:
 		name: "chrome_fill",
 		label: "Chrome Fill",
 		description:
-			"Set the full value of a text input, textarea, or contenteditable using Chrome click/select/delete/type input. Contenteditables use one native text insertion; perCharacter=true retains individual keydown events. Accepts a snapshot uid or CSS selector. Pass includeSnapshot=true to verify after filling.",
-		promptSnippet: "Fill a Chrome form field by snapshot uid or selector, optionally returning a fresh snapshot.",
+			"Replace the whole value of a text input, textarea, or contenteditable using Chrome click/select/delete/type input (select-all + delete + type). Unlike chrome_type it does not insert at the caret: the field's existing contents are cleared first. Contenteditables use one native text insertion; perCharacter=true retains individual keydown events. Accepts a snapshot uid or CSS selector. Pass includeSnapshot=true to verify after filling.",
+		promptSnippet: "Replace a Chrome form field's whole value (select-all + delete + type).",
 		parameters: Type.Object({
 			text: Type.String(),
 			uid: Type.Optional(Type.String({ description: "Stable element uid from chrome_snapshot." })),

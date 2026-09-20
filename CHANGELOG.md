@@ -12,6 +12,41 @@ All notable user-facing changes to `pi-chrome`.
 
 ### Fork additions on top of 0.15.51
 
+- **Typing reports what it did, and observations never predate their own navigation.** Two
+  silent-success bugs were reproduced live and fixed. `chrome_type` types at the caret, so into a
+  field holding `why do flamingos stand on one leg` it produced
+  `why do flamingos why do cats knead blanketsstand on one leg` (caret mid-string) while the tool
+  text said only `Typed 26 character(s) into #q.`; pressing Enter then submitted the spliced value
+  as `q=why+do+flamingwhy+do+cats+knead+blanketsos+stand+on+one+leg`. The real-input result now
+  carries `valueBefore`/`valueAfter` (truncated like snapshots, 120 chars),
+  `existingTextLengthBefore`, and `insertedAt` (`caret-middle` | `caret-end` |
+  `replaced-selection`); password/credential fields follow the snapshot redaction convention
+  (`valueRedacted: true`, no value). The Pi text prints the before → after values and warns loudly
+  that the text was spliced into existing content, plus a second warning when `pressEnter`
+  submitted the spliced value. `chrome_fill` stays the replace path and both tool descriptions
+  state the caret-vs-replace contract. `chrome_type({ replace: true })` does select-all (Ctrl+A)
+  key events + Delete first and reports `replaced: true`, and the before/after evidence is read
+  before the delete so a replaced field still reports its pre-existing value. For a target that
+  carries no value (wrapper div, ARIA textbox, iframe focus) the value report is omitted instead
+  of falsely saying the field went from "" to "". Contenteditable splices are detected from the
+  measured caret even past the 120-char display truncation. Separately, an action with
+  `includeSnapshot` no longer observes the outgoing document when its navigation is already in
+  flight when the action returns: the worker anchors the tab url/status first and, when the URL
+  changed or a previously complete tab is now loading, waits for `chrome.tabs.onUpdated` complete
+  bounded at `min(timeoutMs || 15000, 5000)` ms before snapshotting, returning
+  `navigation: { from, to, settled, waitedMs }`; a tab that was already loading is flagged
+  `settled: false` but not waited on, and a timed-out wait still returns the snapshot with
+  `navigation.settled: false` and never fails the action, and the Pi text says the snapshot may
+  describe the document being replaced and to re-check with `chrome_snapshot`. A navigation that
+  only starts after the action returns (delayed `location.assign`, SPA fetch-then-navigate,
+  `setTimeout` submit) is not observed and produces no `navigation` field. `tab.new` no
+  longer reports `chrome.tabs.create`'s t=0 object (`{url:"", title:"", status:"loading"}`) while
+  the tab loads (measured complete under 10 s): for real URLs it waits bounded to completion
+  (capped at 5 s) and returns `loadStatus: "complete" | "timedOut"` plus the settled tab, never
+  waits for `about:blank`, and the one-line Pi text shows `created tab <id> in window <id>
+  (<group>) — loadStatus=…`. Covered by unit tests in `input-reliability.test.mjs`,
+  `background-policy.test.mjs`, and `cdp-passthrough.test.mjs`.
+
 - **Raw CDP passthrough (`cdp.call` / `chrome_cdp`).** Execute an arbitrary Chrome DevTools
   Protocol method against a resolved tab. `method` must be a non-empty string and `params`
   must be an object (both validated before touching the debugger), and unknown top-level
