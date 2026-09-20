@@ -2008,7 +2008,12 @@ Usage rules:
 		if (windowId === undefined) return;
 		const result = (await bridge.send(
 			"window.select",
-			{ ...windowParams(ctx), windowId },
+			// pickSource marks this pick as the user's own /chrome window choice; the extension refuses
+			// window.select without it (the measured hand-built POST /command that pinned Pi to a window
+			// the user had not chosen). It is a mis-call guard, not authentication — the wire body is
+			// client-asserted — and the durable barrier is the connector key below: the extension only
+			// remembers a pick that carries this profile's own key.
+			{ ...windowParams(ctx), windowId, pickSource: "user" },
 			20_000,
 		)) as { windowId?: number | null; reused?: boolean; moved?: boolean; pickedAt?: number; swept?: number };
 		// The pick is machine-wide state, not a per-session detail: save it so a new session inherits it
@@ -2017,6 +2022,14 @@ Usage rules:
 		// file and the records it was compared against agree on both — a locally invented stamp would let
 		// a record written moments earlier look newer (or older) than it is.
 		const chosenWindowId = typeof result.windowId === "number" ? result.windowId : windowId;
+		// The saved pick carries the connector that made it, and that key is what the extension uses to tell this
+		// profile's pick from another profile's window id — and to decide whether the pick may become the
+		// REMEMBERED, machine-wide one that callers which forward nothing follow. In client mode the key is only
+		// known after a status refresh (ownerStatus), and /chrome window is the one command path that never went
+		// through the dashboard: measured live, a pick made straight from the picker was saved as
+		// `"preferredWindowKey": null`, which silently disabled that attribution and left a hand-built,
+		// pick-less caller pinned to the window the user had moved away from. Refresh first so the key is real.
+		await bridge.refreshStatus().catch(() => undefined);
 		const saved = writePreferredWindow(chosenWindowId, result.pickedAt, bridge.clientKey());
 		const sweptNote = typeof result.swept === "number" && result.swept > 0
 			? ` ${result.swept} other Pi session${result.swept === 1 ? "'s tab was" : "s' tabs were"} moved there too.`

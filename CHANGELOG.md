@@ -125,13 +125,17 @@ All notable user-facing changes to `pi-chrome`.
   driving a tab in the user's window, and a window the user had already replaced still held Pi's tabs.
   Now the pick carries when it was made and which connector made it (`preferredWindowAt`,
   `preferredWindowKey`, stored beside the existing `preferredWindow`), each record carries when a human
-  picked it (`pickedAt`), and the newer of the two wins: an explicit session pick still beats an older
-  machine-wide default, while a pick in any session beats every record that was never picked or was
-  picked earlier — including the unscoped default bucket, which is why an unscoped caller can no longer
-  resurrect the user's window. A pick whose window is gone is refused before anything is touched, so a
-  stale id cannot move a session out of a working window and then fail. The connector key means a pick
-  made in Edge cannot move a tab in Chrome: window ids are per profile, and the same number in another
-  browser is a different window.
+  picked it (`pickedAt`), and the pick is the **one writer**: a record whose window differs is superseded
+  whatever its stamp says — `preferredWindowAt`/`pickedAt` are still written and reported, but they no
+  longer order anything. A record written *later* is exactly what a rogue caller or a clock skew
+  produces, and the measured conflict was the extension's own unscoped `__default__` bucket holding a
+  record with `pickedAt` **newer** than the user's pick (window 720723708 against the chosen 720723947),
+  so Pi worked in a window the user had not chosen. No timestamp comparison could tell that apart from a
+  legitimate newer pick, and today's rule does not try: the pick decides, full stop, which is why an
+  unscoped caller can no longer resurrect the user's window. A pick whose window is gone is refused
+  before anything is touched, so a stale id cannot move a session out of a working window and then fail.
+  The connector key means a pick made in Edge cannot move a tab in Chrome: window ids are per profile,
+  and the same number in another browser is a different window.
 
   Superseded sessions are moved by **moving their tab** into the picked window, not by closing it and
   rebuilding — the tab holds the agent's page (a half-filled form, a logged-in session), and re-picking a
@@ -150,6 +154,21 @@ All notable user-facing changes to `pi-chrome`.
   away from picking theirs. The window Pi is working in (or the saved default, when this session has none
   yet) is now listed first and labelled (`Pi works here` / `saved default`), and a saved window that is no
   longer open is named as gone instead of silently leaving the cursor on the first entry.
+
+  The pick is also remembered across worker restarts: the extension mirrors the newest pick it has seen
+  to `chrome.storage.session` and uses it for commands that carry no `preferredWindow`. That is what lets
+  a caller which cannot read `~/.pi/agent/pi-chrome.json` — the measured hand-built `POST /command` with
+  no `sessionKey` — work in the window the user chose (create or reuse there, never the focused window),
+  even after an MV3 service-worker restart, and it still refuses with the `/chrome window` message when
+  nothing was ever remembered rather than inventing a window. Only a pick that carries this profile's
+  connector key (`preferredWindowKey`, which `/chrome window` saves) is mirrored: a pick from a caller
+  that cannot name the profile is used for its own command but cannot become the machine-wide remembered
+  pick, so the measured hand-built `POST /command` can no longer pin every later pick-less command to a
+  window the user did not choose. `window.select` is accepted only with `pickSource: "user"`, which
+  `/chrome window` sends; an unmarked call — the measured hand-built `POST /command` — fails with `Only
+  /chrome window can choose Pi's window.` before any record write, tab create/move or sweep. That marker
+  is a mis-call guard, not a security boundary: the command body is client-asserted, so a local process
+  can still claim it, and the durable barrier is the connector-key attribution above.
 - **Fixed: a fresh automation tab could not run page actions on Edge.**
   Automation targets were created at `about:blank#pi-chrome`. Measured on Edge 123, the debugger
   refuses that URL with `Cannot access contents of url "about:blank#pi-chrome". Extension manifest

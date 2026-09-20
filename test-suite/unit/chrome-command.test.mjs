@@ -35,6 +35,11 @@ function harness({ until, background = true, mode = "server", choices = [], send
   const calls = [], notices = [], menus = [], namesWritten = [], preferredWindowsWritten = [], pickedAtWritten = [], pickedKeysWritten = [];
   let savedPreferredWindow = preferredWindow;
   let savedPreferredWindowAt;
+  // Client-mode shape by default: the connector key is only known after a status refresh (the real
+  // bridge populates ownerStatus there), so a picker that saves a pick without refreshing first saves it
+  // keyless — measured live as "preferredWindowKey": null, which disables the extension's connector
+  // attribution and keeps the remembered machine-wide pick empty for callers that forward nothing.
+  let statusRefreshed = false;
   let command;
   const ctx = {
     ui: {
@@ -83,9 +88,9 @@ function harness({ until, background = true, mode = "server", choices = [], send
       : {}),
     bridge: {
       status: () => ({ mode }),
-      refreshStatus: async () => ({ mode, clients: connectors }),
+      refreshStatus: async () => { statusRefreshed = true; return { mode, clients: connectors }; },
       clientLabel: () => clientLabel,
-      clientKey: () => clientKey,
+      clientKey: () => (statusRefreshed ? clientKey : undefined),
       async send(action, params, timeout) {
         calls.push({ action, params: JSON.parse(JSON.stringify(params)), timeout });
         return send(action, params, timeout);
@@ -294,12 +299,31 @@ test("/chrome window is routed, carries this session's key, and saves the pick m
   assert.equal(picked.calls[1].action, "window.select");
   assert.equal(picked.calls[1].params.windowId, 11);
   assert.equal(picked.calls[1].params.sessionKey, "session:test");
+  assert.equal(picked.calls[1].params.pickSource, "user",
+    "the picker must declare itself the user, because the extension refuses window.select without pickSource (the measured hand-built POST /command that pinned Pi to a window the user had not chosen)");
   assert.deepEqual(picked.preferredWindowsWritten, [11], "the pick is persisted machine-wide");
   assert.deepEqual(picked.pickedAtWritten, [4242],
     "the file gets the SAME stamp the extension applied, not a locally invented one — two clocks would let a record written moments earlier look newer than the pick");
   assert.deepEqual(picked.pickedKeysWritten, ["edge:unittest"],
     "and the connector that made the pick, so another profile's window id can never match it");
   assert.match(String(picked.notices.at(-1)[0]), /saved, so new sessions use it too/);
+});
+
+test("a pick is saved with this connector's key, even from a client-mode session", async () => {
+  // Measured live: the saved pick had `"preferredWindowKey": null` because the picker read the connector key
+  // before any status refresh (client mode populates it there). A keyless pick silently disables the
+  // extension's connector attribution AND never becomes the remembered machine-wide pick, so callers that
+  // forward nothing (hand-built POST /command) stay pinned to whatever window they used last. The harness
+  // models that shape: clientKey() is undefined until refreshStatus() has run once.
+  const windowResponse = (action) =>
+    action === "window.list"
+      ? { windows: [{ windowId: 11, tabCount: 2, title: "T", focused: false, holdsTargetTab: true }], ownsTargetWindow: false, targetWindowId: null, workingWindowId: 11 }
+      : { windowId: 11, reused: false, pickedAt: 4242 };
+  const h = harness({ send: windowResponse, preferredWindow: 11, choices: ["✓ Window 11 — 2 tabs, saved default — T"] });
+  await h.run("window");
+  assert.deepEqual(h.preferredWindowsWritten, [11]);
+  assert.deepEqual(h.pickedKeysWritten, ["edge:unittest"],
+    "the pick must name the connector that made it: without that key the extension refuses to remember it machine-wide");
 });
 
 test("the picker marks the saved default and offers it first, so re-choosing cannot land on the user's window", async () => {

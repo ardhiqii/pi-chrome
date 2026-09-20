@@ -548,7 +548,7 @@ async function run() {
     const state = makeChromeState();
     const w = loadWorker(makeChrome(state));
     await throwsWith(
-      () => w.dispatch("window.select", { windowId: null, sessionKey: SK }),
+      () => w.dispatch("window.select", { windowId: null, sessionKey: SK, pickSource: "user" }),
       /\/chrome window|no longer creates a window/,
       "own-window: windowId:null refuses instead of creating a window",
     );
@@ -557,14 +557,15 @@ async function run() {
   }
 
   // ===== An explicit pick: window.select records the session's assignment and creates one inactive
-  // guest tab in the chosen window. The record then beats the saved default. =====
+  // guest tab in the chosen window. Under the one-writer rule (R1) that record does NOT outrank the
+  // machine-wide pick; the pick still decides and the record only mirrors it. =====
   {
     const state = makeChromeState();
     const w = loadWorker(makeChrome(state));
     const otherWindowId = state.alloc.window();
     state.windows.set(otherWindowId, { id: otherWindowId });
 
-    const selected = await w.dispatch("window.select", { windowId: state.userWindowId, sessionKey: SK });
+    const selected = await w.dispatch("window.select", { windowId: state.userWindowId, sessionKey: SK, pickSource: "user" });
     ok(selected.windowId === state.userWindowId && Number.isInteger(selected.tabId), "explicit: the pick is recorded in the chosen window");
     ok(state.tabs.get(selected.tabId).windowId === state.userWindowId, "explicit: the guest tab is in the chosen window");
     ok(state.tabs.get(selected.tabId).active === false, "explicit: the guest tab is inactive");
@@ -572,32 +573,74 @@ async function run() {
     assertNoCreation(state, "explicit");
     ok(state.events.focuses.length === 0, "explicit: choosing a window did not focus anything");
 
-    // A saved default pointing elsewhere must NOT pull the session out of its explicit assignment.
-    const nav = await navWith(w, "https://pi.test/explicit-wins", SK, otherWindowId);
-    ok(nav.windowId === state.userWindowId && nav.id === selected.tabId, "explicit: the session's own assignment beats the saved default");
-    ok(state.tabs.get(nav.id).windowId === state.userWindowId, "explicit: the reused tab is where the record says");
-
     // Re-selecting the same window keeps the tab instead of churning one.
-    const again = await w.dispatch("window.select", { windowId: state.userWindowId, sessionKey: SK });
+    const again = await w.dispatch("window.select", { windowId: state.userWindowId, sessionKey: SK, pickSource: "user" });
     ok(again.reused === true && again.tabId === selected.tabId, "explicit: re-selecting the current window reuses the guest tab");
 
-    // Selecting another existing window moves the guest tab there — the tab is MOVED, not replaced:
-    // re-choosing a window must not throw away the page the session was working on, and the new window
-    // must be the only one holding Pi's tab afterwards.
+    // ONE WRITER: a machine-wide pick naming another window supersedes even the session's own explicit
+    // record, and its tab is MOVED there so the page survives. This block used to assert the opposite
+    // ("the session's own assignment beats the saved default") — the rule that let the worker's newer
+    // __default__ record outrank the user's saved pick in the measured conflict.
+    const nav = await navWith(w, "https://pi.test/explicit-wins", SK, otherWindowId);
+    ok(nav.windowId === otherWindowId && nav.id === selected.tabId,
+      "explicit: the machine-wide pick supersedes the session's own record and moves its tab");
+    ok(state.tabs.get(nav.id).windowId === otherWindowId, "explicit: the moved tab now lives in the picked window");
+
+    // Selecting the window the tab was moved away from moves it back — the tab is MOVED, not replaced:
+    // re-choosing a window must not throw away the page the session was working on, and the window it
+    // leaves must hold only its own tabs again.
     state.tabs.set(state.alloc.tab(), { id: state.tabs.size + 3, windowId: otherWindowId, url: "https://example.com/other", active: false, groupId: -1 });
-    const moved = await w.dispatch("window.select", { windowId: otherWindowId, sessionKey: SK });
-    ok(moved.windowId === otherWindowId && state.tabs.get(moved.tabId).windowId === otherWindowId, "explicit: re-selecting moves the assignment");
+    const moved = await w.dispatch("window.select", { windowId: state.userWindowId, sessionKey: SK, pickSource: "user" });
+    ok(moved.windowId === state.userWindowId && state.tabs.get(moved.tabId).windowId === state.userWindowId, "explicit: re-selecting moves the assignment");
     ok(moved.tabId === selected.tabId && moved.moved === true, "explicit: the guest tab itself moved, keeping its page");
-    ok(state.tabs.has(selected.tabId) && state.tabs.get(selected.tabId).windowId === otherWindowId && state.tabs.has(state.userArticle.id) && state.tabs.has(state.userGmail.id),
+    ok(state.tabs.has(selected.tabId) && state.tabs.get(selected.tabId).windowId === state.userWindowId && state.tabs.has(state.userArticle.id) && state.tabs.has(state.userGmail.id),
       "explicit: the window it left holds only its own tabs again");
-    ok(state.windows.has(state.userWindowId), "explicit: the window it left is still open");
+    ok(state.windows.has(otherWindowId), "explicit: the window it left is still open");
   }
 
-  // ===== The machine-wide pick supersedes an assignment nobody ever picked. =====
+  // ===== NO ROGUE WRITERS (R3): window.select may change the workspace only when the caller says the
+  // USER made the choice. The measured failure: another agent posted hand-built JSON to POST /command (no
+  // sessionKey, no pickSource) calling window.select, and thereby pinned Pi to a window the user did not
+  // choose. Without pickSource:"user" the call must fail, name /chrome window, and touch nothing: no
+  // record write, no tab create or move, no sweep — and no remembered pick either (the mirrored pick here
+  // was seeded by a keyed forwarded pick, the shape the real Pi side sends). =====
+  {
+    const state = makeChromeState();
+    const w = loadWorker(makeChrome(state, { withTabGroups: true }));
+    const ownKey = await w.selfClientKey();
+    const otherWindowId = state.alloc.window();
+    state.windows.set(otherWindowId, { id: otherWindowId });
+    const before = await navWith(w, "https://pi.test/rogue-pre", SK, state.userWindowId, { preferredWindowKey: ownKey });
+    const tabIdsBefore = [...state.tabs.keys()].sort().join();
+
+    await throwsWith(
+      () => w.dispatch("window.select", { windowId: otherWindowId, sessionKey: SK }),
+      /Only \/chrome window can choose Pi's window/,
+      "rogue: window.select without pickSource fails, naming the only writer",
+    );
+    ok([...state.tabs.keys()].sort().join() === tabIdsBefore, "rogue: no tab was created or closed");
+    ok(state.tabs.get(before.id).windowId === state.userWindowId, "rogue: no tab was moved");
+    const status = await w.dispatch("automation.status", { sessionKey: SK });
+    ok(status.windowId === state.userWindowId && status.tabId === before.id, "rogue: the workspace record is unchanged");
+    ok(state.storage.piChromePreferredWindow && state.storage.piChromePreferredWindow.windowId === state.userWindowId,
+      "rogue: the refusal did not overwrite the remembered pick with the rogue window");
+    ok(state.windows.has(otherWindowId), "rogue: the window the rogue call named is untouched");
+    assertNoCreation(state, "rogue");
+
+    // The user's own picker carries pickSource:"user", and that same call moves the workspace as before.
+    const picked = await w.dispatch("window.select", { windowId: otherWindowId, sessionKey: SK, pickSource: "user" });
+    ok(picked.windowId === otherWindowId && state.tabs.get(picked.tabId).windowId === otherWindowId,
+      "rogue: the same call with pickSource:\"user\" moves the workspace");
+    ok(state.storage.piChromePreferredWindow && state.storage.piChromePreferredWindow.windowId === otherWindowId,
+      "rogue: the real pick updates the remembered window");
+  }
+
+  // ===== The machine-wide pick supersedes an assignment nobody ever picked — and, per R1, one somebody
+  // did pick too. =====
   // The live bug: a session (or the extension's own unscoped default bucket) had resolved a target inside
-  // the user's window before /chrome window was used, and the pick saved afterwards changed nothing — Pi
-  // kept driving the tab in the user's window while the picker marked another one. A record the implicit
-  // resolver created carries no pickedAt, so it is stale by definition; a record a human picked is not.
+  // the user's window before /chrome window was used, and a record written AFTER the pick (the measured
+  // __default__ bucket, pickedAt newer than the user's pick) kept deciding the workspace. Records no longer
+  // decide at all: a record whose window differs from the pick is superseded whatever its pickedAt says. =====
   {
     const state = makeChromeState();
     const w = loadWorker(makeChrome(state, { withTabGroups: true }));
@@ -661,31 +704,37 @@ async function run() {
     assertNoCreation(state, "legacy-pick");
   }
 
-  // An explicit session pick is NOT disturbed by a machine-wide default that is older than it — the rule
-  // that keeps session-scoped choices meaningful, asserted with both times present.
+  // ONE WRITER (the measured conflict): a session that picked for itself does NOT keep its window against
+  // the machine-wide pick even when the machine-wide pick is OLDER than the session's own stamp. The old
+  // "newer explicit pick wins" comparison is what let the worker's `__default__` bucket record
+  // (pickedAt newer than the user's pick 720723947, windowId 720723708) outrank the window the user chose.
   {
     const state = makeChromeState();
     const w = loadWorker(makeChrome(state));
     const otherWindowId = state.alloc.window();
     state.windows.set(otherWindowId, { id: otherWindowId });
 
-    const selected = await w.dispatch("window.select", { windowId: state.userWindowId, sessionKey: SK });
+    const selected = await w.dispatch("window.select", { windowId: state.userWindowId, sessionKey: SK, pickSource: "user" });
     const nav = await navWith(w, "https://pi.test/explicit-newer", SK, otherWindowId, { preferredWindowAt: Date.now() - 60_000 });
-    ok(nav.windowId === state.userWindowId && nav.id === selected.tabId,
-      "supersede: an explicit pick newer than the machine-wide one still wins");
+    ok(nav.windowId === otherWindowId,
+      "one-writer: an OLDER machine-wide pick still beats the session's own newer record");
+    ok(nav.id === selected.tabId && state.tabs.get(selected.tabId).windowId === otherWindowId,
+      "one-writer: the session's tab is moved to the pick instead of the record surviving on recency");
+    assertNoCreation(state, "one-writer-older-pick");
   }
 
-  // The reverse, and the reason the pick time exists: a NEWER machine-wide pick moves even a session that
-  // had picked for itself. "Pick a window once; Pi remembers it machine-wide" has to mean the pick wins.
+  // The other direction of the same rule: a NEWER machine-wide pick also wins. Asserting both directions is
+  // what makes this block load-bearing for "the pick decides regardless of timestamps" rather than merely
+  // re-asserting the old recency rule with a convenient clock.
   {
     const state = makeChromeState();
     const w = loadWorker(makeChrome(state));
     const otherWindowId = state.alloc.window();
     state.windows.set(otherWindowId, { id: otherWindowId });
 
-    const selected = await w.dispatch("window.select", { windowId: state.userWindowId, sessionKey: SK });
+    const selected = await w.dispatch("window.select", { windowId: state.userWindowId, sessionKey: SK, pickSource: "user" });
     const nav = await navWith(w, "https://pi.test/machine-newer", SK, otherWindowId, { preferredWindowAt: Date.now() + 60_000 });
-    ok(nav.windowId === otherWindowId, "supersede: a newer machine-wide pick moves even an explicitly picked session");
+    ok(nav.windowId === otherWindowId, "one-writer: a newer machine-wide pick beats an explicitly picked session too");
     ok(nav.id === selected.tabId && state.tabs.has(selected.tabId) && state.tabs.get(selected.tabId).windowId === otherWindowId,
       "supersede: the superseded session's tab moves with it instead of losing its page");
     assertNoCreation(state, "supersede-newer");
@@ -704,7 +753,7 @@ async function run() {
     const b = await navWith(w, "https://pi.test/debris-b", "session:b", state.userWindowId);
     ok(a.windowId === state.userWindowId && b.windowId === state.userWindowId, "sweep: two sessions are working in the user's window");
 
-    const picked = await w.dispatch("window.select", { windowId: otherWindowId, sessionKey: "session:c" });
+    const picked = await w.dispatch("window.select", { windowId: otherWindowId, sessionKey: "session:c", pickSource: "user" });
     ok(picked.windowId === otherWindowId, "sweep: the pick is recorded for the picking session");
     ok(typeof picked.pickedAt === "number", "sweep: the pick reports the stamp it wrote, so the Pi side saves the same one");
     ok(picked.swept === 2, "sweep: the pick reports how many other sessions it moved");
@@ -720,12 +769,15 @@ async function run() {
     assertNoCreation(state, "sweep-pick");
   }
 
-  // The guest tabs belonging to other sessions survive a worker restart with their pick time, so a later
-  // machine-wide pick still compares against when a human chose them rather than treating them as unpicked.
+  // The guest tabs belonging to other sessions survive a worker restart with their pick time, and a
+  // machine-wide pick still outranks the hydrated record — including an OLDER pick — while MOVING the tab the
+  // record names rather than losing its page. The stamp survives for reporting/compat (asserted above), but
+  // under the one-writer rule it does not decide the workspace. This used to assert the opposite: that the
+  // hydrating worker let its own newer record keep winning.
   {
     const state = makeChromeState();
     const first = loadWorker(makeChrome(state));
-    const picked = await first.dispatch("window.select", { windowId: state.userWindowId, sessionKey: SK });
+    const picked = await first.dispatch("window.select", { windowId: state.userWindowId, sessionKey: SK, pickSource: "user" });
     ok(typeof picked.pickedAt === "number", "durable-pick: window.select stamps the record");
     const persisted = state.storage.piChromeAutomationTargets || {};
     ok(persisted[SK] && persisted[SK].pickedAt === picked.pickedAt, "durable-pick: the stamp is persisted, not just kept in memory");
@@ -735,8 +787,301 @@ async function run() {
     state.windows.set(otherWindowId, { id: otherWindowId });
     const second = loadWorker(makeChrome(state));
     const nav = await navWith(second, "https://pi.test/durable", SK, otherWindowId, { preferredWindowAt: picked.pickedAt - 60_000 });
-    ok(nav.windowId === state.userWindowId && nav.id === picked.tabId,
-      "durable-pick: the hydrating worker still knows this session picked for itself");
+    ok(nav.windowId === otherWindowId && nav.id === picked.tabId,
+      "durable-pick: the hydrating worker applies an OLDER machine-wide pick to its own hydrated record");
+    ok(state.tabs.has(picked.tabId) && state.tabs.get(picked.tabId).windowId === otherWindowId,
+      "durable-pick: the hydrated record's tab was moved into the picked window, not abandoned");
+    assertNoCreation(state, "durable-pick");
+  }
+
+  // ===== REMEMBERED PICK (R2): the worker mirrors the newest pick it has seen to chrome.storage.session,
+  // so a pick-less caller still works in the user's window after an MV3 worker restart. This is the
+  // measured hand-built POST /command shape: no sessionKey, no preferredWindow, no access to
+  // ~/.pi/agent/pi-chrome.json. Without the mirror it had no pick at all, and whatever record its bucket
+  // held could pin Pi to a window the user had not chosen. =====
+  {
+    const state = makeChromeState();
+    const pickedWindowId = state.alloc.window();
+    state.windows.set(pickedWindowId, { id: pickedWindowId });
+    const first = loadWorker(makeChrome(state));
+    const ownKey = await first.selfClientKey();
+
+    // A command carrying the user's pick (what the Pi side forwards on every command it sends) teaches
+    // the worker the window, and the mirror is written to storage.session. The connector key is part of
+    // that pick: without this profile's own key the mirror is deliberately NOT written (see the
+    // attribution block below), because a keyless pick is exactly the hand-built POST shape.
+    const seeded = await navWith(first, "https://pi.test/remember-seed", SK, pickedWindowId, { preferredWindowAt: 4000, preferredWindowKey: ownKey });
+    ok(seeded.windowId === pickedWindowId, "remembered: the pick-carrying command works in the picked window");
+    ok(state.storage.piChromePreferredWindow && state.storage.piChromePreferredWindow.windowId === pickedWindowId,
+      "remembered: the pick is mirrored to chrome.storage.session");
+    ok(state.storage.piChromePreferredWindow.key === ownKey,
+      "remembered: the mirror keeps this profile's connector key, so the profile check still works after a restart");
+
+    // A fresh worker over the same browser state: worker memory is wiped, storage.session survives.
+    const second = loadWorker(makeChrome(state));
+    const picklessParams = {
+      url: "https://pi.test/remember-after-restart",
+      waitUntilLoad: false,
+      sessionKey: "session:pickless",
+      sessionGroupTitle: "Pi Agent",
+      joinSessionGroup: true,
+      // Deliberately no preferredWindow/preferredWindowAt/preferredWindowKey: the pick-less caller shape.
+    };
+    const nav = await second.dispatch("page.navigate", picklessParams);
+    ok(nav.windowId === pickedWindowId && state.tabs.get(nav.id).windowId === pickedWindowId,
+      "remembered: a pick-less command after a restart creates its target in the remembered window");
+
+    // The second pick-less command in that session REUSES that tab (R4: create/reuse in the pick window,
+    // never the focused window), so the remembered pick behaves exactly like a forwarded one.
+    const again = await second.dispatch("page.navigate", { ...picklessParams, url: "https://pi.test/remember-after-restart-2" });
+    ok(again.id === nav.id && state.tabs.get(again.id).windowId === pickedWindowId,
+      "remembered: the next pick-less action reuses the target in the remembered window");
+    assertNoCreation(state, "remembered");
+
+    // Sanity on the mirror's scope: a remembered pick still passes the connector-key check, so a pick
+    // remembered here is usable here (the foreign-key refusal is asserted in the foreign-pick block).
+    const status = await second.dispatch("automation.status", { sessionKey: "session:pickless" });
+    ok(status.windowId === pickedWindowId, "remembered: the pick-less session's record names the remembered window");
+
+    // window.list is another machinePickParams consumer: the picker must mark the remembered window for a
+    // session that has no record yet, not fall back to the first entry (usually the user's focused one).
+    const report = await second.dispatch("window.list", { sessionKey: "session:never" });
+    ok(report.workingWindowId === pickedWindowId,
+      "remembered: window.list reports the remembered window as the workspace");
+  }
+
+  // With no pick to forward AND nothing remembered, a pick-less caller still refuses with the existing
+  // /chrome window message instead of guessing (R4's negative half) — the mirror must not become a licence
+  // to invent a window.
+  {
+    const state = makeChromeState();
+    const w = loadWorker(makeChrome(state));
+    await throwsWith(
+      () => w.dispatch("page.navigate", {
+        url: "https://pi.test/no-remembered-pick",
+        waitUntilLoad: false,
+        sessionKey: "session:pickless",
+        sessionGroupTitle: "Pi Agent",
+        joinSessionGroup: true,
+      }),
+      /\/chrome window/,
+      "remembered: with nothing remembered, a pick-less caller refuses with the fix named",
+    );
+    ok(state.tabs.size === 2, "remembered: the refusal created no tab");
+    assertNoCreation(state, "remembered-none");
+  }
+
+  // ===== ATTRIBUTION: a pick on a non-select action is usable for the command that carries it, but only
+  // a pick that carries THIS profile's own connector key may become the remembered machine-wide pick.
+  // The measured rogue POST /command carried just `preferredWindow`: before this barrier it overwrote the
+  // mirror and pinned every later pick-less command — the exact caller R2 was built for — to a window the
+  // user did not choose, durably across worker restarts. =====
+  {
+    const state = makeChromeState();
+    const pickedWindowId = state.alloc.window();
+    const rogueWindowId = state.alloc.window();
+    state.windows.set(pickedWindowId, { id: pickedWindowId });
+    state.windows.set(rogueWindowId, { id: rogueWindowId });
+    const w = loadWorker(makeChrome(state));
+    const ownKey = await w.selfClientKey();
+
+    const picked = await w.dispatch("window.select", { windowId: pickedWindowId, sessionKey: SK, pickSource: "user" });
+    ok(state.storage.piChromePreferredWindow.windowId === pickedWindowId, "attribution: the user's pick is remembered");
+    ok(state.storage.piChromePreferredWindow.key === ownKey, "attribution: the remembered pick carries the profile's connector key");
+
+    // The hand-built shape: no sessionKey, no pickSource, no preferredWindowKey.
+    const rogue = await navWith(w, "https://pi.test/rogue-wire-pick", "session:rogue", rogueWindowId, { preferredWindowAt: Date.now() + 60_000 });
+    ok(rogue.windowId === rogueWindowId, "attribution: the unkeyed pick is still usable for the command that carries it");
+    ok(state.storage.piChromePreferredWindow.windowId === pickedWindowId && state.storage.piChromePreferredWindow.key === ownKey,
+      "attribution: the unkeyed pick did not overwrite the remembered machine-wide pick");
+
+    // The pick-less caller (the measured hand-built POST /command shape) must still resolve into the
+    // user's window, and the rogue pick must not have retargeted the user's session record either.
+    const pickless = await w.dispatch("page.navigate", {
+      url: "https://pi.test/rogue-wire-after",
+      waitUntilLoad: false,
+      sessionKey: "session:pickless",
+      sessionGroupTitle: "Pi Agent",
+      joinSessionGroup: true,
+    });
+    ok(pickless.windowId === pickedWindowId && state.tabs.get(pickless.id).windowId === pickedWindowId,
+      "attribution: a later pick-less session still lands in the user's remembered window");
+    ok(state.tabs.get(picked.tabId).windowId === pickedWindowId,
+      "attribution: the rogue pick did not retarget a different session's record");
+    assertNoCreation(state, "attribution");
+  }
+
+  // ===== A remembered pick made in ANOTHER profile must not be replayed here: window ids are per
+  // profile, so the same number names a different window (or nothing). The pick-less caller is refused
+  // with the fix named instead of being sent to a foreign window. =====
+  {
+    const state = makeChromeState();
+    const foreignWindowId = state.alloc.window();
+    state.windows.set(foreignWindowId, { id: foreignWindowId });
+    const probe = loadWorker(makeChrome(state));
+    const foreignKey = `${await probe.selfClientKey()}-other-profile`;
+    state.storage.piChromePreferredWindow = { windowId: foreignWindowId, at: 4000, key: foreignKey };
+    const w = loadWorker(makeChrome(state));
+
+    await throwsWith(
+      () => w.dispatch("page.navigate", {
+        url: "https://pi.test/foreign-remembered",
+        waitUntilLoad: false,
+        sessionKey: "session:pickless",
+        sessionGroupTitle: "Pi Agent",
+        joinSessionGroup: true,
+      }),
+      /\/chrome window/,
+      "remembered-foreign: a pick remembered in another profile refuses here",
+    );
+    ok(state.tabs.size === 2, "remembered-foreign: no tab was created in the foreign window id");
+    assertNoCreation(state, "remembered-foreign");
+  }
+
+  // ===== A window.select naming a window that does not exist fails loudly WITHOUT becoming the
+  // remembered pick: the existence check runs before the mirror write, so a stale pick cannot erase the
+  // working one (and a later pick-less command cannot be sent to a dead window). =====
+  {
+    const state = makeChromeState();
+    const pickedWindowId = state.alloc.window();
+    state.windows.set(pickedWindowId, { id: pickedWindowId });
+    const w = loadWorker(makeChrome(state));
+    const ownKey = await w.selfClientKey();
+    await w.dispatch("window.select", { windowId: pickedWindowId, sessionKey: SK, pickSource: "user" });
+    const goneWindowId = state.alloc.window(); // allocated but never inserted: closed before it was picked
+
+    await throwsWith(
+      () => w.dispatch("window.select", { windowId: goneWindowId, sessionKey: SK, pickSource: "user" }),
+      /No browser window with id/,
+      "select-gone: selecting a closed window fails loudly",
+    );
+    ok(state.storage.piChromePreferredWindow.windowId === pickedWindowId,
+      "select-gone: the failed select left the remembered pick intact");
+    ok(state.storage.piChromePreferredWindow.key === ownKey,
+      "select-gone: the failed select left the remembered pick's key intact");
+  }
+
+  // ===== The window.select mirror keeps a previously stored connector key when this worker cannot
+  // derive its own (storage.local unavailable): a transient outage must not downgrade the remembered pick
+  // to keyless, which would silently disable the profile check for every later pick-less caller. =====
+  {
+    const state = makeChromeState();
+    const firstWindowId = state.alloc.window();
+    const pickedWindowId = state.alloc.window();
+    state.windows.set(firstWindowId, { id: firstWindowId });
+    state.windows.set(pickedWindowId, { id: pickedWindowId });
+    const probe = loadWorker(makeChrome(state));
+    const ownKey = await probe.selfClientKey();
+
+    // A keyed mirror exists in storage.session (written by an earlier worker of this profile).
+    state.storage.piChromePreferredWindow = { windowId: firstWindowId, at: 1, key: ownKey };
+    const w = loadWorker(makeChrome(state));
+    // This worker cannot read its profile id at all.
+    w.chrome.storage.local.get = async () => { throw new Error("storage.local unavailable"); };
+
+    await w.dispatch("window.select", { windowId: pickedWindowId, sessionKey: SK, pickSource: "user" });
+    ok(state.storage.piChromePreferredWindow.windowId === pickedWindowId,
+      "select-keyless-worker: the pick still moves to the selected window");
+    ok(state.storage.piChromePreferredWindow.key === ownKey,
+      "select-keyless-worker: the previously mirrored connector key is kept when this worker has none");
+  }
+
+  // ===== The measured combination (R1 + R2): a pick-less command whose OWN bucket already holds a record
+  // that is NEWER than the remembered pick, in another window. The one-writer rule must move that record's
+  // tab into the remembered window — no timestamp protects the record — instead of letting the bucket pin
+  // the workspace (the live report's `__default__` record, pickedAt newer than the user's pick). =====
+  {
+    const state = makeChromeState();
+    const pickedWindowId = state.alloc.window();
+    const recordWindowId = state.alloc.window();
+    state.windows.set(pickedWindowId, { id: pickedWindowId });
+    state.windows.set(recordWindowId, { id: recordWindowId });
+    const first = loadWorker(makeChrome(state, { withTabGroups: true }));
+    const ownKey = await first.selfClientKey();
+
+    // The session resolved a target in its own window first, and its record is stamped NEWER than the
+    // user's pick below — the wrong ordering that decided the live failure.
+    const recorded = await navWith(first, "https://pi.test/measured-record", SK, recordWindowId, { preferredWindowAt: Date.now() + 60_000 });
+    ok(recorded.windowId === recordWindowId, "measured: the session first works in its record window");
+
+    // The user's pick was made earlier and lives in another window; the worker restarts and only the
+    // mirror is left for the pick-less command.
+    state.storage.piChromePreferredWindow = { windowId: pickedWindowId, at: Date.now() - 60_000, key: ownKey };
+    const second = loadWorker(makeChrome(state, { withTabGroups: true }));
+    const nav = await second.dispatch("page.navigate", {
+      url: "https://pi.test/measured-pickless",
+      waitUntilLoad: false,
+      sessionKey: SK,
+      sessionGroupTitle: "Pi Agent",
+      joinSessionGroup: true,
+    });
+    ok(nav.windowId === pickedWindowId, "measured: the pick-less command uses the remembered pick");
+    ok(nav.id === recorded.id && state.tabs.get(recorded.id).windowId === pickedWindowId,
+      "measured: the newer record's tab was moved into the picked window, not left behind");
+    const status = await second.dispatch("automation.status", { sessionKey: SK });
+    ok(status.windowId === pickedWindowId && status.tabId === recorded.id,
+      "measured: the record was re-pointed at the picked window and kept its tab");
+    assertNoCreation(state, "measured");
+  }
+
+  // ===== retargetSupersededRecord validates its own pick window. Every current caller checks first, but
+  // this function is what moves/closes, so a future caller (or a race after the caller's check) must not
+  // relocate or destroy a tab for a window that is not open. Call it directly with a dead pick window. =====
+  {
+    const state = makeChromeState();
+    const w = loadWorker(makeChrome(state, { withTabGroups: true }));
+    const own = await navWith(w, "https://pi.test/retarget-guard", SK, state.userWindowId);
+    const goneWindowId = state.alloc.window(); // allocated but never inserted: closed
+    const changed = await w.retargetSupersededRecord(SK, { windowId: goneWindowId, tabId: own.id }, { windowId: goneWindowId, at: Date.now() });
+    ok(changed === false, "retarget-guard: a closed pick window makes retargetSupersededRecord a no-op");
+    ok(state.tabs.has(own.id) && state.tabs.get(own.id).windowId === state.userWindowId,
+      "retarget-guard: the tab was neither moved nor closed for a window that is not open");
+  }
+
+  // ===== The hydration race guard: a live in-memory pick must not be clobbered by the stored one it was
+  // derived from (only reachable with a second entry point, but the guard is what makes a future
+  // chrome.runtime.onMessage entry safe). Set a newer pick in the worker scope, then hydrate. =====
+  {
+    const state = makeChromeState();
+    state.storage.piChromePreferredWindow = { windowId: state.userWindowId, at: 1, key: "stored" };
+    const w = loadWorker(makeChrome(state));
+    vm.runInContext("preferredWindowPick = { windowId: 424242, at: 2, key: 'live' }", w);
+    await w.hydratePreferredWindowPick();
+    ok(vm.runInContext("preferredWindowPick.windowId === 424242 && preferredWindowPick.key === 'live'", w),
+      "hydrate-race: hydration does not clobber a newer in-memory pick");
+  }
+
+  // ===== The remembered pick is not page.navigate-specific: tab.new resolves the target window through
+  // the same machinePickParams path and must create in the remembered window, not the focused one. =====
+  {
+    const state = makeChromeState();
+    const pickedWindowId = state.alloc.window();
+    state.windows.set(pickedWindowId, { id: pickedWindowId });
+    const probe = loadWorker(makeChrome(state));
+    const ownKey = await probe.selfClientKey();
+    state.storage.piChromePreferredWindow = { windowId: pickedWindowId, at: 4000, key: ownKey };
+    const w = loadWorker(makeChrome(state, { withTabGroups: true }));
+
+    const created = await w.dispatch("tab.new", { url: "https://pi.test/remember-tab-new", sessionKey: "session:pickless", groupTitle: "Pi Agent" });
+    ok(created && created.tab && state.tabs.get(created.tab.id).windowId === pickedWindowId,
+      "remembered-tab.new: the tab opens in the remembered window, not the focused one");
+    ok(state.events.windowIdLessTabCreates.length === 0,
+      "remembered-tab.new: no tab was created without an explicit window");
+    assertNoCreation(state, "remembered-tab.new");
+  }
+
+  // ===== Version skew: an older Pi session calls window.select without pickSource. The refusal must not
+  // stop at "run /chrome window" alone, because that same older session builds the picker call and would
+  // be refused for the same reason — it must name the restart that loads the updated pi-chrome. =====
+  {
+    const state = makeChromeState();
+    const w = loadWorker(makeChrome(state));
+    await throwsWith(
+      () => w.dispatch("window.select", { windowId: null, sessionKey: SK }),
+      /restart the Pi session/,
+      "skew: window.select without pickSource names the restart fix for an older Pi session",
+    );
+    ok(state.tabs.size === 2, "skew: the refusal created no tab");
   }
 
   // An explicit url/title hint is not a way back into a window the pick replaced: the recorded tab is
@@ -854,7 +1199,7 @@ async function run() {
   {
     const state = makeChromeState();
     const w = loadWorker(makeChrome(state));
-    const selected = await w.dispatch("window.select", { windowId: state.userWindowId, sessionKey: SK });
+    const selected = await w.dispatch("window.select", { windowId: state.userWindowId, sessionKey: SK, pickSource: "user" });
     const cleanup = await w.dispatch("automation.cleanup", { sessionKey: SK });
     ok(cleanup.closedTabId === selected.tabId && cleanup.closedWindowId === null, "cleanup: only the guest tab is reported closed");
     ok(!state.tabs.has(selected.tabId), "cleanup: the guest tab is gone");
@@ -871,7 +1216,7 @@ async function run() {
   {
     const state = makeChromeState();
     const w = loadWorker(makeChrome(state));
-    await w.dispatch("window.select", { windowId: state.userWindowId, sessionKey: SK });
+    await w.dispatch("window.select", { windowId: state.userWindowId, sessionKey: SK, pickSource: "user" });
     // The user closes the whole window (Chrome closes its tabs with it).
     state.windows.delete(state.userWindowId);
     for (const [tid, t] of [...state.tabs]) if (t.windowId === state.userWindowId) state.tabs.delete(tid);
@@ -889,7 +1234,7 @@ async function run() {
     // The picker can only recover if the user opens a window first.
     const reopened = state.alloc.window();
     state.windows.set(reopened, { id: reopened });
-    const recovered = await w.dispatch("window.select", { windowId: reopened, sessionKey: SK });
+    const recovered = await w.dispatch("window.select", { windowId: reopened, sessionKey: SK, pickSource: "user" });
     ok(recovered.windowId === reopened, "window-gone: an explicit re-pick of a live window recovers");
     const nav = await navWith(w, "https://pi.test/window-gone-2", SK, undefined);
     ok(nav.windowId === reopened, "window-gone: the recovered window is the workspace");
@@ -905,7 +1250,7 @@ async function run() {
     const otherTab = { id: state.alloc.tab(), windowId: otherWindowId, url: "https://example.com/elsewhere", active: false, groupId: -1 };
     state.tabs.set(otherTab.id, otherTab);
 
-    const selected = await w.dispatch("window.select", { windowId: state.userWindowId, sessionKey: SK });
+    const selected = await w.dispatch("window.select", { windowId: state.userWindowId, sessionKey: SK, pickSource: "user" });
     state.tabs.get(selected.tabId).windowId = otherWindowId; // the user drags Pi's tab away
 
     const nav = await navWith(w, "https://pi.test/moved", SK, undefined);
@@ -920,7 +1265,7 @@ async function run() {
   {
     const state = makeChromeState();
     const w = loadWorker(makeChrome(state));
-    const selected = await w.dispatch("window.select", { windowId: state.userWindowId, sessionKey: SK });
+    const selected = await w.dispatch("window.select", { windowId: state.userWindowId, sessionKey: SK, pickSource: "user" });
     const otherWindowId = state.alloc.window();
     state.windows.set(otherWindowId, { id: otherWindowId });
     state.tabs.get(selected.tabId).windowId = otherWindowId;
@@ -1199,7 +1544,7 @@ async function run() {
   {
     const state = makeChromeState();
     const w = loadWorker(makeChrome(state, { withTabGroups: true, withStorage: false }));
-    const selected = await w.dispatch("window.select", { windowId: state.userWindowId, sessionKey: SK });
+    const selected = await w.dispatch("window.select", { windowId: state.userWindowId, sessionKey: SK, pickSource: "user" });
     await w.dispatch("automation.cleanup", { sessionKey: SK });
     ok(!state.tabs.has(selected.tabId) && state.tabs.has(state.userArticle.id), "no-storage: cleanup closed only Pi's tab");
   }
@@ -1216,8 +1561,8 @@ async function run() {
     await navWith(w, "https://pi.test/sweep-1", "session:s1", state.userWindowId).catch(() => null);
     await navWith(w, "https://pi.test/sweep-2", "session:s2", undefined).catch(() => null);
     await w.dispatch("tab.new", { url: "https://pi.test/sweep-3", sessionKey: "session:s3", preferredWindow: otherWindowId }).catch(() => null);
-    await w.dispatch("window.select", { windowId: otherWindowId, sessionKey: "session:s4" }).catch(() => null);
-    await w.dispatch("window.select", { windowId: null, sessionKey: "session:s5" }).catch(() => null);
+    await w.dispatch("window.select", { windowId: otherWindowId, sessionKey: "session:s4", pickSource: "user" }).catch(() => null);
+    await w.dispatch("window.select", { windowId: null, sessionKey: "session:s5", pickSource: "user" }).catch(() => null);
     await w.dispatch("automation.cleanup", { sessionKey: "session:s1" }).catch(() => null);
     await w.dispatch("automation.cleanup", { sessionKey: "session:s4" }).catch(() => null);
 

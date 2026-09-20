@@ -121,6 +121,15 @@ const piCreatedWindowIds = new Set();
 const DEFAULT_SESSION_KEY = "__default__";
 const AUTOMATION_STORAGE_KEY = "piChromeAutomationTargets";
 const PI_WINDOWS_STORAGE_KEY = "piChromeCreatedWindowIds";
+// The newest machine-wide pick THIS worker has seen, mirrored to storage.session so it survives a worker
+// restart. The Pi side is the one writer and forwards `preferredWindow` on every command it sends, but a
+// pick-less caller (the measured hand-built POST /command with no sessionKey, and any agent that does not
+// read ~/.pi/agent/pi-chrome.json) carries nothing — without this mirror, such a caller had no pick at all
+// and the extension could not know the window the user chose. It is not a second source of truth: R1 still
+// makes the pick on the wire (the file's content) the decision, and this only replays the last one seen.
+const PREFERRED_WINDOW_STORAGE_KEY = "piChromePreferredWindow";
+let preferredWindowPick = null; // { windowId, at?, key? }
+let preferredWindowHydrated;
 let automationHydrated;
 const sessionTabs = new Map(); // sessionKey -> Map<tabId, { created: boolean, groupId?: number }>
 const SESSION_TABS_STORAGE_KEY = "piChromeSessionTabs";
@@ -170,6 +179,33 @@ async function hydrateAutomationTargets() {
     }
   })();
   return automationHydrated;
+}
+
+// Re-hydrate the remembered machine-wide pick once per worker lifetime, so a pick-less command after an
+// MV3 worker restart still resolves into the window the user chose (the measured pick-less caller case).
+// Best effort like hydrateAutomationTargets: storage may be unavailable, and a failure only means a
+// pick-less caller gets the /chrome window refusal instead of the remembered window — never a wrong window.
+async function hydratePreferredWindowPick() {
+  if (preferredWindowHydrated) return preferredWindowHydrated;
+  preferredWindowHydrated = (async () => {
+    try {
+      const stored = await chrome.storage?.session?.get?.(PREFERRED_WINDOW_STORAGE_KEY);
+      const saved = stored && stored[PREFERRED_WINDOW_STORAGE_KEY];
+      if (!saved || typeof saved !== "object" || !Number.isInteger(saved.windowId)) return;
+      // Never clobber a live in-memory pick with an older stored one. Command dispatch is serialized
+      // today, so this cannot happen yet, but a second entry point (chrome.runtime.onMessage) would make
+      // it a real race, and losing a fresh pick to hydration would silently move the whole machine.
+      if (preferredWindowPick) return;
+      preferredWindowPick = {
+        windowId: saved.windowId,
+        at: typeof saved.at === "number" && Number.isFinite(saved.at) ? saved.at : undefined,
+        key: typeof saved.key === "string" && saved.key ? saved.key : undefined,
+      };
+    } catch {
+      // Ignore: treat as "no remembered pick".
+    }
+  })();
+  return preferredWindowHydrated;
 }
 
 async function hydrateSessionTabs() {
@@ -253,12 +289,31 @@ async function persistAutomationTargets() {
         tabId: typeof value.tabId === "number" ? value.tabId : null,
         windowId: typeof value.windowId === "number" ? value.windowId : null,
         piWindow: value.piWindow === true,
-        // When a human chose this window with /chrome window. Absent means "no one ever picked this",
-        // which is what lets a later machine-wide pick supersede it (see supersededByMachinePick).
+        // When a human chose this window with /chrome window. Reporting/compat only: under the one-writer
+        // rule the machine-wide pick supersedes a record regardless of this stamp (see
+        // supersededByMachinePick), so this must never be read as "this session outranks the pick".
         pickedAt: typeof value.pickedAt === "number" ? value.pickedAt : null,
       };
     }
     await chrome.storage?.session?.set?.({ [AUTOMATION_STORAGE_KEY]: obj });
+  } catch {
+    // Ignore: persistence is an optimization, not a correctness requirement.
+  }
+}
+
+// Mirror the newest pick this worker has seen to storage.session. Best effort by the same rule as
+// persistAutomationTargets: a storage failure must never fail the command that carried the pick, it only
+// costs a later pick-less caller the remembered window. `at`/`key` are stored verbatim when present so a
+// restart remembers which connector the pick was made in, not just the id.
+async function persistPreferredWindowPick(pick) {
+  try {
+    await chrome.storage?.session?.set?.({
+      [PREFERRED_WINDOW_STORAGE_KEY]: {
+        windowId: pick.windowId,
+        at: typeof pick.at === "number" ? pick.at : null,
+        key: typeof pick.key === "string" && pick.key ? pick.key : null,
+      },
+    });
   } catch {
     // Ignore: persistence is an optimization, not a correctness requirement.
   }
@@ -290,20 +345,50 @@ function selfClientKey() {
 // validated here — a bad value must never decide where Pi works. Returns null when the pick is not
 // usable here, which callers treat as "no pick": a per-session assignment keeps working, and a session
 // with none fails with the /chrome window message instead of guessing.
+//
+// The caller's pick is the file's content — Pi is the one writer and forwards it on every command — and a
+// pick that carries THIS profile's connector key is also REMEMBERED (storage.session) for pick-less
+// callers. An unkeyed pick still steers the command that carries it, but it is never remembered: the
+// durable mirror is reserved for picks the Pi-side file attributes to this profile, so an unauthenticated
+// POST cannot pin every later pick-less command to a window the user did not choose. When the command
+// carries no pick at all, the remembered one is used after the same connector-key check, which is what lets
+// the measured hand-built POST /command (no sessionKey, no file access) work in the user's window instead
+// of having no pick and refusing, or worse, being pinned by whatever record its bucket happens to hold.
 async function machineWindowPick(params) {
+  await hydratePreferredWindowPick();
   const windowId = params && typeof params.preferredWindow === "number" && Number.isInteger(params.preferredWindow)
     ? params.preferredWindow
     : null;
-  if (windowId === null) return null;
+  if (windowId === null) {
+    // No pick on this command: the remembered one is the only witness left. Its key is checked the same
+    // way, so a pick remembered in ANOTHER browser profile is never replayed as this profile's window id
+    // (window ids are per profile — the same number names a different window).
+    if (!preferredWindowPick) return null;
+    const own = await selfClientKey();
+    if (preferredWindowPick.key && own && own !== preferredWindowPick.key) return null;
+    return { windowId: preferredWindowPick.windowId, at: preferredWindowPick.at };
+  }
   const at = params && typeof params.preferredWindowAt === "number" && Number.isFinite(params.preferredWindowAt)
     ? params.preferredWindowAt
     : null;
   const key = params && typeof params.preferredWindowKey === "string" && params.preferredWindowKey
     ? params.preferredWindowKey
     : null;
+  const own = await selfClientKey();
   if (key !== null) {
-    const own = await selfClientKey();
+    // Either key unknown (no profile id, or a legacy pick without one) -> accept rather than refuse.
     if (own && own !== key) return null;
+  }
+  // A pick is USABLE for the command that carries it either way — that is the one-writer protocol, Pi
+  // forwards the file's pick on every command — but only a pick carrying THIS profile's connector key may
+  // become the durable machine-wide pick. The measured hand-built POST /command carries no key: before
+  // this guard it overwrote the mirror and pinned every later pick-less command to a window the user did
+  // not choose. A keyless pick must also not erase a previously keyed mirror, which would silently
+  // disable the connector check the key exists for (a pick from another profile's file).
+  const attributable = key !== null && Boolean(own) && key === own;
+  if (attributable) {
+    preferredWindowPick = { windowId, at, key };
+    await persistPreferredWindowPick(preferredWindowPick);
   }
   return { windowId, at };
 }
@@ -332,18 +417,18 @@ const SAVED_WINDOW_GONE =
 
 // True when the machine-wide pick replaces this session's recorded workspace.
 //
-// The rule the live bug needed: a record that points somewhere else loses to the pick when nobody ever
-// picked that record's window (`pickedAt` absent — the implicit resolver made it, or an older build
-// wrote it), or when the pick is newer than the session's own pick. An explicit session pick is NOT
-// disturbed: "the session's own assignment beats the saved default" still holds, which is what keeps
-// session-scoped choices meaningful. What dies here is the sticky record that made a pick in one session
-// invisible in every other one — the user chose their window, and Pi still drove a tab in a window they
-// had not chosen (their own, in the live report).
+// ONE WRITER: the machine-wide pick is the ONLY thing that decides the workspace, so a record that
+// points somewhere else always loses to it — timestamps are not consulted, in either direction. This is
+// the measured failure the rule exists for: the worker's `__default__` bucket held
+// {windowId: 720723708, pickedAt <newer than the user's pick 720723947>}, so the old "newer explicit pick
+// wins" comparison let a record that happened to be written later outrank the window the user chose and
+// window.list reported workingWindowId 720723708. Any timestamp ordering is the wrong test here: a
+// later-written record is exactly what a rogue/hand-built caller (or a clock skew) produces, and no
+// comparison can tell that apart from a legitimate pick. Records only MIRROR the pick — `pickedAt` is
+// still written and reported for compat/reporting — but they never decide which window Pi works in.
 function supersededByMachinePick(record, pick) {
   if (!pick || !record || typeof record.windowId !== "number") return false;
-  if (record.windowId === pick.windowId) return false;
-  if (typeof record.pickedAt !== "number") return true;
-  return typeof pick.at === "number" && record.pickedAt < pick.at;
+  return record.windowId !== pick.windowId;
 }
 
 // True when a tab recorded as a session's target is provably Pi's own, so closing it cannot lose user
@@ -403,6 +488,11 @@ async function regroupMovedTarget(tab) {
 // user is leaving, which is the visible half of the bug. A tab we cannot prove is ours is never touched.
 // Returns true when it changed the map.
 async function retargetSupersededRecord(sessionKey, record, pick) {
+  // The pick's window must be open before any tab is moved or closed for it. Every current caller checks
+  // first and keeps its own actionable error/refusal, but this function is what moves and closes, so the
+  // invariant lives here too: a future caller cannot relocate a tab into — or close one for — a window
+  // that is not open.
+  if (!(await pickWindowIsOpen(pick.windowId))) return false;
   const pickedAt = typeof pick.at === "number" ? pick.at : record.pickedAt;
   const tab = typeof record.tabId === "number" ? await chrome.tabs.get(record.tabId).catch(() => null) : null;
   const owned = tab ? await isPiRelocatableTarget(tab) : false;
@@ -1923,16 +2013,16 @@ async function groupTab(tab, title, color) {
 
 // Apply one machine-wide pick to every session record it supersedes: each one's guest tab is moved into
 // the picked window (or closed when it cannot be moved and is provably Pi's) and the record is re-pointed at
-// the picked window. Records that a human picked no later than this pick are left alone. `keepKey` is the
-// session that made the pick: its record is already written and must not be rewritten here. Returns the
-// number of records retargeted.
+// the picked window. Under the one-writer rule EVERY record whose window differs is superseded, however
+// recently it was picked — a record's own timestamp cannot protect it (that is what the measured pick-vs-
+// record conflict required). `keepKey` is the session that made the pick: its record is already written
+// and must not be rewritten here. Returns the number of records retargeted.
 async function sweepSupersededTargets(keepKey, wanted, at) {
   const pick = { windowId: wanted, at };
   let retargeted = 0;
   for (const [key, record] of [...automationTargets]) {
     if (key === keepKey || !supersededByMachinePick(record, pick)) continue;
-    await retargetSupersededRecord(key, record, pick);
-    retargeted++;
+    if (await retargetSupersededRecord(key, record, pick)) retargeted++;
   }
   if (retargeted > 0) await persistAutomationTargets();
   return retargeted;
@@ -2222,13 +2312,29 @@ async function dispatch(action, params) {
       if (wanted !== null && !Number.isInteger(wanted)) {
         throw new Error('window.select needs "windowId" as an integer. A window of Pi\'s own is no longer offered: run /chrome window to pick an existing window.');
       }
+      // R3: a command may only move the workspace when it declares itself the user's picker
+      // (`pickSource: "user"`). This is a mis-call guard, not authentication — the command body is
+      // client-asserted, so a local caller can still claim the field; the durable barrier is the
+      // connector-key attribution in machineWindowPick. It does stop the measured unmarked call: another
+      // agent posted hand-built JSON to POST /command (no sessionKey, no pickSource) calling
+      // window.select, and thereby pinned Pi to a window the user did not choose. Refuse HERE, before any
+      // record write, tab create/move or sweep, so an unmarked call cannot move a workspace even while
+      // failing. The restart hint exists for version skew: an older Pi session never sends pickSource, and
+      // "run /chrome window" alone is circular while that same session is building the picker's call.
+      if (params.pickSource !== "user") {
+        throw new Error(
+          "Only /chrome window can choose Pi's window. Run /chrome window to pick one of your open browser " +
+            "windows; if the picker is refused too, restart the Pi session so it loads the updated pi-chrome.",
+        );
+      }
       const sessionKey = sessionKeyOf(params);
       const groupTitle = params.groupTitle || PI_GROUP_NAME;
       await hydrateAutomationTargets();
       const current = automationTargets.get(sessionKey);
-      // The moment the user chose this window. Every record written by this pick — this session's and the
-      // ones swept below — carries it, so a later session pick can still win on recency while everything
-      // older is retired. One timestamp for the whole pick keeps the sweep and the assignment consistent.
+      // The moment the user chose this window. Under the one-writer rule the stamp no longer decides the
+      // workspace (see supersededByMachinePick); it is still written and returned so the Pi side can save
+      // the same one and window.list can report it. One timestamp for the whole pick keeps the sweep and
+      // the assignment consistent.
       const pickedAt = Date.now();
       const retireCurrent = async (keepTabId) => {
         if (current && typeof current.tabId === "number" && current.tabId !== keepTabId) {
@@ -2250,6 +2356,16 @@ async function dispatch(action, params) {
       }
       const win = await chrome.windows.get(wanted).catch(() => null);
       if (!win) throw new Error(`No browser window with id ${wanted}.`);
+      // The pick is valid now, and window.select is one of the two places a pick enters this worker (the
+      // other is preferredWindow on any command, via machineWindowPick). Mirror it the same way, so a
+      // pick-less caller after a worker restart resolves into this window (R2). Deliberately AFTER the
+      // existence check: a select naming a closed window must fail without becoming the remembered pick.
+      // The connector key is kept from a previously mirrored pick when this worker cannot derive its own
+      // id (storage unavailable), so that outage cannot silently downgrade the profile check to keyless.
+      await hydratePreferredWindowPick();
+      const ownKey = await selfClientKey();
+      preferredWindowPick = { windowId: wanted, at: pickedAt, key: ownKey || preferredWindowPick?.key || null };
+      await persistPreferredWindowPick(preferredWindowPick);
       // Already working in that window: keep the tab we have instead of churning a new one.
       if (typeof current?.tabId === "number") {
         const existing = await chrome.tabs.get(current.tabId).catch(() => null);
