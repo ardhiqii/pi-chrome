@@ -117,6 +117,23 @@ All notable user-facing changes to `pi-chrome`.
   action fails with a message naming `/chrome window` rather than creating a window, using the focused
   one, or landing in one of yours uninvited. `/chrome window own` is gone with the automatic-creation
   path it configured.
+- **Fixed: a fresh automation tab could not run page actions on Edge.**
+  Automation targets were created at `about:blank#pi-chrome`. Measured on Edge 123, the debugger
+  refuses that URL with `Cannot access contents of url "about:blank#pi-chrome". Extension manifest
+  must request permission to access this host.` while a bare `about:blank` attaches fine, so
+  `chrome_evaluate`, `chrome_snapshot` and click/type/screenshot died on a brand-new target;
+  `chrome_navigate` still worked because `tabs.update` never attaches (without an `initScript`).
+  New targets are now plain `about:blank`, and a legacy `#pi-chrome` tab is navigated to
+  `about:blank` when a session adopts it as its target. Edge also refuses
+  `chrome.scripting.executeScript` on `about:blank` itself (a top-level about:blank has an opaque
+  origin, so `<all_urls>` does not cover it), so snapshot/inspect/console/network/probe and the DOM
+  input fallbacks now use the debugger channel when scripting is refused. The `#pi-chrome` marker
+  remains only as recognition evidence for tabs/windows that older builds left behind. The bridge
+  reports every failed command as HTTP 504, so the observed "504 Gateway Timeout" *was* one of these
+  permission errors, not a wedged tab or a proxy timeout. An extension reload clears the per-session
+  target records, so Pi tabs from the previous session become unowned; a legacy `#pi-chrome` tab that
+  is targeted explicitly instead of adopted still fails page actions until it is navigated away or
+  closed.
 - **Fixed: a session that does not own the bridge reported "no connector" no matter what.** Only the Pi
   session that first bound port 17318 ever receives the companion extension's poll; every other session
   forwards its commands to that owner. Their local `connected`/`clients` state is therefore empty **by

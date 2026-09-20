@@ -20,13 +20,24 @@ const PI_GROUP_RE = /^Pi(\b|\s*-)/i;
 // (index.ts `sessionGroupTitle`). "Pi" alone was ambiguous — it reads as the number pi — and it
 // split Pi's own tabs across two differently-named groups in the same window.
 const PI_GROUP_NAME = "Pi Agent";
-// Initial URL of every automation target. The fragment is a marker, not content: a Pi-created blank
-// tab stays distinguishable from a blank tab the user opened (tab lists show the marker), while a
-// `urlIncludes: "about:blank"` hint still matches both and is settled by recorded identity, not by
-// whichever match Chrome lists first. The marker is also legacy ownership evidence: `window.list`
-// recognizes windows Pi created in an earlier build so the picker never offers them.
+// Initial URL of every automation target. It MUST stay exactly `about:blank`.
+// Measured on Edge 123 with this extension's manifest (host_permissions `<all_urls>`):
+//   - chrome.debugger.attach succeeds on exactly `about:blank`; `about:blank#pi-chrome` is refused
+//     with `Cannot access contents of url "about:blank#pi-chrome". Extension manifest must request
+//     permission to access this host.` (attachDebugger -> cdpRaw's `Chrome debugger attach failed
+//     for tab N: ...`). A fragment therefore makes the target un-attachable and kills
+//     page.evaluate/cdp.call/screenshot/input on a fresh automation tab, while page.navigate still
+//     works because tabs.update never attaches (page.navigate only attaches when params.initScript
+//     is set, via registerInitScript).
+//   - chrome.scripting.executeScript is refused on ALL of about:blank, about:blank#pi-chrome and
+//     data: URLs; a top-level about:blank the extension opened has an opaque origin, so even
+//     <all_urls> does not cover it, and the refusal is `Cannot access contents of url
+//     "about:blank". Extension manifest must request permission to access this host.` Scripting-only
+//     actions (snapshot/inspect/console/network/probe and the DOM input fallbacks) therefore have a
+//     CDP fallback; see executeScriptWithFallback.
+// The #pi-chrome marker below is legacy-recognition evidence only; new targets are never marked.
 const PI_CHROME_MARKER = "#pi-chrome";
-const BLANK_AUTOMATION_URL = `about:blank${PI_CHROME_MARKER}`;
+const BLANK_AUTOMATION_URL = "about:blank";
 const VALID_GROUP_COLORS = new Set(["grey", "blue", "red", "yellow", "green", "pink", "purple", "cyan", "orange"]);
 const COMMAND_TIMEOUT_MS = 25_000;
 const CDP_COMMAND_TIMEOUT_MS = 5_000;
@@ -290,14 +301,22 @@ async function createAutomationTarget(sessionKey, groupTitle, { preferredWindow 
   const recordedWindowId = record && typeof record.windowId === "number" ? record.windowId : null;
   if (recordedWindowId !== null) {
     const piWindow = record.piWindow === true || isPiOwnedWindow(recordedWindowId);
-    // A recorded Pi window whose own tab is gone may still hold an unowned marker from a wiped
-    // record; adopt it instead of adding yet another marker to the shared window.
+    // A recorded Pi window whose own tab is gone may still hold an unowned legacy marker from a
+    // wiped record; adopt it instead of adding yet another tab to the shared window.
     if (piWindow) {
       const reusable = await findReusableOrphanAutomationTab(recordedWindowId);
       if (reusable) {
-        automationTargets.set(sessionKey, { windowId: recordedWindowId, tabId: reusable.id, piWindow: true });
-        await persistAutomationTargets();
-        return reusable;
+        // Heal the legacy marker URL before adopting. findReusableOrphanAutomationTab returns only
+        // #pi-chrome tabs, and that URL cannot be attached (see BLANK_AUTOMATION_URL), so adopting
+        // it unmodified would hand out the un-attachable target this change exists to remove.
+        // tabs.update needs no debugger attach. If the update fails the tab is gone, so fall through
+        // and create a fresh target instead of adopting a dead one.
+        const healed = await chrome.tabs.update(reusable.id, { url: BLANK_AUTOMATION_URL }).catch(() => null);
+        if (healed && typeof healed.id === "number") {
+          automationTargets.set(sessionKey, { windowId: recordedWindowId, tabId: reusable.id, piWindow: true });
+          await persistAutomationTargets();
+          return healed;
+        }
       }
     }
     // Creating the tab is also the existence check: Chrome rejects a windowId whose window is gone.
@@ -351,9 +370,12 @@ async function createAutomationTarget(sessionKey, groupTitle, { preferredWindow 
   return created;
 }
 
-// True when a tab carries Pi's creation marker. Every automation target starts at
-// about:blank#pi-chrome; the marker survives an extension reload (which clears the in-memory
-// registry) but not a navigation, which is why "Pi Agent" groups are checked as well.
+// True when a tab carries the legacy Pi creation marker. Automation targets used to start at
+// about:blank#pi-chrome; that URL is no longer created (see BLANK_AUTOMATION_URL — the debugger
+// refuses to attach to it), but tabs an earlier build left behind still carry the marker, and it
+// remains ownership evidence for windows Pi created back then. The marker survives an extension
+// reload (which clears the in-memory registry) but not a navigation, which is why "Pi Agent"
+// groups are checked as well.
 function isPiMarkerTab(tab) {
   return Boolean(tab) && typeof tab.url === "string" && tab.url.includes(PI_CHROME_MARKER);
 }
@@ -364,11 +386,12 @@ function isPiMarkerTab(tab) {
 //   - `chrome.windows.create` made it for Pi in an earlier build and the registry still remembers it
 //     (same browser session; storage.session outlives service-worker restarts); the registry is
 //     authority by construction, so even a user tab later dragged into that window does not revoke it;
-//   - EVERY tab in it is a Pi tab — a #pi-chrome marker tab or a member of a "Pi Agent" group —
-//     and at least one piece of Pi evidence lives in it (a marker tab or a "Pi Agent" group),
+//   - EVERY tab in it is a Pi tab — a legacy #pi-chrome marker tab or a member of a "Pi Agent"
+//     group — and at least one piece of Pi evidence lives in it (a legacy marker tab or a "Pi
+//     Agent" group),
 //     covering a Pi window whose automation tab has navigated away.
 // The all-Pi-tabs condition is what keeps a user's window out no matter how much Pi debris
-// (leftover marker tabs or "Pi Agent" groups) it holds: a dedicated window has no non-Pi tabs.
+// (leftover legacy marker tabs or "Pi Agent" groups) it holds: a dedicated window has no non-Pi tabs.
 // Shared with `window.list` so the report states the same evidence it acts on.
 function dedicatedPiWindowIds(windows, groups) {
   const ids = new Set();
@@ -396,11 +419,14 @@ function dedicatedPiWindowIds(windows, groups) {
   return ids;
 }
 
-// An #pi-chrome marker tab that no session record names is an orphan: what an extension reload (which
-// wipes chrome.storage.session) leaves behind while the browser keeps the window. Adopting it for a new
-// session keeps ONE automation marker per shared window instead of one per session that ever ran, and
-// it is safe precisely because no live session owns it. A tab a live record names is never touched, so
-// two sessions can never end up driving the same tab.
+// A legacy #pi-chrome marker tab that no session record names is an orphan: what an extension reload
+// (which wipes chrome.storage.session) leaves behind while the browser keeps the window. Adopting it
+// for a new session keeps ONE automation target per shared window instead of one per session that ever
+// ran, and it is safe precisely because no live session owns it. A tab a live record names is never
+// touched, so two sessions can never end up driving the same tab. The caller heals the adopted tab's
+// URL to plain about:blank first (a marker tab cannot be attached; see BLANK_AUTOMATION_URL). New
+// targets are plain about:blank and are deliberately NOT adopted this way: an unmarked blank tab
+// cannot be told apart from one the user opened.
 async function findReusableOrphanAutomationTab(windowId) {
   if (typeof windowId !== "number" || typeof chrome.tabs.query !== "function") return null;
   await hydrateAutomationTargets();
@@ -779,6 +805,57 @@ function executeScriptTimed(options, label) {
   return withTimeout(chrome.scripting.executeScript(options), SCRIPTING_TIMEOUT_MS, label || "chrome.scripting.executeScript");
 }
 
+// Chrome refuses chrome.scripting on pages it considers outside the extension's reach. Measured on
+// Edge 123 (see BLANK_AUTOMATION_URL): a top-level about:blank has an opaque origin, so even
+// <all_urls> does not cover it, and data:/view-source:/chrome:/edge: and the legacy marker URL are
+// refused the same way. The debugger API still attaches to exactly about:blank, so scripting calls
+// fall back to CDP Runtime.evaluate (same MAIN world, and Runtime.evaluate bypasses page CSP exactly
+// as the scripting func/files forms do). Keep the scripting path primary: it is the only one that
+// works while another debugger (DevTools) holds the tab, and it is the path every ordinary page
+// already uses.
+function isScriptingAccessDenied(error) {
+  const message = String(error?.message || error);
+  return /Cannot access contents of url|Cannot access .+ at origin|Extension manifest must request permission|matchAboutBlank must be true/i.test(message);
+}
+
+// One chrome.scripting.executeScript call with a CDP fallback when Chrome refuses scripting for a
+// permission reason (see isScriptingAccessDenied). The options keep the scripting API's exact shape,
+// so every call site passes the same object it always did; only the entry point changes. The
+// fallback covers both forms: `func:` is stringified and called with Runtime.evaluate (which bypasses
+// page CSP exactly as the scripting func form does), and `files:` is read from the package once and
+// evaluated with Runtime.evaluate (CDP has no file form). Any other scripting failure stays a
+// scripting failure, so callers keep seeing the real error.
+const packagedFileSources = new Map();
+async function executeScriptWithFallback(options, label) {
+  try {
+    return await executeScriptTimed(options, label);
+  } catch (error) {
+    if (!isScriptingAccessDenied(error) || !chrome.debugger) throw error;
+    const tabId = options?.target?.tabId;
+    recordAttachEvent({ kind: "scripting-denied-cdp-fallback", tabId, files: options?.files || null, message: String(error?.message || error).slice(0, 300) });
+    if (Array.isArray(options?.files) && options.files.length) {
+      for (const file of options.files) {
+        if (!packagedFileSources.has(file)) {
+          const response = await fetch(chrome.runtime.getURL(file));
+          if (!response.ok) throw new Error(`Could not read ${file} for CDP injection (HTTP ${response.status})`);
+          packagedFileSources.set(file, await response.text());
+        }
+        const injected = await cdpEval(tabId, packagedFileSources.get(file));
+        if (injected.exceptionDetails) {
+          throw new Error(`${label || file}: ${cdpExceptionText(injected.exceptionDetails) || "CDP injection failed"}`);
+        }
+      }
+      return [{ result: undefined }];
+    }
+    const expression = `(${options.func.toString()})(...${JSON.stringify(Array.isArray(options.args) ? options.args : [])})`;
+    const result = await cdpEval(tabId, expression);
+    if (result.exceptionDetails) {
+      throw new Error(`${label || "page script"}: ${cdpExceptionText(result.exceptionDetails) || "evaluation failed"}`);
+    }
+    return [{ result: result.result?.value }];
+  }
+}
+
 // Wraps cdpRaw with one auto-recover on detached/closed sessions:
 // chrome.debugger.attach can stay cached in attachedTabs even after Chrome killed
 // the session (tab nav, devtools opened/closed, etc). Recover by detaching the
@@ -890,7 +967,7 @@ function cdpIsSyntaxError(details) {
 
 // Resolve target -> {x, y, rect} in viewport coords by running tiny script in tab.
 async function resolveTargetInTab(tabId, params) {
-  const results = await executeScriptTimed({
+  const results = await executeScriptWithFallback({
     target: { tabId, frameIds: [0] },
     world: "MAIN",
     func: (selector, uid, x, y) => {
@@ -1048,7 +1125,7 @@ async function cdpTypeChar(tabId, ch) {
 }
 
 async function domClickFallback(tabId, params, cause) {
-  const results = await executeScriptTimed({
+  const results = await executeScriptWithFallback({
     target: { tabId, frameIds: [0] },
     world: "MAIN",
     func: (selector, uid, x, y) => {
@@ -1091,7 +1168,7 @@ async function chromeInputClick(params) {
     // focus can leave :focus-visible=true in Chromium, which trips heuristics that expect
     // Reset focus styling after pointer click when possible.
     if (params.selector || params.uid) {
-      await executeScriptTimed({
+      await executeScriptWithFallback({
         target: { tabId: tab.id, frameIds: [0] },
         world: "MAIN",
         func: (sel, uid) => {
@@ -1167,7 +1244,7 @@ async function chromeInputKey(params) {
 // the requested editor's entire contents: triple-click only selects a paragraph.
 // Selection uses the DOM; deletion and insertion still use Chrome's input layer.
 async function contentEditableInTab(tabId, selectAllParams = null) {
-  const results = await executeScriptTimed({
+  const results = await executeScriptWithFallback({
     target: { tabId, frameIds: [0] },
     world: "MAIN",
     func: (selector, uid, selectAll) => {
@@ -1228,7 +1305,7 @@ async function chromeInputType(params) {
 
 async function domFillFallback(tabId, params, cause) {
   if (!(params.selector || params.uid)) throw cause;
-  const results = await executeScriptTimed({
+  const results = await executeScriptWithFallback({
     target: { tabId, frameIds: [0] },
     world: "MAIN",
     func: async (selector, uid, text, submit) => {
@@ -1845,7 +1922,7 @@ async function dispatch(action, params) {
             focused: win.focused === true,
             holdsTargetTab: typeof target?.tabId === "number" && tabs.some((tab) => tab.id === target.tabId),
             // A dedicated Pi window, wherever the session record says the tab is. Discovery evidence —
-            // the registry, the #pi-chrome marker, or an all-Pi-tab "Pi Agent" group — decides, not
+            // the registry, a legacy #pi-chrome marker, or an all-Pi-tab "Pi Agent" group — decides, not
             // the per-session record: inherited targets and cleaned-up creating sessions must not
             // make a live Pi window look like one of the user's.
             ownedByPi: isPiOwnedWindow(win.id) || dedicatedWindowIds.has(win.id),
@@ -1912,6 +1989,11 @@ async function dispatch(action, params) {
       automationTargets.set(sessionKey, { windowId: wanted, tabId: tab.id, piWindow: isPiOwnedWindow(wanted) });
       await persistAutomationTargets();
       await retireCurrent(tab.id);
+      // NOTE (follow-up, out of scope for the about:blank fix): the record above was written before
+      // groupTab ran. If grouping ever relocates this tab (Chrome moves a tab that joins a group in
+      // another window), the record's windowId no longer matches where the tab lives, and the next
+      // implicit action's resolveOwnedAutomationTarget retires and recreates it. Re-read the tab's
+      // windowId after groupTab and update the record (or record after grouping).
       await groupTab(tab, groupTitle, params.groupColor).catch(() => {});
       return { windowId: tab.windowId ?? null, tabId: tab.id ?? null, reused: false };
     }
@@ -2096,10 +2178,9 @@ async function executeInTab(params, func, args) {
     throw new Error(`Failed to inject Chrome page helpers: ${cdpExceptionText(defineRes.exceptionDetails) || "unknown error"}`);
   }
 
-  // Phase 2: run the action via chrome.scripting.executeScript. The `func:` form is
-  // injected by Chrome itself (not `new Function`), so it is CSP-safe, and it lets Chrome
-  // serialize the invocation args. The wrapper references window.__piAction defined above.
-  const results = await executeScriptTimed({
+  // Phase 2: run the action in the same MAIN world (executeScriptWithFallback falls back to CDP
+  // Runtime.evaluate when Chrome refuses chrome.scripting on this URL, e.g. a fresh about:blank).
+  const results = await executeScriptWithFallback({
     target: { tabId: tab.id },
     world: "MAIN",
     func: async (invocationArgs) => {
@@ -2191,9 +2272,11 @@ async function withOptionalSnapshot(params, actionFn) {
 }
 
 // Snapshot/inspect run from a packaged MAIN-world script (snapshot_injected.js) injected via
-// chrome.scripting.executeScript({ files }). That file is free of eval/new Function, so it works
-// on strict-CSP pages, and it installs globalThis.__piChromeSnapshotPage / __piChromeInspectTarget.
-// It shares window.__PI_CHROME_STATE__ (same el- uid scheme) with the CDP-injected input helpers.
+// chrome.scripting.executeScript({ files }), falling back to a CDP source injection when Chrome
+// refuses scripting on the URL (see executeScriptWithFallback). That file is free of eval/new
+// Function, so it works on strict-CSP pages, and it installs globalThis.__piChromeSnapshotPage /
+// __piChromeInspectTarget. It shares window.__PI_CHROME_STATE__ (same el- uid scheme) with the
+// CDP-injected input helpers.
 async function snapshotInTab(params) {
   const tab = await getTabByParams(params);
   await bringToFront(tab, params);
@@ -2206,12 +2289,12 @@ async function snapshotInTab(params) {
     params.query ?? null,
     params.maxTextChars ?? null,
   ];
-  await executeScriptTimed({
+  await executeScriptWithFallback({
     target: { tabId: tab.id, frameIds: [0] },
     world: "MAIN",
     files: ["snapshot_injected.js"],
   }, `inject snapshot script in tab ${tab.id}`);
-  const results = await executeScriptTimed({
+  const results = await executeScriptWithFallback({
     target: { tabId: tab.id, frameIds: [0] },
     world: "MAIN",
     func: async (invocationArgs) => {
@@ -2242,12 +2325,12 @@ async function inspectInTab(params) {
   const tab = await getTabByParams(params);
   await bringToFront(tab, params);
   const args = [params.uid ?? null, params.selector ?? null, params.scrollIntoView === true];
-  await executeScriptTimed({
+  await executeScriptWithFallback({
     target: { tabId: tab.id, frameIds: [0] },
     world: "MAIN",
     files: ["snapshot_injected.js"],
   }, `inject inspect script in tab ${tab.id}`);
-  const results = await executeScriptTimed({
+  const results = await executeScriptWithFallback({
     target: { tabId: tab.id, frameIds: [0] },
     world: "MAIN",
     func: async (invocationArgs) => {

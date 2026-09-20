@@ -10,9 +10,15 @@
 // Like csp-eval.test.mjs this loads the *real* worker into a vm sandbox with a stateful chrome.*
 // mock, then exercises the real helpers and the real dispatch() paths. The mock models the observed
 // Edge shape rather than an idealised Chrome one: `chrome.windows.create` answers with a Window whose
-// `tabs` entries OMIT `windowId` (live 0.15.51.13 finding), and `chrome.tabs.create` without a
-// windowId lands in the focused window (the user's) exactly like the browser does. A mock that
-// idealised either one is what let a broken fix look green before.
+// `tabs` entries OMIT `windowId` (live 0.15.51.13 finding), `chrome.tabs.create` without a windowId
+// lands in the focused window (the user's) exactly like the browser does, `chrome.debugger.attach`
+// refuses about:blank#pi-chrome exactly like live Edge (2026-09-20 finding), and
+// `chrome.scripting.executeScript` refuses about:blank itself exactly like live Edge (2026-09-20
+// finding) so snapshot/inspect/probe must go through production's scripting->debugger fallback.
+// Scripting and Runtime.evaluate share ONE per-tab page realm, and Runtime.evaluate runs the real
+// expression there, so an assertion like `evaluated === 2` proves the expression ran, not merely
+// that a hardcoded mock path was reached. A mock that idealised any of these is what let a broken
+// fix look green before.
 
 import vm from "node:vm";
 import fs from "node:fs";
@@ -34,6 +40,83 @@ async function throwsWith(fn, re, msg) {
   catch (e) { ok(re.test(String(e.message || e)), `${msg} (got: ${e.message})`); }
 }
 
+// ---- minimal MAIN-world page sandbox for the mock ------------------------------------------------
+// chrome.scripting and debugger Runtime.evaluate both run code in the page's MAIN world, so the mock
+// keeps ONE realm per tab: a global set by a scripting func is visible to a later CDP evaluate, like
+// the browser. The DOM is a stub intentionally limited to what the injected production helpers touch
+// on an empty page (probePage, listConsoleMessages/listNetworkRequests, and the real
+// snapshot_injected.js); running the real snapshot file here is what makes the scripting-denied
+// fallback test honest instead of asserting a hardcoded value.
+const snapshotSource = fs.readFileSync(path.resolve(__dirname, "../../extensions/chrome-profile-bridge/browser-extension/snapshot_injected.js"), "utf8");
+const PACKAGED_FILES = { "snapshot_injected.js": snapshotSource };
+
+function stubElement(tag = "div") {
+  const uppercase = String(tag).toUpperCase();
+  return {
+    tagName: uppercase, nodeName: uppercase, id: "", className: "", textContent: "", innerText: "", value: "",
+    children: [], childNodes: [], style: {}, isConnected: true, isContentEditable: false, disabled: false,
+    parentElement: null,
+    getBoundingClientRect: () => ({ left: 0, top: 0, right: 0, bottom: 0, width: 0, height: 0, x: 0, y: 0 }),
+    querySelectorAll: () => [], querySelector: () => null, closest: () => null, contains: () => false,
+    getAttribute: () => null, hasAttribute: () => false, focus: () => {}, scrollIntoView: () => {},
+    addEventListener: () => {}, removeEventListener: () => {}, dispatchEvent: () => true,
+  };
+}
+
+function pageContextFor(state, tabId) {
+  const existing = state.pageContexts.get(tabId);
+  if (existing) return existing;
+  const body = stubElement("body");
+  const documentElement = stubElement("html");
+  documentElement.scrollWidth = 0; documentElement.scrollHeight = 0; documentElement.clientWidth = 800; documentElement.clientHeight = 600;
+  const document = {
+    title: "", readyState: "complete", body, documentElement, activeElement: body,
+    querySelectorAll: () => [], querySelector: () => null, getElementById: () => null,
+    elementFromPoint: () => null, createElement: (tag) => stubElement(tag),
+    addEventListener: () => {}, removeEventListener: () => {}, scripts: [],
+  };
+  function XHRStub() {}
+  XHRStub.prototype = { open: () => {}, send: () => {}, addEventListener: () => {}, removeEventListener: () => {}, getAllResponseHeaders: () => "" };
+  const page = {
+    console: { debug: (...a) => console.debug(...a), log: (...a) => console.log(...a), info: (...a) => console.info(...a), warn: (...a) => console.warn(...a), error: (...a) => console.error(...a) },
+    JSON, Math, Date, Promise, Array, Object, String, Number, Boolean, Error, TypeError, Map, Set, WeakMap, WeakSet, RegExp, Symbol,
+    document, location: { href: "", origin: "null" }, navigator: { userAgent: "unit-test", webdriver: false },
+    innerWidth: 800, innerHeight: 600, scrollX: 0, scrollY: 0, devicePixelRatio: 1,
+    getComputedStyle: () => ({ visibility: "visible", display: "block", opacity: "1", position: "static", overflow: "visible", pointerEvents: "auto" }),
+    XMLHttpRequest: XHRStub, MutationObserver: function MutationObserver() { this.observe = () => {}; this.disconnect = () => {}; },
+    CSS: { escape: (value) => String(value) }, performance: { now: () => Date.now() },
+    requestAnimationFrame: (callback) => setTimeout(() => callback(Date.now()), 0),
+    setTimeout, clearTimeout, fetch: async () => ({ ok: true, status: 200, text: async () => "" }),
+    addEventListener: () => {}, removeEventListener: () => {},
+  };
+  page.window = page;
+  page.self = page;
+  page.globalThis = page;
+  const wrapped = { context: vm.createContext(page), page };
+  state.pageContexts.set(tabId, wrapped);
+  return wrapped;
+}
+
+function syncPage(ctx, tab) {
+  ctx.page.location.href = tab ? String(tab.url || "") : "";
+  ctx.page.document.title = tab ? String(tab.title || "") : "";
+}
+
+function cdpValue(value) {
+  if (value === undefined) return { type: "undefined" };
+  if (value === null) return { type: "object", subtype: "null", value: null };
+  if (typeof value === "object") return { type: "object", value };
+  return { type: typeof value, value };
+}
+
+function exceptionResult(error) {
+  const description = String((error && error.stack) || error);
+  return {
+    result: { type: "object", subtype: "error", description },
+    exceptionDetails: { text: "Uncaught", exception: { className: (error && error.name) || "Error", description, value: (error && error.message) || String(error) } },
+  };
+}
+
 // ---- stateful Chrome mock. `state` (tabs/windows/storage) can be shared across two sandbox loads
 // to simulate a service-worker restart: the browser keeps its tabs/windows/session-storage, the
 // worker memory is wiped (a fresh sandbox).
@@ -48,7 +131,10 @@ function makeChromeState() {
   const alloc = { tab: () => nextTabId++, window: () => nextWindowId++, group: () => nextGroupId++ };
   // Every way a window or an unanchored tab could appear, recorded so the "never creates a window,
   // never uses the focused window" invariant can be asserted directly instead of inferred.
-  const events = { windowCreates: [], windowIdLessTabCreates: [], focuses: [] };
+  const events = { windowCreates: [], windowIdLessTabCreates: [], focuses: [], debuggerAttaches: [] };
+  // The page realm survives a service-worker restart (the tab keeps its globals), so it lives on
+  // `state`, not on the chrome mock.
+  const pageContexts = new Map(); // tabId -> { context, page }
 
   // Seed a user window with two real user tabs (Gmail + a research article, the active one).
   const userWindowId = alloc.window();
@@ -58,7 +144,7 @@ function makeChromeState() {
   tabs.set(userGmail.id, userGmail);
   tabs.set(userArticle.id, userArticle);
 
-  return { tabs, windows, groups, storage, alloc, userWindowId, userGmail, userArticle, events };
+  return { tabs, windows, groups, storage, alloc, userWindowId, userGmail, userArticle, events, pageContexts };
 }
 
 function makeChrome(state, { withWindows = true, withStorage = true, withTabGroups = false } = {}) {
@@ -66,12 +152,119 @@ function makeChrome(state, { withWindows = true, withStorage = true, withTabGrou
   const noop = () => {};
   const listener = { addListener: noop, removeListener: noop };
 
+  // Live-measured permission rules (Edge 123, headed, 2026-09-20). The browser really has two
+  // different rules, so the mock has two:
+  //   - chrome.debugger.attach accepts exactly `about:blank`; every OTHER about:-scheme URL (the
+  //     marked legacy target) is refused with the host-permission error. This is the rule the
+  //     original fix measured on the debugger path.
+  //   - chrome.scripting.executeScript refuses plain about:blank as well (a top-level about:blank
+  //     the extension opened has an opaque origin, so <all_urls> does not cover it), plus the
+  //     marked URL, data: and the other restricted schemes. Snapshot/inspect/console/network/probe
+  //     only work because production falls back to the debugger channel after this refusal; an
+  //     idealised mock that let scripting through on about:blank hid that second failure mode.
+  const cannotAccessError = (url) =>
+    `Cannot access contents of url "${url}". Extension manifest must request permission to access this host.`;
+  const originAccessError = (url) =>
+    `Cannot access "${url}" at origin "null". Extension must have permission to access the frame's origin, and matchAboutBlank must be true.`;
+  const debuggerDeniedUrl = (tab) => {
+    const url = tab ? String(tab.url || "") : "";
+    return url.startsWith("about:") && url !== "about:blank" && url !== "about:srcdoc" ? url : "";
+  };
+  const scriptingDeniedUrl = (tab) => {
+    const url = tab ? String(tab.url || "") : "";
+    return url.startsWith("about:") || url.startsWith("data:") || url.startsWith("view-source:") ||
+      url.startsWith("chrome:") || url.startsWith("edge:") || url.startsWith("devtools:") ? url : "";
+  };
+  // Production addresses the debugger with the page target from pageDebuggeeForTab ({targetId}) and
+  // falls back to {tabId}; the mock resolves both so the preferred shape is the one actually used.
+  const tabIdOfDebuggee = (debuggee) => {
+    if (!debuggee || typeof debuggee !== "object") return null;
+    if (typeof debuggee.tabId === "number") return debuggee.tabId;
+    const match = typeof debuggee.targetId === "string" ? /^page-target-(\d+)$/.exec(debuggee.targetId) : null;
+    return match ? Number(match[1]) : null;
+  };
+  const attachedTabIds = new Set();
+  // Run a MAIN-world expression the way the browser runs it: in the tab's page realm, asynchronously
+  // when asked. Errors become a CDP exceptionDetails result, never a sendCommand lastError.
+  const evaluateInPage = async (tabId, expression, awaitPromise) => {
+    const ctx = pageContextFor(state, tabId);
+    syncPage(ctx, tabs.get(tabId));
+    let value;
+    try {
+      value = vm.runInContext(String(expression ?? ""), ctx.context);
+    } catch (error) {
+      return exceptionResult(error);
+    }
+    if (awaitPromise && value && typeof value.then === "function") {
+      try { value = await value; } catch (error) { return exceptionResult(error); }
+    }
+    return { result: cdpValue(value) };
+  };
+
   const chrome = {
-    runtime: { id: "unittestextension", getManifest: () => ({ version: "0.0.0" }), onInstalled: listener, onStartup: listener, lastError: null },
+    runtime: { id: "unittestextension", getURL: (file) => `chrome-extension://unittestextension/${file}`, getManifest: () => ({ version: "0.0.0" }), onInstalled: listener, onStartup: listener, lastError: null },
     alarms: { onAlarm: listener, create: noop, clear: noop, clearAll: noop },
     action: { onClicked: listener },
-    debugger: { sendCommand: noop, attach: async () => {}, detach: async () => {}, getTargets: (cb) => cb([]), onDetach: listener },
-    scripting: { executeScript: async () => [{ result: undefined }], registerContentScripts: async () => {}, unregisterContentScripts: async () => {} },
+    debugger: {
+      sendCommand: (debuggee, method, params, callback) => {
+        const tabId = tabIdOfDebuggee(debuggee);
+        const denied = debuggerDeniedUrl(tabId === null ? null : tabs.get(tabId));
+        if (denied) {
+          chrome.runtime.lastError = { message: cannotAccessError(denied) };
+          try { callback(undefined); } finally { chrome.runtime.lastError = null; }
+          return;
+        }
+        if (method !== "Runtime.evaluate") { callback({ result: {} }); return; }
+        void evaluateInPage(tabId, params && params.expression, params && params.awaitPromise === true).then((result) => callback(result));
+      },
+      attach: async (debuggee) => {
+        const tabId = tabIdOfDebuggee(debuggee);
+        const denied = debuggerDeniedUrl(tabId === null ? null : tabs.get(tabId));
+        if (denied) throw new Error(cannotAccessError(denied));
+        state.events.debuggerAttaches.push({ tabId, targetId: debuggee && debuggee.targetId });
+        if (typeof tabId === "number") attachedTabIds.add(tabId);
+      },
+      detach: async (debuggee) => { const tabId = tabIdOfDebuggee(debuggee); if (tabId !== null) attachedTabIds.delete(tabId); },
+      getTargets: (callback) => callback([...tabs.values()].map((tab) => ({
+        id: `page-target-${tab.id}`, tabId: tab.id, type: "page", url: tab.url, attached: attachedTabIds.has(tab.id),
+      }))),
+      onDetach: listener,
+    },
+    scripting: {
+      executeScript: async (options = {}) => {
+        const tabId = options && options.target ? options.target.tabId : null;
+        const tab = typeof tabId === "number" ? tabs.get(tabId) : null;
+        const denied = scriptingDeniedUrl(tab);
+        if (denied) {
+          // Per-shape messages exactly as measured live: the func form on a fragment about: URL
+          // reports the frame-origin rule; the file form and about:blank/data: report the URL rule.
+          const message = options.func && denied.startsWith("about:") && denied !== "about:blank"
+            ? originAccessError(denied)
+            : cannotAccessError(denied);
+          throw new Error(message);
+        }
+        if (Array.isArray(options.files) && options.files.length) {
+          for (const file of options.files) {
+            const source = PACKAGED_FILES[file];
+            if (source === undefined) throw new Error(`No packaged file ${file}`);
+            const ctx = pageContextFor(state, tabId);
+            syncPage(ctx, tab);
+            vm.runInContext(source, ctx.context);
+          }
+          return [{ result: undefined }];
+        }
+        // Chrome serialises the func into the page realm; the mock does the same, so a scripting
+        // result is real page execution and not a hardcoded value.
+        const ctx = pageContextFor(state, tabId);
+        syncPage(ctx, tab);
+        const serializedArgs = JSON.stringify(Array.isArray(options.args) ? options.args : []);
+        let value = vm.runInContext(`(${options.func.toString()})(...${serializedArgs})`, ctx.context);
+        if (value && typeof value.then === "function") value = await value;
+        return [{ result: value }];
+      },
+      registerContentScripts: async () => {},
+      unregisterContentScripts: async () => {},
+    },
     webNavigation: { onCommitted: listener },
     tabs: {
       onUpdated: listener,
@@ -184,7 +377,14 @@ function loadWorker(chrome) {
     console, JSON, Date, Math, Promise, Array, Object, String, Number, Boolean,
     Error, TypeError, Map, Set, BigInt, Symbol, structuredClone,
     setTimeout, clearTimeout, setInterval: () => 0, clearInterval: noop,
-    fetch: async () => { throw new Error("no network in unit test"); },
+    fetch: async (url) => {
+      const key = String(url).replace(/^chrome-extension:\/\/unittestextension\//, "");
+      if (key in PACKAGED_FILES) {
+        const text = PACKAGED_FILES[key];
+        return { ok: true, status: 200, text: async () => text, clone: () => ({ text: async () => text }) };
+      }
+      throw new Error("no network in unit test");
+    },
     navigator: { userAgent: "unit-test" },
     WebSocket: function () {},
     chrome,
@@ -491,6 +691,92 @@ async function run() {
     ok(repaired.windowId === win.id, "edge-quirk: withResolvedWindowId re-read the live tab and filled the window id");
   }
 
+  // ===== The live 2026-09-20 permission failure, pinned to the real browser and to production's URL
+  // choice, on BOTH channels. Live Edge 123 refuses chrome.debugger.attach for about:blank#pi-chrome
+  // (host-permission error) and refuses chrome.scripting.executeScript for plain about:blank as well
+  // (opaque origin, <all_urls> does not cover it). So two independent regressions are pinned here:
+  // the debugger path that the URL fix repaired, and the scripting path that only works because
+  // production falls back to the debugger. Before the fix the debugger assertion below fails with
+  // "Chrome debugger attach failed for tab N: Cannot access contents of url \"about:blank#pi-chrome\".
+  // Extension manifest must request permission to access this host.", and the snapshot/probe/console
+  // assertions fail with the scripting permission error on plain about:blank. =====
+  {
+    const state = makeChromeState();
+    const w = loadWorker(makeChrome(state));
+
+    // The mock now refuses exactly what live Edge refuses, so a future marker URL cannot pass tests.
+    const denied = await w.chrome.tabs.create({ url: "about:blank#pi-chrome", windowId: state.userWindowId });
+    await throwsWith(
+      () => w.attachDebugger(denied.id),
+      /^Chrome debugger attach failed for tab \d+: Cannot access contents of url "about:blank#pi-chrome"\. Extension manifest must request permission to access this host\./,
+      "permission-model: attach to the #pi-chrome URL is denied (live Edge shape)",
+    );
+    const allowed = await w.chrome.tabs.create({ url: "about:blank", windowId: state.userWindowId });
+    let allowedError = null;
+    try { await w.attachDebugger(allowed.id); } catch (e) { allowedError = e; }
+    ok(!allowedError, `permission-model: plain about:blank attaches (got: ${allowedError && allowedError.message})`);
+
+    // Production: a brand-new session's first page.evaluate must succeed. Before the fix this
+    // rejected with the attach error above because the target URL was about:blank#pi-chrome.
+    const permissionKey = "session:permission";
+    let evaluated = null;
+    let evaluateError = null;
+    try {
+      evaluated = await w.dispatch("page.evaluate", { expression: "1+1", background: true, sessionKey: permissionKey, preferredWindow: state.userWindowId });
+    } catch (e) { evaluateError = e; }
+    ok(
+      evaluated === 2 && !evaluateError,
+      `permission: a fresh automation target can run page.evaluate (got: ${evaluateError ? evaluateError.message : evaluated})`,
+    );
+
+    const target = state.tabs.get((await w.dispatch("automation.status", { sessionKey: permissionKey })).tabId);
+    ok(target && target.url === "about:blank", `permission: the automation target URL is exactly about:blank (got: ${target && target.url})`);
+
+    // Production attached through the page-target debuggee (pageDebuggeeForTab), not the bare
+    // {tabId} shape: the mock's getTargets returns page targets, so this pins the path exercised.
+    ok(
+      state.events.debuggerAttaches.some((entry) => typeof entry.targetId === "string" && entry.targetId.startsWith("page-target-")),
+      "permission-model: attach used the page-target debuggee shape",
+    );
+
+    // Scripting vs plain about:blank, exactly as live Edge refuses it. This is the second failure
+    // mode the URL fix alone does not repair; pinning the refusal keeps an idealised mock from
+    // hiding it again.
+    await throwsWith(
+      () => w.chrome.scripting.executeScript({ target: { tabId: target.id }, world: "MAIN", func: () => 1 + 1 }),
+      /^Cannot access contents of url "about:blank"\. Extension manifest must request permission to access this host\.$/,
+      "permission-model: chrome.scripting refuses plain about:blank (live Edge shape)",
+    );
+
+    // page.probe / page.console.list / page.snapshot on that fresh target are scripting-only
+    // production actions: they can only work through the scripting->debugger fallback. The snapshot
+    // assertion runs the real snapshot_injected.js in the mock's page realm, so it proves the file
+    // source was injected and the snapshot function really returned a snapshot.
+    const probed = await w.dispatch("page.probe", { background: true, sessionKey: permissionKey });
+    ok(
+      probed && probed.arithmetic === 2 && probed.location === "about:blank",
+      `permission: page.probe runs on a fresh target through the scripting fallback (got: ${JSON.stringify(probed)})`,
+    );
+    const consoleList = await w.dispatch("page.console.list", { background: true, sessionKey: permissionKey });
+    ok(consoleList && Array.isArray(consoleList.messages), `permission: page.console.list runs on a fresh target (got: ${JSON.stringify(consoleList)})`);
+    const snapshot = await w.dispatch("page.snapshot", { background: true, sessionKey: permissionKey, mode: "auto" });
+    ok(
+      snapshot && snapshot.url === "about:blank" && snapshot.mode === "auto" && Array.isArray(snapshot.elements),
+      `permission: page.snapshot runs on a fresh target through the scripting fallback (got: ${JSON.stringify(snapshot && { url: snapshot.url, mode: snapshot.mode })})`,
+    );
+
+    // And the per-command refusal, matching the live crossover: a tab attached on a permitted URL that
+    // then navigates to the marker is refused by Runtime.evaluate itself (live measurement: 10ms).
+    const attached = await w.chrome.tabs.create({ url: "https://example.com/", windowId: state.userWindowId });
+    await w.dispatch("cdp.call", { targetId: String(attached.id), method: "Runtime.evaluate", params: { expression: "1+1" }, background: true });
+    await w.chrome.tabs.update(attached.id, { url: "about:blank#pi-chrome" });
+    await throwsWith(
+      () => w.dispatch("cdp.call", { targetId: String(attached.id), method: "Runtime.evaluate", params: { expression: "1+1" }, background: true }),
+      /^Runtime\.evaluate: Cannot access contents of url "about:blank#pi-chrome"\. Extension manifest must request permission to access this host\./,
+      "permission-model: Runtime.evaluate is refused after a permitted tab navigates to the marker",
+    );
+  }
+
   // ===== A window that exists but refuses Pi's tab fails actionably; it never retries without a
   // windowId and never leaves a stray tab. =====
   {
@@ -544,8 +830,21 @@ async function run() {
     state.storage.piChromeCreatedWindowIds = [legacyWindowId];
     const w = loadWorker(makeChrome(state));
 
+    const adopted = await w.getOrCreateAutomationTarget(legacyKey);
+    ok(adopted.id === marker.id, "legacy: the unowned marker in the recorded Pi window was adopted, not duplicated");
+    ok(
+      state.tabs.get(marker.id).url === "about:blank",
+      `legacy: adoption healed the marker URL to plain about:blank (got: ${state.tabs.get(marker.id).url})`,
+    );
+    // The residual hole the review found: without healing, adoption returned the un-attachable
+    // marker URL and the first page.evaluate on it died with the debugger permission error.
+    let adoptedEval = null;
+    let adoptedEvalError = null;
+    try { adoptedEval = await w.dispatch("page.evaluate", { expression: "1+1", background: true, sessionKey: legacyKey }); } catch (e) { adoptedEvalError = e; }
+    ok(adoptedEval === 2 && !adoptedEvalError, `legacy: the adopted legacy marker runs page.evaluate (got: ${adoptedEvalError ? adoptedEvalError.message : adoptedEval})`);
+
     const nav = await w.dispatch("page.navigate", { url: "https://pi.test/legacy", waitUntilLoad: false, sessionKey: legacyKey });
-    ok(nav.id === marker.id && nav.windowId === legacyWindowId, "legacy: the unowned marker in the recorded Pi window was adopted, not duplicated");
+    ok(nav.id === marker.id && nav.windowId === legacyWindowId, "legacy: the adopted marker is reused for the next action");
     assertNoCreation(state, "legacy");
 
     const report = await w.dispatch("window.list", { sessionKey: legacyKey });
