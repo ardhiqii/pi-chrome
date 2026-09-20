@@ -2,21 +2,50 @@
 
 All notable user-facing changes to `pi-chrome`.
 
-## FORK ADDITIONS — NOT AN OFFICIAL RELEASE
+## FORK ADDITIONS — pi-chrome PLUS (not an official upstream release)
 
 > **This section is not part of any official `pi-chrome` release.** It documents the changes this
-> fork (`0.15.51.1`, based on upstream `0.15.51`) carries on top of the released package. Upstream
-> releases do not contain them, and nothing here is offered upstream or as a pull request.
-> `service_worker.js` here also carries a pre-existing fork fix (explicit page target on attach)
-> that predates this section.
+> fork (`0.15.51.23`, tagged `0.15.51-plus.23`, based on upstream `0.15.51`) carries on top of the
+> released package. Upstream releases do not contain them, and nothing here is offered upstream or
+> as a pull request. `service_worker.js` here also carries a pre-existing fork fix (explicit page
+> target on attach) that predates this section.
 
 ### Fork additions on top of 0.15.51
 
+- **The fork is presented as "pi-chrome PLUS", and its version tag can no longer lag the build.**
+  `package.json` / `manifest.json` move to `0.15.51.23`; the display tag in `version_name` is now
+  `0.15.51-plus.23` (it had been left at `0.15.51-aufa.21` while the numeric version reached
+  `.22`). `scripts/sync-manifest-version.mjs` now derives `version_name` from the numeric version
+  as `<major>.<minor>.<patch>-plus.<build>` and writes it together with `manifest.version`, so a
+  bump cannot leave the tag behind (Chrome still validates `version` as integers only, which is
+  why the tag lives in the display-only `version_name`). The npm metadata (`homepage`,
+  `repository`, `bugs`) now points at `github.com/ardhiqii/pi-chrome`; `author` stays upstream's.
+  The interactive `/chrome` picker gained **Repair stray Pi groups…**, which runs the same code
+  path as `/chrome groups repair` — read-only preview first, the existing confirmation before any
+  ungroup when strays exist, and a plain "nothing to repair" notice when there are none. `README.md`
+  gained a "Plus fork features" section (with a "Versioning" subsection and a note on what a Pi
+  tab group is and what `/chrome groups repair` does) ahead of upstream's README. `deploy.sh` now
+  prints both the numeric version and its plus tag.
+- **The repository is presented as a maintained open-source project, and two docs no longer describe
+  upstream behaviour.** Added `.github/workflows/ci.yml` (guard + `npm test` on Node 22.13 and 24, no
+  install step needed), issue forms for bug reports (they ask for the numeric version, the plus tag,
+  and full `/chrome doctor` output) and feature requests, a pull-request checklist, weekly Dependabot
+  updates for actions, `CODE_OF_CONDUCT.md` (Contributor Covenant 2.1), `.editorconfig`, `.nvmrc`, and
+  a `docs/README.md` index. `package.json` gained `engines.node >= 22.13.0` — the suites import
+  `stripTypeScriptTypes` from `node:module`, which Node 18/20 do not have — and its `files` list now
+  ships `scripts/` (the `version` script lives there) instead of the maintainer tooling. `deploy.sh`
+  and `DEPLOY.md` are labelled maintainer tooling and stay out of the published package: installing
+  pi-chrome normally never needs them. `CONTRIBUTING.md` documents the fork's real release flow (no
+  `npm publish`) and the red-on-revert evidence rule; `SECURITY.md` reports to the fork's tracker and
+  states only verified design facts; `LICENSE` keeps upstream's MIT text verbatim with one added line
+  for this fork's contributions. `docs/FAQ.md` and `docs/ARCHITECTURE.md` claimed the first action
+  opens a dedicated automation *window* — this fork creates a tab in the window you pick with
+  `/chrome window`, so both now say that, plus what `/chrome groups repair` does.
 - **Pi can no longer create a "Pi Agent" group, or adopt a tab, in a window it was not told to use —
   and the resolution that caused the live mis-target is fixed and reported.** Reproduced live in the
   user's own Edge window: Pi created a "Pi Agent" tab group in window `720723708` and adopted the
   user's Google tab `720723910` into it, while this Pi session's own workspace was window
-  `1808155021`; a `page.*` call carrying `urlIncludes: "google.com/search"` then resolved to that
+  `720723947`; a `page.*` call carrying `urlIncludes: "google.com/search"` then resolved to that
   user tab and typed into it. The cause was a group call scoped only to `tab.windowId` plus a
   `groupTitle`/`joinSessionGroup` pair on every page action, so any target resolving to a user tab in
   another window was grouped there. `groupTab` now takes a REQUIRED `allowedWindowId` and refuses,

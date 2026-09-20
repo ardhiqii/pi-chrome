@@ -26,12 +26,14 @@ Multiple Pi sessions can use same Chrome companion extension. First session open
 
 Each Pi session owns its own automation target:
 
-- First chrome action without explicit target opens dedicated automation window.
-- If separate window cannot be created, pi-chrome falls back to dedicated tab.
+- The first chrome action without an explicit target creates an automation tab inside the window you chose with `/chrome window` (one machine-wide pick, saved for future sessions).
+- With no chosen window, an action that needs one fails with the `/chrome window` message instead of guessing the focused window.
+- Grouping is confined to that window: Pi never creates or joins a tab group outside it, and a page action that resolved to a tab elsewhere says so in its result instead of adopting it.
+- `/chrome groups` reports a `Pi Agent` group found outside the chosen window, and `/chrome groups repair` ungroups it without closing, moving or navigating anything.
 - Target survives `/reload` and Chrome service-worker restarts.
 - Ownership is tracked by id and mirrored to `chrome.storage.session`.
 - Cleanup closes calling session's automation target and every tab it created through `tab.new`.
-- Existing user tabs adopted into a session group are preserved, and ungrouped only if still in that group.
+- Existing user tabs are never grouped unless they sit inside the chosen window and the caller grouped them explicitly; `/chrome groups repair` ungroups strays in other windows.
 - Cleanup removes individual owned tabs, never whole windows. User/other-session tabs moved into a Pi window remain open; Chrome closes a window automatically when its final tab is removed.
 - Shutdown waits at most two seconds for cleanup before stopping the bridge. `/reload` preserves resources; revoke starts cleanup without blocking. Hard process termination or unavailable Chrome can still leave owned tabs open.
 

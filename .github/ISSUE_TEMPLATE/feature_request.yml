@@ -1,0 +1,43 @@
+name: Feature request
+description: Propose a change or a new capability.
+title: "[feature] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe the problem first; the proposal is more useful once the problem is clear. The
+        project's non-negotiables (no re-login, verifiable action results, Chrome real input, and
+        tests that fail before the change and pass after) are in CONTRIBUTING.md.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to do, and what stops you today? Include what pi-chrome currently does in this situation.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: The proposal
+      description: What should change? If it is a new tool or parameter, sketch the call and the structured result you would expect.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Workarounds you tried, or other designs you rejected.
+    validations:
+      required: false
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: How would we know it works?
+      description: What observation, benchmark page, or measurement would show this works? User-visible claims in this project are measured, not inferred.
+    validations:
+      required: false

@@ -1,0 +1,20 @@
+# https://editorconfig.org
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+[*.{js,mjs,json,yml,yaml,md,html,css}]
+indent_style = space
+indent_size = 2
+
+# index.ts is tab-indented; the Pi-side extension keeps tabs in .ts files.
+[*.ts]
+indent_style = tab
+
+# Hard line breaks are meaningful in markdown, especially in CHANGELOG.md.
+[*.md]
+trim_trailing_whitespace = false

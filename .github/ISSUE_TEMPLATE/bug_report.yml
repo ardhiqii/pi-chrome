@@ -1,0 +1,93 @@
+name: Bug report
+description: Report something that is broken or behaves differently than documented.
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Real diagnostics are the difference between a fix and a guess, so the
+        fields below ask for the measurements this project works from.
+
+        **Never paste credentials, cookies, session tokens, API keys, or other secret data.** Redact
+        private page URLs and page content before posting.
+
+  - type: input
+    id: pi_chrome_version
+    attributes:
+      label: pi-chrome version
+      description: The version printed by `/chrome doctor` (for example `pi-chrome v0.15.51.23`).
+      placeholder: "0.15.51.23"
+    validations:
+      required: true
+
+  - type: input
+    id: plus_tag
+    attributes:
+      label: PLUS display tag
+      description: "For a pi-chrome PLUS build this is `version_name` in `manifest.json` (for example `0.15.51-plus.23`), also printed by `deploy.sh`. `/chrome doctor` prints the numeric version only, so include the tag here if you know it."
+      placeholder: "0.15.51-plus.23"
+    validations:
+      required: false
+
+  - type: input
+    id: browser_profile
+    attributes:
+      label: Browser and profile
+      description: "Which browser (Chrome, Edge, Brave, Vivaldi, ...) and which profile? `/chrome doctor` names the connected connector in its \"Connected to ...\" line (for example `edge:9d233ecf`)."
+      placeholder: "Edge, profile edge:9d233ecf"
+    validations:
+      required: true
+
+  - type: textarea
+    id: doctor_output
+    attributes:
+      label: Exact `/chrome doctor` output
+      description: Paste the complete output, not a paraphrase. Redact private page URLs if needed.
+      render: text
+      placeholder: |
+        pi-chrome v0.15.51.23
+        • Authorization: ...
+        • Background: ...
+        ✓ Connected to ...
+    validations:
+      required: true
+
+  - type: dropdown
+    id: extension_reloaded
+    attributes:
+      label: Was the Chrome companion extension reloaded?
+      description: "If `service_worker.js` changed, the running copy keeps executing the old code until you click Reload on the extension card. See DEPLOY.md."
+      options:
+        - "Yes, reloaded before the failure"
+        - "No, not reloaded"
+        - "Unknown or not applicable"
+    validations:
+      required: true
+
+  - type: textarea
+    id: action
+    attributes:
+      label: What was the action?
+      description: The exact tool call or `/chrome` command, and the result envelope you got back.
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected_actual
+    attributes:
+      label: Expected vs actual
+      description: What you expected to happen, and what happened instead.
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: hygiene
+    attributes:
+      label: Before submitting
+      options:
+        - label: I have not included credentials, session data, or private page content in this report.
+          required: true
+        - label: I searched existing issues for this problem.
+          required: false

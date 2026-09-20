@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Deploy this fork's pi-chrome build into the live unpacked extension install.
+# Deploy this fork's pi-chrome build into the live unpacked extension install
+# (default: $HOME/.pi/agent/npm/node_modules/pi-chrome; override with PI_CHROME_INSTALL_DIR).
 #
 # - Copies ONLY the files this build changes: the extension service worker, the Pi-side tool
 #   surface, and the two files carrying this build's version (package.json / manifest.json).
@@ -7,9 +8,15 @@
 #   build) nor $BASE_VERSION_UPSTREAM (a clean upstream reinstall), or whose service_worker.js is
 #   neither a known-good base (pristine release or page-target-fixed) nor an already-deployed
 #   fork build. --force overrides the refusal (a backup is still made).
+# - Refuses a broken build before touching the live install: node --check on service_worker.js,
+#   and an ES-module parse check on index.ts (a duplicate top-level declaration once killed the
+#   whole /chrome command and every chrome_* tool).
 # - Backs up each overwritten file with a .pi-backup-<timestamp> suffix first.
 # - Idempotent: identical files are skipped, so a second run copies nothing.
 # - Never moves, reinstalls, or re-adds the extension: the install path is unchanged.
+# - Prints the steps that are actually required afterwards: reload the extension when
+#   service_worker.js changed, /reload in Pi when index.ts changed, and /chrome authorize when
+#   Chrome control is locked. The build's numeric version and plus tag are printed on deploy.
 set -euo pipefail
 
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -32,6 +39,9 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 # copy drifts silently on the next version bump, and the guard then refuses a perfectly good deploy —
 # which is exactly what happened going from 0.15.51.1 to 0.15.51.2.
 BASE_VERSION="$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$SRC/package.json" | head -n 1)"
+# This build's display tag (`0.15.51-plus.23`), read from the manifest the sync script writes rather
+# than re-derived here: one implementation of the scheme. Empty when a manifest predates version_name.
+BASE_VERSION_NAME="$(sed -n 's/.*"version_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$SRC/extensions/chrome-profile-bridge/browser-extension/manifest.json" | head -n 1)"
 BASE_VERSION_UPSTREAM="0.15.51"
 BASE_SW_SHA256="ac1e346d88aaa684d1998b17f899c4b50077d27f01eeb1a3393649013643ee3f"
 PATCHED_BASE_SW_SHA256="a5b2cdd816c357acd3910aa6f24db7ac61ec0684851d12013be5e50664dfc764"
@@ -42,6 +52,8 @@ for arg in "$@"; do
     --force) FORCE=1 ;;
     -h|--help)
       echo "usage: bash deploy.sh [--force]"
+      echo "       deploy this build (${BASE_VERSION}${BASE_VERSION_NAME:+ (${BASE_VERSION_NAME})}) into:"
+      echo "       $DEST_ROOT"
       exit 0
       ;;
     *)
@@ -70,6 +82,17 @@ sha256_of() {
   fi
 }
 
+# Print "0.15.51.23 (0.15.51-plus.23)" when the fork's display tag is known, otherwise just the
+# numeric version: an upstream install (or an older manifest) has no version_name, and inventing a
+# tag for it would misreport what is installed.
+version_with_tag() {
+  if [ -n "$2" ]; then
+    printf '%s (%s)' "$1" "$2"
+  else
+    printf '%s' "$1"
+  fi
+}
+
 # ---- upgrade guard -----------------------------------------------------------
 # After `npm/pi update`, the live install is a newer release while this build still carries
 # 0.15.51 files. Copying them in would leave a version-skewed install: package.json / manifest.json
@@ -79,8 +102,12 @@ src_sw="$SRC/extensions/chrome-profile-bridge/browser-extension/service_worker.j
 src_index="$SRC/extensions/chrome-profile-bridge/index.ts"
 dest_sw="$DEST_ROOT/extensions/chrome-profile-bridge/browser-extension/service_worker.js"
 dest_version=""
+dest_version_name=""
 if [ -f "$DEST_ROOT/package.json" ]; then
   dest_version="$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$DEST_ROOT/package.json" | head -n 1)"
+fi
+if [ -f "$DEST_ROOT/extensions/chrome-profile-bridge/browser-extension/manifest.json" ]; then
+  dest_version_name="$(sed -n 's/.*"version_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$DEST_ROOT/extensions/chrome-profile-bridge/browser-extension/manifest.json" | head -n 1)"
 fi
 src_version="$BASE_VERSION"
 # See the note next to BASE_VERSION: this is read from package.json, not maintained by hand.
@@ -115,7 +142,7 @@ if [ "$FORCE" -ne 1 ]; then
     case "$dest_version" in
       "$BASE_VERSION"|"$BASE_VERSION_UPSTREAM"|"$BASE_VERSION_UPSTREAM".*) ;;
       *)
-        echo "ERROR: live install is version $dest_version, but this build is $BASE_VERSION" >&2
+        echo "ERROR: live install is version $(version_with_tag "$dest_version" "$dest_version_name"), but this build is $(version_with_tag "$BASE_VERSION" "$BASE_VERSION_NAME")" >&2
         echo "       (based on $BASE_VERSION_UPSTREAM). Deploying would mix versions of the extension" >&2
         echo "       service worker and its manifests. Re-run with --force only if you deliberately" >&2
         echo "       want to keep this local build on top of that release." >&2
@@ -228,7 +255,7 @@ echo
 if [ "$sw_changed" -eq 1 ] && [ "$version_changed" -eq 1 ]; then
   echo "  1) No manual Reload needed: service_worker.js and the version both changed, so the"
   echo "     extension reloads itself within a few seconds of its next poll"
-  echo "     (${dest_version:-unknown} -> ${src_version:-unknown}). Clicking Reload at"
+  echo "     ($(version_with_tag "${dest_version:-unknown}" "$dest_version_name") -> $(version_with_tag "${src_version:-unknown}" "$BASE_VERSION_NAME")). Clicking Reload at"
   echo "     edge://extensions still works if you would rather not wait."
 elif [ "$sw_changed" -eq 1 ]; then
   echo "  1) RELOAD THE EXTENSION (service_worker.js changed, version unchanged):"
@@ -240,7 +267,7 @@ elif [ "$sw_changed" -eq 1 ]; then
 else
   echo "  1) No Reload needed: service_worker.js is unchanged."
   if [ "$version_changed" -eq 1 ]; then
-    echo "     The version changed (${dest_version:-unknown} -> ${src_version:-unknown}), which the extension"
+    echo "     The version changed ($(version_with_tag "${dest_version:-unknown}" "$dest_version_name") -> $(version_with_tag "${src_version:-unknown}" "$BASE_VERSION_NAME")), which the extension"
     echo "     picks up on its own within a few seconds of its next poll."
   else
     echo "     (Nothing changed on the browser side at all.)"

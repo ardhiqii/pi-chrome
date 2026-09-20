@@ -30,15 +30,19 @@ Chrome control is also locked per Pi session until you run `/chrome authorize`; 
 
 ## Can multiple Pi sessions use it at once?
 
-Yes. The first session opens the local bridge; later sessions detect it and pipe their commands through the same bridge. Each Pi session must be authorized with `/chrome authorize` before its chrome_* tools work. Each session also owns its **own** dedicated automation window (ownership is keyed by session id inside the one extension), so concurrent sessions never navigate into or close each other's tabs.
+Yes. The first session opens the local bridge; later sessions detect it and pipe their commands through the same bridge. Each Pi session must be authorized with `/chrome authorize` before its chrome_* tools work. Each session owns its **own** automation target tab (ownership is keyed by session id inside the one extension), created inside the window you chose, so concurrent sessions never navigate into or close each other's tabs. The chosen window is machine-wide: every session works in it until you pick another with `/chrome window`.
 
 ## Does pi-chrome navigate my current tab?
 
-No. The first chrome_* action that has no explicit target opens a **dedicated automation window** that pi-chrome owns (falling back to a dedicated tab only if a separate window can't be created), and reuses it for the rest of the session. Your existing tabs and windows are never reused or overwritten. Pass `targetId`/`urlIncludes`/`titleIncludes` to deliberately act on a tab you already have open.
+No. Chrome actions use the window you picked with `/chrome window` (saved for future sessions). The first action that has no explicit target creates a reusable automation tab there, kept in that session's `Pi Agent` tab group, and reuses it. Your existing tabs and windows are never reused, grouped, moved or closed. Pass `targetId`/`urlIncludes`/`titleIncludes` to deliberately act on a tab you already have open; if it resolves to a tab outside Pi's window, the result says so and Pi does not group it.
 
-The window survives `/reload` and Chrome service-worker restarts because ownership is tracked by id and mirrored to `chrome.storage.session`. It is closed when you run `/chrome revoke` and on real session end (not on `/reload`); cleanup only ever closes that session's own window/tab.
+The automation tab survives `/reload` and extension service-worker restarts because ownership is tracked by id and mirrored to `chrome.storage.session`. It is closed on real session end (not on `/reload`); cleanup only ever closes that session's own tab and the tabs it created through `tab.new`.
 
-**After a full browser restart**, `chrome.storage.session` is cleared by Chrome. If Chrome's session-restore reopens the old automation window, pi-chrome no longer recognizes it (its tracking is gone), so it is left alone as an ordinary window — pi-chrome will open a fresh dedicated window for the new run rather than reclaim or close the restored one. pi-chrome never closes a window it can't positively identify as its own, so a user window is never at risk.
+**After a full browser restart**, `chrome.storage.session` is cleared and window ids change, so the saved pick no longer names a live window. pi-chrome then refuses the action and asks you to run `/chrome window` again: it never falls back to the focused window, and it never closes or reclaims a window it cannot positively identify as its own.
+
+## What is the "Pi Agent" tab group?
+
+Pi keeps its own tabs in a tab group titled `Pi Agent` inside the window you chose, so they are easy to tell apart from yours. It is not a window and not a setting. Pi never creates or joins such a group outside the chosen window. If one is ever found there, `/chrome groups` lists it and `/chrome groups repair` previews the fix first, then ungroups those tabs — the tabs themselves stay open, on the same page, and are never closed, moved or navigated.
 
 ## Why ship as an unpacked extension?
 

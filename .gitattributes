@@ -1,2 +1,5 @@
 # Keep byte-identical copies of upstream extension files: no EOL conversion.
 * -text
+
+# Binary assets: never diff, merge or convert these.
+*.png binary

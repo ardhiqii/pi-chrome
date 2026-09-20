@@ -1,0 +1,10 @@
+# SECURITY.md asks for issues titled with a `[security]` prefix, which the fixed titles of the
+# issue forms cannot express, so blank issues stay enabled alongside the forms.
+blank_issues_enabled: true
+contact_links:
+  - name: Security report
+    url: https://github.com/ardhiqii/pi-chrome/blob/main/SECURITY.md
+    about: Read the security policy first; do not post exploit details in a public issue without coordinating.
+  - name: Questions and usage help
+    url: https://github.com/ardhiqii/pi-chrome/blob/main/docs/FAQ.md
+    about: Common questions about behavior, safety, and limits are answered here.

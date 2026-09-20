@@ -2,6 +2,7 @@ node_modules/
 .pi/
 *.log
 .DS_Store
+Thumbs.db
 dist/
 build/
 # Timestamped backups written by deploy.sh next to the files it overwrites.

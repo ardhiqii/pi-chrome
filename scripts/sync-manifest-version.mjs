@@ -29,7 +29,7 @@ if (typeof version !== "string" || version.length === 0) {
 }
 
 // Chrome only accepts 1-4 dot-separated integers here. A semver prerelease such as
-// "0.15.51-aufa.1" is rejected outright and the extension fails to load, so fail loudly here
+// "0.15.51-plus.23" is rejected outright and the extension fails to load, so fail loudly here
 // instead of shipping a manifest Edge will refuse.
 if (!/^\d+(\.\d+){0,3}$/.test(version)) {
   throw new Error(
@@ -51,13 +51,31 @@ for (const part of parts) {
   }
 }
 
+// Derive the fork's display tag. Chrome validates manifest.version as integers only, so a fork
+// marker cannot live there; it lives in version_name (display-only), and this script is what keeps
+// the tag from lagging the build. It drifted exactly once: the numeric version reached 0.15.51.22
+// while version_name sat at 0.15.51-aufa.21, so the browser and every version report disagreed
+// about which fork build was running. Scheme: <major>.<minor>.<patch>-plus.<build>, where build is
+// the 4th numeric component (0.15.51.23 -> 0.15.51-plus.23). A 3-component version is padded to
+// three so the tag is always well-formed.
+const padded = parts.length >= 3 ? parts : [...parts, ...Array(3 - parts.length).fill("0")];
+const build = parts[3] ?? "0";
+const versionName = `${padded[0]}.${padded[1]}.${padded[2]}-plus.${build}`;
+
 const raw = readFileSync(manifestPath, "utf8");
 const manifest = JSON.parse(raw);
-if (manifest.version === version) {
-  console.log(`manifest.json already in sync at ${version}`);
+const changes = [];
+if (manifest.version !== version) {
+  changes.push(`version ${manifest.version} -> ${version}`);
+}
+if (manifest.version_name !== versionName) {
+  changes.push(`version_name ${manifest.version_name ?? "(none)"} -> ${versionName}`);
+}
+if (changes.length === 0) {
+  console.log(`manifest.json already in sync at ${version} (${versionName})`);
 } else {
-  const before = manifest.version;
   manifest.version = version;
+  manifest.version_name = versionName;
   writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
-  console.log(`manifest.json version ${before} -> ${version}`);
+  console.log(`manifest.json ${changes.join("; ")}`);
 }

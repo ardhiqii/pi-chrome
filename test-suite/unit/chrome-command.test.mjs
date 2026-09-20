@@ -595,3 +595,61 @@ test("/chrome groups repair says so plainly when there is nothing to repair", as
   assert.match(text, /No stray Pi tab groups outside window 11/);
   assert.match(text, /Nothing to repair/);
 });
+
+// ===== The bare /chrome picker offers the groups repair too. The user could only reach it by knowing
+// the /chrome groups repair subcommand; the menu entry must run that exact handler (preview first,
+// confirm before applying) rather than any parallel implementation. =====
+
+test("the dashboard menu offers the stray-group repair entry", async () => {
+  const h = harness({ choices: [undefined] });
+  await h.run();
+  assert.ok(
+    h.menus[0].items.includes("Repair stray Pi groups…"),
+    `the picker must offer the repair, got: ${JSON.stringify(h.menus[0].items)}`,
+  );
+});
+
+test("choosing the dashboard repair entry with zero strays notifies and never applies", async () => {
+  const h = harness({
+    choices: ["Repair stray Pi groups…", undefined],
+    send: () => groupsPreview({ groups: [], skippedTabs: [] }),
+  });
+  await h.run();
+  assert.deepEqual(
+    h.calls.filter((call) => call.action === "groups.repair").map((call) => [call.action, call.params.dryRun]),
+    [["groups.repair", true]],
+    "only the read-only preview is sent; nothing is applied when there is nothing to repair",
+  );
+  assert.equal(h.confirms.length, 0, "nothing to repair means no confirm dialog");
+  assert.ok(
+    h.notices.some((notice) => /Nothing to repair/.test(String(notice[0]))),
+    `the user must be told there is nothing to repair, got: ${JSON.stringify(h.notices.map((notice) => notice[0]))}`,
+  );
+  assert.equal(h.menus.length, 2, "the entry returns to the picker, like the other control menus");
+});
+
+test("choosing the dashboard repair entry previews, then applies only after the confirm", async () => {
+  const applied = groupsPreview({ dryRun: false, ungroupedTabs: [40], groups: [{ ...groupsPreview().groups[0], groupDisposedAfter: true }] });
+  const h = harness({
+    choices: ["Repair stray Pi groups…", undefined],
+    confirmAnswers: [true],
+    send: (action, params) => (action === "groups.repair" && params.dryRun === false ? applied : groupsPreview()),
+  });
+  await h.run();
+  assert.deepEqual(
+    h.calls.filter((call) => call.action === "groups.repair").map((call) => call.params.dryRun),
+    [true, false],
+    "the entry dry-runs first and applies only after the confirmation",
+  );
+  assert.equal(h.confirms.length, 1, "the user is asked exactly once, exactly like /chrome groups repair");
+  assert.match(h.confirms[0].message, /1 tab in 1 stray Pi group will be ungrouped/);
+  assert.ok(
+    h.notices.some((notice) => /Repaired 1 tab — pages and tabs were left in place/.test(String(notice[0]))),
+    `the applied result must be reported, got: ${JSON.stringify(h.notices.map((notice) => notice[0]))}`,
+  );
+  assert.deepEqual(
+    [...new Set(h.calls.map((call) => call.action))].sort(),
+    ["groups.repair", "tab.version"],
+    "the entry never closes, moves or navigates a tab",
+  );
+});

@@ -2239,6 +2239,7 @@ Usage rules:
 				"Background / watch mode…",
 				"Choose connector…",
 				"Choose window…",
+				"Repair stray Pi groups…",
 				"Install / onboard extension",
 			]);
 			if (!choice) return;
@@ -2249,6 +2250,7 @@ Usage rules:
 				case "Background / watch mode…": await openBackgroundMenu(ctx); continue;
 				case "Choose connector…": return connectorHandler(ctx, "");
 				case "Choose window…": await windowHandler(ctx, ""); continue;
+				case "Repair stray Pi groups…": await groupsHandler(ctx, "repair"); continue;
 				case "Install / onboard extension": return onboardHandler(ctx);
 			}
 		}

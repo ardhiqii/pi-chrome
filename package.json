@@ -1,12 +1,12 @@
 {
 	"name": "pi-chrome",
-	"version": "0.15.51.22",
+	"version": "0.15.51.23",
 	"scripts": {
 		"test": "node test-suite/unit/extension-load.test.mjs && node test-suite/unit/csp-eval.test.mjs && node test-suite/unit/automation-target.test.mjs && node test-suite/unit/session-cleanup.test.mjs && node test-suite/unit/background-policy.test.mjs && node test-suite/unit/input-reliability.test.mjs && node test-suite/unit/chrome-command.test.mjs && node test-suite/unit/bridge-routing.test.mjs && node test-suite/unit/cdp-passthrough.test.mjs",
 		"version": "node scripts/sync-manifest-version.mjs",
 		"prepublishOnly": "node scripts/sync-manifest-version.mjs"
 	},
-	"description": "Let Pi use your existing signed-in Chrome profile after explicit authorization.",
+	"description": "The Plus fork of tianrendong/pi-chrome: let Pi use your existing signed-in Chrome profile after explicit authorization.",
 	"keywords": [
 		"pi",
 		"pi-package",
@@ -37,22 +37,26 @@
 		"stagehand-alternative"
 	],
 	"license": "MIT",
+	"engines": {
+		"node": ">=22.13.0"
+	},
 	"author": {
 		"name": "tianrendong",
 		"company": "Earendil Inc."
 	},
-	"homepage": "https://github.com/tianrendong/pi-chrome#readme",
+	"homepage": "https://github.com/ardhiqii/pi-chrome#readme",
 	"repository": {
 		"type": "git",
-		"url": "git+https://github.com/tianrendong/pi-chrome.git"
+		"url": "git+https://github.com/ardhiqii/pi-chrome.git"
 	},
 	"bugs": {
-		"url": "https://github.com/tianrendong/pi-chrome/issues"
+		"url": "https://github.com/ardhiqii/pi-chrome/issues"
 	},
 	"type": "commonjs",
 	"files": [
 		"extensions",
 		"docs",
+		"scripts",
 		"test-suite",
 		"README.md",
 		"CHANGELOG.md",

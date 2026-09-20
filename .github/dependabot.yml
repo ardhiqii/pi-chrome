@@ -1,0 +1,9 @@
+version: 2
+updates:
+  # package.json declares no dependencies or devDependencies and the project is zero-dependency on
+  # purpose, so there is nothing for npm or pip ecosystems to update here. Only the GitHub Actions
+  # used by CI are updated.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
